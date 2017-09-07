@@ -1,0 +1,12 @@
+resolver: lts-9.3
+packages:
+- .
+- ../core
+- ../alang-sexpr-parser
+- ../alang-clike-parser
+extra-deps: []
+flags:
+  ohuac:
+    with-clike-parser: true
+    with-sexpr-parser: true
+extra-package-dbs: []

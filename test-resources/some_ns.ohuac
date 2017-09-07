@@ -1,0 +1,27 @@
+ns some_ns;
+
+use sf ohua.math (add, isZero);
+use algo some.module (a);
+
+fn square (x) {
+    add(x, x)
+}
+
+fn algo1 (someParam) {
+    let a = square(someParam);
+
+    let coll0 = for i in coll {
+        square(i)
+    };
+
+    if (isZero(a)) {
+        coll0
+    } else {
+        a
+    }
+    
+}
+
+fn main (param) {
+    algo0(param)
+}

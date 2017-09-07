@@ -1,0 +1,67 @@
+name: ohuac
+version: '0.1.0.0'
+category: Devel
+author: Sebastian Ertel, Justus Adam
+maintainer: dev@justus.science
+copyright: © 2017 Sebastian Ertel, Justus Adam
+license: OtherLicense
+github: ohua-dev/ohua-standalone
+extra-source-files:
+- README.md
+# library:
+#   source-dirs: src
+#   exposed-modules:
+#   - Lib
+#   dependencies:
+#   - base >=4.7 && <5
+#   - ohua-core
+executables:
+  ohuac:
+    main: Main.hs
+    source-dirs: app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - base
+    - ohua-core
+    - mtl
+    - async
+    - bytestring
+    - unordered-containers
+    - directory
+    - text
+    - filepath
+    - aeson
+    - hashable
+
+    when:
+      - condition: flag(with-clike-parser)
+        dependencies: 
+        - alang-clike-parser
+        cpp-options:
+        - -DWITH_CLIKE_PARSER=1
+      - condition: flag(with-sexpr-parser)
+        dependencies: 
+        - alang-sexpr-parser
+        cpp-options:
+        - -DWITH_SEXPR_PARSER=1
+
+flags:
+  with-sexpr-parser:
+    default: true
+    manual: false
+  with-clike-parser:
+    default: false
+    manual: true
+tests:
+  ohua-standalone-test:
+    main: Spec.hs
+    source-dirs: test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - base

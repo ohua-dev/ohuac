@@ -1,7 +1,7 @@
 ns some_ns;
 
-use sf ohua.math (add, isZero);
-use algo some.module (a);
+use sf ohua::math (add, isZero);
+use algo some::module (a);
 
 fn square (x) {
     add(x, x)
@@ -23,5 +23,5 @@ fn algo1 (someParam) {
 }
 
 fn main (param) {
-    algo0(param)
+    algo1(param)
 }

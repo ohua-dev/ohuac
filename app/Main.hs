@@ -1,49 +1,58 @@
-{-# LANGUAGE CPP, LambdaCase, OverloadedStrings, OverloadedLists, FlexibleContexts, TypeFamilies, BangPatterns, DeriveGeneric #-}
+{-# LANGUAGE BangPatterns      #-}
+{-# LANGUAGE CPP               #-}
+{-# LANGUAGE DeriveGeneric     #-}
+{-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE LambdaCase        #-}
+{-# LANGUAGE OverloadedLists   #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeFamilies      #-}
+{-# LANGUAGE UnboxedTuples #-}
 module Main where
 
 
-import System.Environment
-import System.Directory
-import qualified Data.ByteString.Lazy as L
-import Ohua.ALang.NS
-import Ohua.ALang.Lang
-import Data.IORef
-import qualified Data.HashMap.Strict as HM
-import qualified Data.HashSet as HS
-import Ohua.Types
-import Ohua.DFGraph
-import Control.Concurrent.Async
-import Control.Monad.IO.Class
-import Control.Concurrent.MVar
-import qualified Data.Text as T
-import Data.String (fromString)
-import Data.Maybe
-import Control.Monad
-import System.FilePath ((-<.>), (<.>), takeExtension)
-import Data.Monoid
-import Control.Monad.Reader
-import Control.Monad.RWS
-import Control.Monad.Writer
-import Data.Aeson
-import Ohua.Serialize.JSON
-import Data.Hashable
-import Ohua.Compile
-import Data.Foldable
-import Control.Arrow
-import Data.List (partition)
-import GHC.Generics
+import           Control.Arrow
+import           Control.Concurrent.Async
+import           Control.Concurrent.MVar
+import           Control.Monad
+import           Control.Monad.IO.Class
+import           Control.Monad.Reader
+import           Control.Monad.RWS
+import           Control.Monad.Writer
+import           Data.Aeson
+import qualified Data.ByteString.Lazy.Char8 as L
+import           Data.Foldable
+import           Data.Hashable
+import qualified Data.HashMap.Strict      as HM
+import qualified Data.HashSet             as HS
+import           Data.IORef
+import           Data.List                (partition)
+import           Data.Maybe
+import           Data.Monoid
+import           Data.String              (fromString)
+import qualified Data.Text                as T
+import qualified Data.Text.IO             as T
+import           GHC.Generics
+import           Ohua.ALang.Lang
+import           Ohua.ALang.NS
+import           Ohua.Compile
+import           Ohua.DFGraph
+import           Ohua.Serialize.JSON
+import           Ohua.Types
+import           System.Directory
+import           System.Environment
+import           System.FilePath          (takeExtension, (-<.>), (<.>))
 
 #ifdef WITH_SEXPR_PARSER
-import qualified Ohua.Compat.SExpr.Lexer as SLex
+import qualified Ohua.Compat.SExpr.Lexer  as SLex
 import qualified Ohua.Compat.SExpr.Parser as SParse
 #endif
 #ifdef WITH_CLIKE_PARSER
-import qualified Ohua.Compat.Clike.Lexer as CLex
+import qualified Ohua.Compat.Clike.Lexer  as CLex
 import qualified Ohua.Compat.Clike.Parser as CParse
 #endif
 
 
-getParser :: String -> L.ByteString -> Namespace SomeBinding
+getParser :: String -> L.ByteString -> RawNamespace
 #ifdef WITH_SEXPR_PARSER
 getParser ".ohuas" = SParse.parseNS . SLex.tokenize
 #endif
@@ -60,15 +69,15 @@ type RawNamespace = Namespace SomeBinding
 type ResolvedNamespace = Namespace ResolvedSymbol
 
 
-data CompileObject = CompileObject 
-    { coName :: NSRef
+data CompileObject = CompileObject
+    { coName  :: NSRef
     , coDecls :: HM.HashMap Binding Expression
     } deriving (Eq, Show, Generic)
 
 
 data GraphFile = GraphFile
-    { graph :: OutGraph
-    , mainArity :: Int
+    { graph          :: OutGraph
+    , mainArity      :: Int
     , sfDependencies :: HS.HashSet QualifiedBinding
     } deriving (Eq, Show, Generic)
 
@@ -77,13 +86,19 @@ instance ToJSON GraphFile where toJSON = genericToJSON defaultOptions
 instance FromJSON GraphFile where parseJSON = genericParseJSON defaultOptions
 
 
+stdNamespace =
+    ( nsRefFromList ["ohua", "lang"]
+    , [ "id", "smap", "if" ] -- TODO complete list
+    )
+
+
 resolveNS :: IFaceDefs -> RawNamespace -> ResolvedNamespace
-resolveNS ifacem ns@(Namespace modname algoImports sfImports decls) = 
+resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
     ns { nsDecls = HM.fromList resDecls }
   where
     resDecls = flip runReader (mempty, ifacem) $
-        go0 (topSortDecls 
-                (\case Unqual bnd | bnd `HS.member` locallyDefinedAlgos -> Just bnd ; _ -> Nothing) 
+        go0 (topSortDecls
+                (\case Unqual bnd | bnd `HS.member` locallyDefinedAlgos -> Just bnd ; _ -> Nothing)
                 $ HM.toList decls)
 
     go0 [] = return []
@@ -93,31 +108,35 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports decls) =
              ((name, done) :) <$> (go0 xs)
 
     go :: Expr SomeBinding -> Reader (HS.HashSet Binding, IFaceDefs) Expression
-    go (Let assign val body) = 
+    go (Let assign val body) =
         registerAssign assign $ Let assign <$> go val <*> go body
     go (Var (Unqual bnd)) = do
         isLocal <- asks (HS.member bnd . fst)
-        
+
         if isLocal then
             return $ Var $ Local bnd
-        else 
-            case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
-                (Just algo, Just sf) -> error $ "Ambiguous ocurrence of unqualified binding " ++ show bnd ++ ". Could refer to algo " ++ show algo ++ " or sf " ++ show sf
-                (Just algoname, _) -> do
-                    fromMaybe (error $ "Algo not loaded " ++ show algoname) <$> asks (HM.lookup algoname . snd)
-
-                (_, Just sf) -> return $ Var $ Sf sf Nothing
+        else
+            case (# HM.lookup bnd algoRefers, HM.lookup bnd sfRefers #) of
+                (# Just algo, Just sf #) ->
+                  error $ "Ambiguous ocurrence of unqualified binding " ++ show bnd
+                    ++ ". Could refer to algo " ++ show algo ++ " or sf " ++ show sf
+                (# Just algoname, _ #) ->
+                    fromMaybe (error $ "Algo not loaded " ++ show algoname)
+                      <$> asks (HM.lookup algoname . snd)
+                (# _, Just sf #) -> return $ Var $ Sf sf Nothing
                 _ -> error $ "Binding not in scope " ++ show bnd
     go (Var (Qual qb)) = do
         algo <- asks (HM.lookup qb . snd)
-        return $ 
+        return $
             case algo of
                 Just algo -> algo
                 _ | qbNamespace qb `HS.member` importedSfNamespaces -> Var (Sf qb Nothing)
                 _ -> error $ "No matching algo available or namespace not loaded for " ++ show qb
     go (Apply expr expr2) = Apply <$> go expr <*> go expr2
-    go (Lambda assign body) = 
+    go (Lambda assign body) =
         registerAssign assign $ Lambda assign <$> go body
+
+    sfImports = stdNamespace : sfImports'
 
     registerAssign = local . first . HS.union . HS.fromList . flattenAssign
 
@@ -134,7 +153,8 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports decls) =
         , shortname <- referList
         ]
 
-    reportCollidingRef a b = error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "'"
+    reportCollidingRef a b =
+      error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "' in " ++ show modname
 
 
 readAndParse :: String -> IO RawNamespace
@@ -162,7 +182,7 @@ findSourceFile modname = do
     asFile = T.unpack $ T.intercalate "/" $ map unBinding $ nsRefToList modname
     extensions =
 #ifdef WITH_SEXPR_PARSER
-        ".ohuas" : 
+        ".ohuas" :
 #endif
 #ifdef WITH_CLIKE_PARSER
         ".ohuac" :
@@ -174,7 +194,8 @@ loadModule :: ModTracker -> NSRef -> IO ResolvedNamespace
 loadModule tracker modname = do
     filename <- findSourceFile modname
     rawMod <- readAndParse filename
-    unless (nsName rawMod == modname) $ error $ "Expected module with name " ++ show modname ++ " but got " ++ show (nsName rawMod)
+    unless (nsName rawMod == modname) $
+      error $ "Expected module with name " ++ show modname ++ " but got " ++ show (nsName rawMod)
     loadDepsAndResolve tracker rawMod
 
 
@@ -188,25 +209,25 @@ registerAndLoad tracker mod = registerAnd tracker mod (loadModule tracker mod)
 
 registerAnd :: ModTracker -> NSRef -> IO ResolvedNamespace -> IO ResolvedNamespace
 registerAnd tracker mod ac = do
-    newModRef <- newEmptyMVar 
+    newModRef <- newEmptyMVar
     actualRef <- atomicModifyIORef' tracker $ \map ->
         case HM.lookup mod map of
             Just mvar -> (map, Left mvar)
-            Nothing -> (HM.insert mod newModRef map, Right newModRef)
+            Nothing   -> (HM.insert mod newModRef map, Right newModRef)
     case actualRef of
         Left toWait -> readMVar toWait
-        Right build -> do 
+        Right build -> do
             compiled <- ac
             putMVar build compiled
             return compiled
-    
+
 
 
 gatherSFDeps :: Expression -> HS.HashSet QualifiedBinding
 gatherSFDeps = execWriter . foldlExprM (const . go) ()
   where
     go (Var (Sf name _)) = tell [name]
-    go _ = return ()
+    go _                 = return ()
 
 
 
@@ -233,48 +254,57 @@ topSortDecls f decls = map fst $ topSortWith (fst . fst) snd declsWDeps
     localAlgos = HS.fromList $ map fst decls
     getDeps e = HS.toList $ snd $ evalRWS (go e) mempty ()
       where
-        go (Let assign val body) = local (HS.union $ HS.fromList $ flattenAssign assign) $ go val >> go body
+        go (Let assign val body) =
+          local (HS.union $ HS.fromList $ flattenAssign assign) $ go val >> go body
         go (Var thing) | Just bnd <- f thing = do
             isLocal <- asks (HS.member bnd)
             if isLocal then
                 return ()
-            else 
+            else
                 when (bnd `HS.member` localAlgos) $ tell [bnd]
         go (Var _) = return ()
         go (Lambda assign body) = local (HS.union $ HS.fromList $ flattenAssign assign) $ go body
         go (Apply function val) = go function >> go val
-                
+
     declsWDeps = zip decls $ map (getDeps . snd) decls
 
-mainToEnv :: Expression -> (Int, Expression)
+mainToEnv :: Expression -> (# Int, Expression #)
 mainToEnv = go 0 id
   where
     go !i f (Lambda assign body) = go (i+1) (f . Let assign (Var $ Env $ HostExpr i)) body
-    go !i f rest = (i, f rest)
+    go !i f rest = (# i, f rest #)
 
 
 main :: IO ()
 main = do
     [inputModFile] <- getArgs
-    
+
     modTracker <- newIORef HM.empty
 
     rawMainMod <- readAndParse inputModFile
 
     mainMod <- registerAnd modTracker (nsName rawMainMod) $ loadDepsAndResolve modTracker rawMainMod
 
-    case HM.lookup "main" $ nsDecls mainMod of 
+    case HM.lookup "main" $ nsDecls mainMod of
         Nothing -> error "Main module has no main function"
         Just expr -> do
 
             let sfDeps = gatherSFDeps expr
-            
-            let (mainArity, completeExpr) = mainToEnv expr
 
-            let !gr = either (error . T.unpack) id $ compile completeExpr
+            let (# mainArity, completeExpr #) = mainToEnv expr
 
-            L.writeFile (inputModFile -<.> "ohuao") $ encode $ GraphFile 
-                { graph = gr
-                , mainArity = mainArity
-                , sfDependencies = sfDeps
-                }
+            case compile completeExpr of
+                Left err -> do
+                    T.putStrLn err
+                    print completeExpr
+                Right gr -> do
+                    L.putStrLn $ encode $ GraphFile
+                        { graph = gr
+                        , mainArity = mainArity
+                        , sfDependencies = sfDeps
+                        }
+                    L.writeFile (inputModFile -<.> "ohuao") $ encode $ GraphFile
+                        { graph = gr
+                        , mainArity = mainArity
+                        , sfDependencies = sfDeps
+                        }

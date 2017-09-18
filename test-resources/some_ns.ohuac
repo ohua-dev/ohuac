@@ -7,7 +7,7 @@ fn square (x) {
     add(x, x)
 }
 
-fn algo1 (someParam) {
+fn algo1 (someParam, coll) {
     let a = square(someParam);
 
     let coll0 = for i in coll {
@@ -19,9 +19,9 @@ fn algo1 (someParam) {
     } else {
         a
     }
-    
+
 }
 
 fn main (param) {
-    algo1(param)
+    algo1(param, param)
 }

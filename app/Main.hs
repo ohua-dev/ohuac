@@ -82,7 +82,7 @@ data GraphFile = GraphFile
     } deriving (Eq, Show, Generic)
 
 
-instance ToJSON GraphFile where toJSON = genericToJSON defaultOptions
+instance ToJSON GraphFile where toEncoding = genericToEncoding defaultOptions
 instance FromJSON GraphFile where parseJSON = genericParseJSON defaultOptions
 
 
@@ -298,11 +298,6 @@ main = do
                     T.putStrLn err
                     print completeExpr
                 Right gr -> do
-                    L.putStrLn $ encode $ GraphFile
-                        { graph = gr
-                        , mainArity = mainArity
-                        , sfDependencies = sfDeps
-                        }
                     L.writeFile (inputModFile -<.> "ohuao") $ encode $ GraphFile
                         { graph = gr
                         , mainArity = mainArity

@@ -68,7 +68,7 @@ supportedExtensions =
         (".ohuas", "S-Expression frontend for the algorithm language") :
 #endif
 #ifdef WITH_CLIKE_PARSER
-        (".ohuac", "C/Rust-like fromtent for the algorithm language") :
+        (".ohuac", "C/Rust-like frontent for the algorithm language") :
 #endif
         []
 
@@ -77,12 +77,6 @@ type ModMap = HM.HashMap NSRef (MVar (Namespace ResolvedSymbol))
 type ModTracker = IORef ModMap
 type RawNamespace = Namespace SomeBinding
 type ResolvedNamespace = Namespace ResolvedSymbol
-
-
-data CompileObject = CompileObject
-    { coName  :: NSRef
-    , coDecls :: HM.HashMap Binding Expression
-    } deriving (Eq, Show, Generic)
 
 
 data GraphFile = GraphFile
@@ -111,7 +105,7 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
                 (\case Unqual bnd | bnd `HS.member` locallyDefinedAlgos -> Just bnd ; _ -> Nothing)
                 $ HM.toList decls)
 
-    go0 [] = return []
+    go0 [] = pure []
     go0 ((name, expr):xs) = do
         done <- go expr
         local (second $ HM.insert (QualifiedBinding modname name) done) $
@@ -124,7 +118,7 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
         isLocal <- asks (HS.member bnd . fst)
 
         if isLocal then
-            return $ Var $ Local bnd
+            pure $ Var $ Local bnd
         else
             case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
                 (Just algo, Just sf) ->
@@ -133,11 +127,11 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
                 (Just algoname, _) ->
                     fromMaybe (error $ "Algo not loaded " ++ show algoname)
                       <$> asks (HM.lookup algoname . snd)
-                (_, Just sf) -> return $ Var $ Sf sf Nothing
+                (_, Just sf) -> pure $ Var $ Sf sf Nothing
                 _ -> error $ "Binding not in scope " ++ show bnd
     go (Var (Qual qb)) = do
         algo <- asks (HM.lookup qb . snd)
-        return $
+        pure $
             case algo of
                 Just algo -> algo
                 _ | qbNamespace qb `HS.member` importedSfNamespaces -> Var (Sf qb Nothing)
@@ -174,7 +168,7 @@ readAndParse filename = getParser (takeExtension filename) <$> L.readFile filena
 gatherDeps :: IORef ModMap -> Namespace a -> IO IFaceDefs
 gatherDeps tracker Namespace{ nsAlgoImports=algoImports } = do
     mods <- mapConcurrently (registerAndLoad tracker) (map fst algoImports)
-    return $ HM.fromList
+    pure $ HM.fromList
         [ (QualifiedBinding (nsName ns) name, algo)
         | ns <- mods
         , (name, algo) <- HM.toList $ nsDecls ns
@@ -186,7 +180,7 @@ findSourceFile modname = do
     candidates <- filterM doesFileExist $ map (asFile <.>) extensions
     case candidates of
         [] -> error $ "No file found for module " ++ show modname
-        [f] -> return f
+        [f] -> pure f
         files -> error $ "Found multiple files matching " ++ show modname ++ ": " ++ show files
   where
     asFile = T.unpack $ T.intercalate "/" $ map unBinding $ nsRefToList modname
@@ -198,7 +192,7 @@ loadModule tracker modname = do
     filename <- findSourceFile modname
     rawMod <- readAndParse filename
     unless (nsName rawMod == modname) $
-      error $ "Expected module with name " ++ show modname ++ " but got " ++ show (nsName rawMod)
+        error $ "Expected module with name " ++ show modname ++ " but got " ++ show (nsName rawMod)
     loadDepsAndResolve tracker rawMod
 
 
@@ -222,16 +216,14 @@ registerAnd tracker mod ac = do
         Right build -> do
             compiled <- ac
             putMVar build compiled
-            return compiled
-
+            pure compiled
 
 
 gatherSFDeps :: Expression -> HS.HashSet QualifiedBinding
 gatherSFDeps = execWriter . foldlExprM (const . go) ()
   where
     go (Var (Sf name _)) = tell [name]
-    go _                 = return ()
-
+    go _                 = pure ()
 
 
 topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
@@ -262,14 +254,15 @@ topSortDecls f decls = map fst $ topSortWith (fst . fst) snd declsWDeps
         go (Var thing) | Just bnd <- f thing = do
             isLocal <- asks (HS.member bnd)
             if isLocal then
-                return ()
+                pure ()
             else
                 when (bnd `HS.member` localAlgos) $ tell [bnd]
-        go (Var _) = return ()
+        go (Var _) = pure ()
         go (Lambda assign body) = local (HS.union $ HS.fromList $ flattenAssign assign) $ go body
         go (Apply function val) = go function >> go val
 
     declsWDeps = zip decls $ map (getDeps . snd) decls
+
 
 mainToEnv :: Expression -> (Int, Expression)
 mainToEnv = go 0 id
@@ -327,9 +320,9 @@ main = do
             <> help "Source file to compile"
             )
         <*> optional 
-                ( strOption
-                $ long "output"
-                <> metavar "PATH"
-                <> short 'o'
-                <> help "Path to write the output to (default: input filename with '.ohuao' extension)"
-                )
+            (  strOption
+            $  long "output"
+            <> metavar "PATH"
+            <> short 'o'
+            <> help "Path to write the output to (default: input filename with '.ohuao' extension)"
+            )

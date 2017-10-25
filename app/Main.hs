@@ -6,7 +6,6 @@
 {-# LANGUAGE OverloadedLists   #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies      #-}
-{-# LANGUAGE UnboxedTuples     #-}
 module Main where
 
 
@@ -127,14 +126,14 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
         if isLocal then
             return $ Var $ Local bnd
         else
-            case (# HM.lookup bnd algoRefers, HM.lookup bnd sfRefers #) of
-                (# Just algo, Just sf #) ->
+            case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
+                (Just algo, Just sf) ->
                   error $ "Ambiguous ocurrence of unqualified binding " ++ show bnd
                     ++ ". Could refer to algo " ++ show algo ++ " or sf " ++ show sf
-                (# Just algoname, _ #) ->
+                (Just algoname, _) ->
                     fromMaybe (error $ "Algo not loaded " ++ show algoname)
                       <$> asks (HM.lookup algoname . snd)
-                (# _, Just sf #) -> return $ Var $ Sf sf Nothing
+                (_, Just sf) -> return $ Var $ Sf sf Nothing
                 _ -> error $ "Binding not in scope " ++ show bnd
     go (Var (Qual qb)) = do
         algo <- asks (HM.lookup qb . snd)
@@ -272,21 +271,22 @@ topSortDecls f decls = map fst $ topSortWith (fst . fst) snd declsWDeps
 
     declsWDeps = zip decls $ map (getDeps . snd) decls
 
-mainToEnv :: Expression -> (# Int, Expression #)
+mainToEnv :: Expression -> (Int, Expression)
 mainToEnv = go 0 id
   where
     go !i f (Lambda assign body) = go (i+1) (f . Let assign (Var $ Env $ HostExpr i)) body
-    go !i f rest = (# i, f rest #)
+    go !i f rest = (i, f rest)
 
 
 data CmdOpts = CmdOpts
     { inputModuleFile :: FilePath
+    , outputPath :: Maybe FilePath
     }
 
 
 main :: IO ()
 main = do
-    CmdOpts { inputModuleFile = inputModFile } <- execParser odef
+    CmdOpts { inputModuleFile = inputModFile, outputPath = out } <- execParser odef
 
     modTracker <- newIORef HM.empty
 
@@ -300,14 +300,14 @@ main = do
 
             let sfDeps = gatherSFDeps expr
 
-            let (# mainArity, completeExpr #) = mainToEnv expr
+            let (mainArity, completeExpr) = mainToEnv expr
 
             case compile completeExpr of
                 Left err -> do
                     T.putStrLn err
                     print completeExpr
                 Right gr -> do
-                    L.writeFile (inputModFile -<.> "ohuao") $ encode $ GraphFile
+                    L.writeFile (fromMaybe (inputModFile -<.> "ohuao") out) $ encode $ GraphFile
                         { graph = gr
                         , mainArity = mainArity
                         , sfDependencies = sfDeps
@@ -326,3 +326,10 @@ main = do
             (  metavar "SOURCE"
             <> help "Source file to compile"
             )
+        <*> optional 
+                ( strOption
+                $ long "output"
+                <> metavar "PATH"
+                <> short 'o'
+                <> help "Path to write the output to (default: input filename with '.ohuao' extension)"
+                )

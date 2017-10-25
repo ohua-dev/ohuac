@@ -6,7 +6,7 @@
 {-# LANGUAGE OverloadedLists   #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies      #-}
-{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE UnboxedTuples     #-}
 module Main where
 
 
@@ -22,15 +22,15 @@ import           Data.Aeson
 import qualified Data.ByteString.Lazy.Char8 as L
 import           Data.Foldable
 import           Data.Hashable
-import qualified Data.HashMap.Strict      as HM
-import qualified Data.HashSet             as HS
+import qualified Data.HashMap.Strict        as HM
+import qualified Data.HashSet               as HS
 import           Data.IORef
-import           Data.List                (partition)
+import           Data.List                  (partition)
 import           Data.Maybe
 import           Data.Monoid
-import           Data.String              (fromString)
-import qualified Data.Text                as T
-import qualified Data.Text.IO             as T
+import           Data.String                (fromString)
+import qualified Data.Text                  as T
+import qualified Data.Text.IO               as T
 import           GHC.Generics
 import           Ohua.ALang.Lang
 import           Ohua.ALang.NS
@@ -38,17 +38,19 @@ import           Ohua.Compile
 import           Ohua.DFGraph
 import           Ohua.Serialize.JSON
 import           Ohua.Types
+import           Options.Applicative
 import           System.Directory
 import           System.Environment
-import           System.FilePath          (takeExtension, (-<.>), (<.>))
+import           System.FilePath            (takeExtension, (-<.>), (<.>))
+import           Data.List (intercalate)
 
 #ifdef WITH_SEXPR_PARSER
-import qualified Ohua.Compat.SExpr.Lexer  as SLex
-import qualified Ohua.Compat.SExpr.Parser as SParse
+import qualified Ohua.Compat.SExpr.Lexer    as SLex
+import qualified Ohua.Compat.SExpr.Parser   as SParse
 #endif
 #ifdef WITH_CLIKE_PARSER
-import qualified Ohua.Compat.Clike.Lexer  as CLex
-import qualified Ohua.Compat.Clike.Parser as CParse
+import qualified Ohua.Compat.Clike.Lexer    as CLex
+import qualified Ohua.Compat.Clike.Parser   as CParse
 #endif
 
 
@@ -61,6 +63,15 @@ getParser ".ohuac" = CParse.parseNS . CLex.tokenize
 #endif
 getParser ext = error $ "No parser defined for files with extension '" ++ ext ++ "'"
 
+supportedExtensions :: [(String, String)]
+supportedExtensions =     
+#ifdef WITH_SEXPR_PARSER
+        (".ohuas", "S-Expression frontend for the algorithm language") :
+#endif
+#ifdef WITH_CLIKE_PARSER
+        (".ohuac", "C/Rust-like fromtent for the algorithm language") :
+#endif
+        []
 
 type IFaceDefs = HM.HashMap QualifiedBinding Expression
 type ModMap = HM.HashMap NSRef (MVar (Namespace ResolvedSymbol))
@@ -154,7 +165,7 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
         ]
 
     reportCollidingRef a b =
-      error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "' in " ++ show modname
+        error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "' in " ++ show modname
 
 
 readAndParse :: String -> IO RawNamespace
@@ -180,14 +191,7 @@ findSourceFile modname = do
         files -> error $ "Found multiple files matching " ++ show modname ++ ": " ++ show files
   where
     asFile = T.unpack $ T.intercalate "/" $ map unBinding $ nsRefToList modname
-    extensions =
-#ifdef WITH_SEXPR_PARSER
-        ".ohuas" :
-#endif
-#ifdef WITH_CLIKE_PARSER
-        ".ohuac" :
-#endif
-        []
+    extensions = map fst supportedExtensions
 
 
 loadModule :: ModTracker -> NSRef -> IO ResolvedNamespace
@@ -275,9 +279,14 @@ mainToEnv = go 0 id
     go !i f rest = (# i, f rest #)
 
 
+data CmdOpts = CmdOpts
+    { inputModuleFile :: FilePath
+    }
+
+
 main :: IO ()
 main = do
-    [inputModFile] <- getArgs
+    CmdOpts { inputModuleFile = inputModFile } <- execParser odef
 
     modTracker <- newIORef HM.empty
 
@@ -303,3 +312,17 @@ main = do
                         , mainArity = mainArity
                         , sfDependencies = sfDeps
                         }
+  where
+    odef = info
+        (helper <*> optsParser)
+        ( fullDesc
+        <> header "ohuac ~ the ohua standalone compiler"
+        <> progDesc ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: " 
+            <> intercalate ", " (map (\a -> "'" <> fst a <> "'") supportedExtensions)
+            )
+        )
+    optsParser = CmdOpts
+        <$> argument str
+            (  metavar "SOURCE"
+            <> help "Source file to compile"
+            )

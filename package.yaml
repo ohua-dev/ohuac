@@ -35,15 +35,16 @@ executables:
     - filepath
     - aeson
     - hashable
+    - optparse-applicative
 
     when:
       - condition: flag(with-clike-parser)
-        dependencies: 
+        dependencies:
         - alang-clike-parser
         cpp-options:
         - -DWITH_CLIKE_PARSER=1
       - condition: flag(with-sexpr-parser)
-        dependencies: 
+        dependencies:
         - alang-sexpr-parser
         cpp-options:
         - -DWITH_SEXPR_PARSER=1

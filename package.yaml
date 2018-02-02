@@ -36,6 +36,10 @@ executables:
     - aeson
     - hashable
     - optparse-applicative
+    - recursion-schemes
+    - data-default-class
+    - lifted-base
+    - lifted-async
 
     when:
       - condition: flag(with-clike-parser)

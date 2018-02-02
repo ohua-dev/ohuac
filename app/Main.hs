@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE LambdaCase        #-}
+{-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedLists   #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies      #-}
@@ -10,46 +11,50 @@ module Main where
 
 
 import           Control.Arrow
-import           Control.Concurrent.Async
-import           Control.Concurrent.MVar
+import           Control.Concurrent.Async.Lifted
+import           Control.Concurrent.MVar.Lifted
 import           Control.Monad
+import           Control.Monad.Except
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
 import           Control.Monad.RWS
 import           Control.Monad.Writer
 import           Data.Aeson
-import qualified Data.ByteString.Lazy.Char8 as L
+import qualified Data.ByteString.Lazy.Char8      as L
+import           Data.Default.Class
 import           Data.Foldable
+import           Data.Functor.Foldable           hiding (fold)
 import           Data.Hashable
-import qualified Data.HashMap.Strict        as HM
-import qualified Data.HashSet               as HS
-import           Data.IORef
-import           Data.List                  (partition)
+import qualified Data.HashMap.Strict             as HM
+import qualified Data.HashSet                    as HS
+import           Data.IORef.Lifted
+import           Data.List                       (partition)
+import           Data.List                       (intercalate)
 import           Data.Maybe
 import           Data.Monoid
-import           Data.String                (fromString)
-import qualified Data.Text                  as T
-import qualified Data.Text.IO               as T
+import           Data.String                     (fromString)
+import qualified Data.Text                       as T
 import           GHC.Generics
 import           Ohua.ALang.Lang
 import           Ohua.ALang.NS
 import           Ohua.Compile
 import           Ohua.DFGraph
+import           Ohua.Monad
 import           Ohua.Serialize.JSON
 import           Ohua.Types
+import qualified Ohua.Util.Str                   as Str
 import           Options.Applicative
 import           System.Directory
 import           System.Environment
-import           System.FilePath            (takeExtension, (-<.>), (<.>))
-import           Data.List (intercalate)
+import           System.FilePath                 (takeExtension, (-<.>), (<.>))
 
 #ifdef WITH_SEXPR_PARSER
-import qualified Ohua.Compat.SExpr.Lexer    as SLex
-import qualified Ohua.Compat.SExpr.Parser   as SParse
+import qualified Ohua.Compat.SExpr.Lexer         as SLex
+import qualified Ohua.Compat.SExpr.Parser        as SParse
 #endif
 #ifdef WITH_CLIKE_PARSER
-import qualified Ohua.Compat.Clike.Lexer    as CLex
-import qualified Ohua.Compat.Clike.Parser   as CParse
+import qualified Ohua.Compat.Clike.Lexer         as CLex
+import qualified Ohua.Compat.Clike.Parser        as CParse
 #endif
 
 
@@ -63,7 +68,7 @@ getParser ".ohuac" = CParse.parseNS . CLex.tokenize
 getParser ext = error $ "No parser defined for files with extension '" ++ ext ++ "'"
 
 supportedExtensions :: [(String, String)]
-supportedExtensions =     
+supportedExtensions =
 #ifdef WITH_SEXPR_PARSER
         (".ohuas", "S-Expression frontend for the algorithm language") :
 #endif
@@ -77,6 +82,7 @@ type ModMap = HM.HashMap NSRef (MVar (Namespace ResolvedSymbol))
 type ModTracker = IORef ModMap
 type RawNamespace = Namespace SomeBinding
 type ResolvedNamespace = Namespace ResolvedSymbol
+type CompM = ExceptT Error (LoggingT IO)
 
 
 data GraphFile = GraphFile
@@ -161,11 +167,11 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
         error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "' in " ++ show modname
 
 
-readAndParse :: String -> IO RawNamespace
-readAndParse filename = getParser (takeExtension filename) <$> L.readFile filename
+readAndParse :: MonadIO m => String -> m RawNamespace
+readAndParse filename = getParser (takeExtension filename) <$> liftIO (L.readFile filename)
 
 
-gatherDeps :: IORef ModMap -> Namespace a -> IO IFaceDefs
+gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
 gatherDeps tracker Namespace{ nsAlgoImports=algoImports } = do
     mods <- mapConcurrently (registerAndLoad tracker) (map fst algoImports)
     pure $ HM.fromList
@@ -175,36 +181,36 @@ gatherDeps tracker Namespace{ nsAlgoImports=algoImports } = do
         ]
 
 
-findSourceFile :: NSRef -> IO String
+findSourceFile :: NSRef -> CompM String
 findSourceFile modname = do
-    candidates <- filterM doesFileExist $ map (asFile <.>) extensions
+    candidates <- filterM (liftIO . doesFileExist) $ map (asFile <.>) extensions
     case candidates of
         [] -> error $ "No file found for module " ++ show modname
         [f] -> pure f
         files -> error $ "Found multiple files matching " ++ show modname ++ ": " ++ show files
   where
-    asFile = T.unpack $ T.intercalate "/" $ map unBinding $ nsRefToList modname
+    asFile = intercalate "/" $ map (Str.toString . unBinding) $ nsRefToList modname
     extensions = map fst supportedExtensions
 
 
-loadModule :: ModTracker -> NSRef -> IO ResolvedNamespace
+loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
 loadModule tracker modname = do
     filename <- findSourceFile modname
     rawMod <- readAndParse filename
     unless (nsName rawMod == modname) $
-        error $ "Expected module with name " ++ show modname ++ " but got " ++ show (nsName rawMod)
+        throwError $ "Expected module with name " <> Str.showS modname <> " but got " <> Str.showS (nsName rawMod)
     loadDepsAndResolve tracker rawMod
 
 
-loadDepsAndResolve :: ModTracker -> RawNamespace -> IO ResolvedNamespace
+loadDepsAndResolve :: ModTracker -> RawNamespace -> CompM ResolvedNamespace
 loadDepsAndResolve tracker rawMod = flip resolveNS rawMod <$> gatherDeps tracker rawMod
 
 
-registerAndLoad :: ModTracker -> NSRef -> IO ResolvedNamespace
+registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
 registerAndLoad tracker mod = registerAnd tracker mod (loadModule tracker mod)
 
 
-registerAnd :: ModTracker -> NSRef -> IO ResolvedNamespace -> IO ResolvedNamespace
+registerAnd :: ModTracker -> NSRef -> CompM ResolvedNamespace -> CompM ResolvedNamespace
 registerAnd tracker mod ac = do
     newModRef <- newEmptyMVar
     actualRef <- atomicModifyIORef' tracker $ \map ->
@@ -220,10 +226,9 @@ registerAnd tracker mod ac = do
 
 
 gatherSFDeps :: Expression -> HS.HashSet QualifiedBinding
-gatherSFDeps = execWriter . foldlExprM (const . go) ()
-  where
-    go (Var (Sf name _)) = tell [name]
-    go _                 = pure ()
+gatherSFDeps = cata $ \case
+  VarF (Sf ref _) -> HS.singleton ref
+  other -> fold other
 
 
 topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
@@ -273,13 +278,18 @@ mainToEnv = go 0 id
 
 data CmdOpts = CmdOpts
     { inputModuleFile :: FilePath
-    , outputPath :: Maybe FilePath
+    , entrypoint      :: Str.Str
+    , outputPath      :: Maybe FilePath
     }
 
 
+runCompM :: CompM () -> IO ()
+runCompM c = runStderrLoggingT $ runExceptT c >>= either (logErrorN . T.pack . Str.toString) pure
+
+
 main :: IO ()
-main = do
-    CmdOpts { inputModuleFile = inputModFile, outputPath = out } <- execParser odef
+main = runCompM $ do
+    CmdOpts { inputModuleFile = inputModFile, outputPath = out, entrypoint } <- liftIO $ execParser odef
 
     modTracker <- newIORef HM.empty
 
@@ -287,30 +297,26 @@ main = do
 
     mainMod <- registerAnd modTracker (nsName rawMainMod) $ loadDepsAndResolve modTracker rawMainMod
 
-    case HM.lookup "main" $ nsDecls mainMod of
-        Nothing -> error "Main module has no main function"
+    case HM.lookup (Binding $ entrypoint) $ nsDecls mainMod of
+        Nothing -> throwError $ "Module does not define specified entry point '" <> entrypoint <> "'"
         Just expr -> do
 
             let sfDeps = gatherSFDeps expr
 
             let (mainArity, completeExpr) = mainToEnv expr
 
-            case compile completeExpr of
-                Left err -> do
-                    T.putStrLn err
-                    print completeExpr
-                Right gr -> do
-                    L.writeFile (fromMaybe (inputModFile -<.> "ohuao") out) $ encode $ GraphFile
-                        { graph = gr
-                        , mainArity = mainArity
-                        , sfDependencies = sfDeps
-                        }
+            gr <- compile def def completeExpr
+            liftIO $ L.writeFile (fromMaybe (inputModFile -<.> "ohuao") out) $ encode $ GraphFile
+              { graph = gr
+              , mainArity = mainArity
+              , sfDependencies = sfDeps
+              }
   where
     odef = info
         (helper <*> optsParser)
         ( fullDesc
         <> header "ohuac ~ the ohua standalone compiler"
-        <> progDesc ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: " 
+        <> progDesc ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: "
             <> intercalate ", " (map (\a -> "'" <> fst a <> "'") supportedExtensions)
             )
         )
@@ -319,7 +325,12 @@ main = do
             (  metavar "SOURCE"
             <> help "Source file to compile"
             )
-        <*> optional 
+        <*> argument (Str.fromString <$> str)
+            (  metavar "MAIN"
+            <> help "Algorithm that serves as entry point"
+            <> value "main"
+            )
+        <*> optional
             (  strOption
             $  long "output"
             <> metavar "PATH"

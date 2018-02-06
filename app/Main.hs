@@ -6,6 +6,8 @@
 {-# LANGUAGE NamedFieldPuns    #-}
 {-# LANGUAGE OverloadedLists   #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections     #-}
+{-# LANGUAGE TypeApplications  #-}
 {-# LANGUAGE TypeFamilies      #-}
 module Main where
 
@@ -19,8 +21,9 @@ import           Control.Monad.IO.Class
 import           Control.Monad.Reader
 import           Control.Monad.RWS
 import           Control.Monad.Writer
-import           Data.Aeson
+import           Data.Aeson                      as A
 import qualified Data.ByteString.Lazy.Char8      as L
+import qualified Data.Char                       as C
 import           Data.Default.Class
 import           Data.Foldable
 import           Data.Functor.Foldable           hiding (fold)
@@ -29,14 +32,15 @@ import qualified Data.HashMap.Strict             as HM
 import qualified Data.HashSet                    as HS
 import           Data.IORef.Lifted
 import           Data.List                       (partition)
-import           Data.List                       (intercalate)
+import           Data.List                       (intercalate, intersperse)
 import           Data.Maybe
 import           Data.Monoid
 import           Data.String                     (fromString)
 import qualified Data.Text                       as T
 import           GHC.Generics
+import           Lens.Micro
 import           Ohua.ALang.Lang
-import           Ohua.ALang.NS
+import           Ohua.ALang.NS                   as NS
 import           Ohua.Compile
 import           Ohua.DFGraph
 import           Ohua.Monad
@@ -58,12 +62,17 @@ import qualified Ohua.Compat.Clike.Parser        as CParse
 #endif
 
 
-getParser :: String -> L.ByteString -> RawNamespace
+getParser :: String -> L.ByteString -> (Maybe TyAnnMap, RawNamespace)
 #ifdef WITH_SEXPR_PARSER
-getParser ".ohuas" = SParse.parseNS . SLex.tokenize
+getParser ".ohuas" = (Nothing,) . SParse.parseNS . SLex.tokenize
 #endif
 #ifdef WITH_CLIKE_PARSER
-getParser ".ohuac" = CParse.parseNS . CLex.tokenize
+getParser ".ohuac" = reNS . CParse.parseNS . CLex.tokenize
+  where
+    reNS :: Namespace (Annotated (FunAnn SomeBinding) (Expr SomeBinding)) -> (Maybe TyAnnMap, RawNamespace)
+    reNS ns = (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
+      where
+        (anns, newDecls) = unzip $ map (\(name, Annotated tyAnn expr) -> ((name, tyAnn), (name, expr))) (HM.toList $ ns ^. decls)
 #endif
 getParser ext = error $ "No parser defined for files with extension '" ++ ext ++ "'"
 
@@ -78,18 +87,19 @@ supportedExtensions =
         []
 
 type IFaceDefs = HM.HashMap QualifiedBinding Expression
-type ModMap = HM.HashMap NSRef (MVar (Namespace ResolvedSymbol))
+type ModMap = HM.HashMap NSRef (MVar ResolvedNamespace)
 type ModTracker = IORef ModMap
-type RawNamespace = Namespace SomeBinding
-type ResolvedNamespace = Namespace ResolvedSymbol
+type RawNamespace = Namespace (Expr SomeBinding)
+type ResolvedNamespace = Namespace Expression
 type CompM = ExceptT Error (LoggingT IO)
+type TyAnnMap = HM.HashMap Binding (FunAnn SomeBinding)
 
 
 data GraphFile = GraphFile
-    { graph          :: OutGraph
-    , mainArity      :: Int
-    , sfDependencies :: HS.HashSet QualifiedBinding
-    } deriving (Eq, Show, Generic)
+  { graph          :: OutGraph
+  , mainArity      :: Int
+  , sfDependencies :: HS.HashSet QualifiedBinding
+  } deriving (Eq, Show, Generic)
 
 
 instance ToJSON GraphFile where toEncoding = genericToEncoding defaultOptions
@@ -104,7 +114,7 @@ stdNamespace =
 
 resolveNS :: IFaceDefs -> RawNamespace -> ResolvedNamespace
 resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
-    ns { nsDecls = HM.fromList resDecls }
+    ns & NS.decls .~ HM.fromList resDecls
   where
     resDecls = flip runReader (mempty, ifacem) $
         go0 (topSortDecls
@@ -167,17 +177,17 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
         error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "' in " ++ show modname
 
 
-readAndParse :: MonadIO m => String -> m RawNamespace
+readAndParse :: MonadIO m => String -> m (Maybe TyAnnMap, RawNamespace)
 readAndParse filename = getParser (takeExtension filename) <$> liftIO (L.readFile filename)
 
 
 gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
-gatherDeps tracker Namespace{ nsAlgoImports=algoImports } = do
-    mods <- mapConcurrently (registerAndLoad tracker) (map fst algoImports)
+gatherDeps tracker ns = do
+    mods <- mapConcurrently (registerAndLoad tracker) (map fst $ ns ^. algoImports)
     pure $ HM.fromList
-        [ (QualifiedBinding (nsName ns) name, algo)
+        [ (QualifiedBinding (ns ^. NS.name) name, algo)
         | ns <- mods
-        , (name, algo) <- HM.toList $ nsDecls ns
+        , (name, algo) <- HM.toList $ ns ^. decls
         ]
 
 
@@ -196,9 +206,9 @@ findSourceFile modname = do
 loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
 loadModule tracker modname = do
     filename <- findSourceFile modname
-    rawMod <- readAndParse filename
-    unless (nsName rawMod == modname) $
-        throwError $ "Expected module with name " <> Str.showS modname <> " but got " <> Str.showS (nsName rawMod)
+    (anns, rawMod) <- readAndParse filename
+    unless (rawMod ^. name == modname) $
+        throwError $ "Expected module with name " <> Str.showS modname <> " but got " <> Str.showS (rawMod ^. name)
     loadDepsAndResolve tracker rawMod
 
 
@@ -210,11 +220,11 @@ registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
 registerAndLoad tracker mod = registerAnd tracker mod (loadModule tracker mod)
 
 
-registerAnd :: ModTracker -> NSRef -> CompM ResolvedNamespace -> CompM ResolvedNamespace
+registerAnd :: (Eq ref, Hashable ref) => IORef (HM.HashMap ref (MVar load)) -> ref -> CompM load -> CompM load
 registerAnd tracker mod ac = do
     newModRef <- newEmptyMVar
     actualRef <- atomicModifyIORef' tracker $ \map ->
-        case HM.lookup mod map of
+        case map ^? ix mod of
             Just mvar -> (map, Left mvar)
             Nothing   -> (HM.insert mod newModRef map, Right newModRef)
     case actualRef of
@@ -232,20 +242,24 @@ gatherSFDeps = cata $ \case
 
 
 topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
-topSortMods = topSortWith nsName (map fst . nsAlgoImports)
+topSortMods = topSortWith (^. name) (map fst . (^. algoImports))
 
 
 topSortWith :: (Hashable b, Eq b) => (a -> b) -> (a -> [b]) -> [a] -> [a]
-topSortWith getIdent getDeps mods' = snd $ evalRWS go (mempty, mods') ()
+topSortWith getIdent getDeps mods' = concat @[] $ ana (uncurry go) (mempty, mods')
   where
-    go = do
-        (satisfied, avail) <- ask
-        let (newSat, newAvail) = partition (all (`HS.member` satisfied) . getDeps) avail
-        if null newSat then
-            unless (null newAvail) $ error "Unsortable! (Probably due to a cycle)"
-        else do
-            tell newSat
-            local (HS.union (HS.fromList $ map getIdent newSat) *** const newAvail) go
+    go satisfied avail
+      | null newSat =
+        if null newAvail
+        then Nil
+        else error "Unsortable! (Probably due to a cycle)"
+      | otherwise = Cons newSat $ (HS.union (HS.fromList (map getIdent newSat)) satisfied, newAvail)
+      where
+        (newSat, newAvail) = partition (all (`HS.member` satisfied) . getDeps) avail
+
+
+unlessM :: Monad m => m Bool -> m () -> m ()
+unlessM cond a = cond >>= \b -> unless b a
 
 
 topSortDecls :: (a -> Maybe Binding) -> [(Binding, Expr a)] -> [(Binding, Expr a)]
@@ -254,17 +268,11 @@ topSortDecls f decls = map fst $ topSortWith (fst . fst) snd declsWDeps
     localAlgos = HS.fromList $ map fst decls
     getDeps e = HS.toList $ snd $ evalRWS (go e) mempty ()
       where
-        go (Let assign val body) =
-          local (HS.union $ HS.fromList $ flattenAssign assign) $ go val >> go body
-        go (Var thing) | Just bnd <- f thing = do
-            isLocal <- asks (HS.member bnd)
-            if isLocal then
-                pure ()
-            else
-                when (bnd `HS.member` localAlgos) $ tell [bnd]
-        go (Var _) = pure ()
-        go (Lambda assign body) = local (HS.union $ HS.fromList $ flattenAssign assign) $ go body
-        go (Apply function val) = go function >> go val
+        go = cata $ \case
+          LetF assign val body -> local (HS.union $ HS.fromList $ flattenAssign assign) $ val >> body
+          VarF thing | Just bnd <- f thing -> unlessM (asks $ HS.member bnd) $ when (bnd `HS.member` localAlgos) $ tell [bnd]
+          LambdaF assign body -> local (HS.union $ HS.fromList $ flattenAssign assign) body
+          e -> sequence_ e
 
     declsWDeps = zip decls $ map (getDeps . snd) decls
 
@@ -275,9 +283,38 @@ mainToEnv = go 0 id
     go !i f (Lambda assign body) = go (i+1) (f . Let assign (Var $ Env $ HostExpr i)) body
     go !i f rest = (i, f rest)
 
+formatRustType :: TyExpr SomeBinding -> String
+formatRustType = go []
+  where
+    formatRef sb = concat $ intersperse "::" (map (Str.toString . unBinding) $ bnds)
+      where
+        bnds = case sb of
+                 Unqual b                       -> [b]
+                 Qual (QualifiedBinding ns bnd) -> nsRefToList ns ++ [bnd]
+
+    go l (TyRef ref) = formatRef ref ++
+      if null l
+      then ""
+      else "<" ++ intercalate "," l ++ ">"
+    go l (TyApp t1 t2) = go (formatRustType t2:l) t1
+
+data Command
+  = Build
+  | DumpType DumpOpts
+
+type LangFormatter = TyExpr SomeBinding -> String
+
+langs :: [(String, LangFormatter)]
+langs =
+  [("rust", formatRustType)]
+
+data DumpOpts = DumpOpts
+  { dumpLang :: LangFormatter
+  }
 
 data CmdOpts = CmdOpts
-    { inputModuleFile :: FilePath
+    { command_        :: Command
+    , inputModuleFile :: FilePath
     , entrypoint      :: Str.Str
     , outputPath      :: Maybe FilePath
     }
@@ -289,17 +326,30 @@ runCompM c = runStderrLoggingT $ runExceptT c >>= either (logErrorN . T.pack . S
 
 main :: IO ()
 main = runCompM $ do
-    CmdOpts { inputModuleFile = inputModFile, outputPath = out, entrypoint } <- liftIO $ execParser odef
+    opts@CmdOpts { inputModuleFile = inputModFile, outputPath = out, entrypoint } <- liftIO $ execParser odef
 
     modTracker <- newIORef HM.empty
 
-    rawMainMod <- readAndParse inputModFile
+    (mainAnns, rawMainMod) <- readAndParse inputModFile
 
-    mainMod <- registerAnd modTracker (nsName rawMainMod) $ loadDepsAndResolve modTracker rawMainMod
+    case command_ opts of
+      DumpType (DumpOpts format) ->
+        case mainAnns of
+          Nothing -> throwError "No annotations present for the module"
+          Just m ->
+            case m ^? ix (Binding entrypoint) of
+              Nothing -> throwError "Could not find chosen main module"
+              Just (FunAnn args ret) ->
+                liftIO $ L.writeFile (fromMaybe (inputModFile -<.> "type-dump") out) $ encode $ object
+                  [ "arguments" A..= map format args
+                  , "return" A..= format ret
+                  ]
+      Build -> do
+        mainMod <- registerAnd modTracker (rawMainMod ^. name) $ loadDepsAndResolve modTracker rawMainMod
 
-    case HM.lookup (Binding $ entrypoint) $ nsDecls mainMod of
-        Nothing -> throwError $ "Module does not define specified entry point '" <> entrypoint <> "'"
-        Just expr -> do
+        case mainMod ^? decls . ix (Binding entrypoint) of
+          Nothing -> throwError $ "Module does not define specified entry point '" <> entrypoint <> "'"
+          Just expr -> do
 
             let sfDeps = gatherSFDeps expr
 
@@ -320,8 +370,17 @@ main = runCompM $ do
             <> intercalate ", " (map (\a -> "'" <> fst a <> "'") supportedExtensions)
             )
         )
+    dumpOpts = DumpOpts
+      <$> argument (maybeReader $ flip lookup langs . map C.toLower)
+        (  metavar "LANG"
+        <> help "Language format for the types"
+        )
     optsParser = CmdOpts
-        <$> argument str
+        <$> hsubparser
+          (  command "build" (info (pure Build) (progDesc "Build the ohua graph"))
+          <> command "dump-main-type" (info (DumpType <$> dumpOpts) (progDesc "Dump the type of the main function"))
+          )
+        <*> argument str
             (  metavar "SOURCE"
             <> help "Source file to compile"
             )
@@ -337,3 +396,4 @@ main = runCompM $ do
             <> short 'o'
             <> help "Path to write the output to (default: input filename with '.ohuao' extension)"
             )
+

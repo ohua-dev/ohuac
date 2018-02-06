@@ -2,8 +2,9 @@ resolver: lts-9.3
 packages:
 - .
 - location:
-    git: git@github.com:ohua-dev/ohua-core
-    commit: 22a1187ae5d57cc935729b20a69f627cd773e6f3
+    ../core
+    #git: git@github.com:ohua-dev/ohua-core
+    #commit: 8b982a27f335e480982c0f47f966962ee8bf7bb9
   extra-dep: true
 - location:
     git: git@github.com:ohua-dev/alang-clike-parser
@@ -11,7 +12,7 @@ packages:
   extra-dep: true
 - location:
     git: git@github.com:ohua-dev/alang-sexpr-parser
-    commit: bef6c4597cd8ed4da54ca3e6bde530d1317c2e8e
+    commit: 40b3370d080db3bb075d0dbef31e7f7fcd5ddc78
   extra-dep: true
 extra-deps: []
 flags:

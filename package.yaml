@@ -40,6 +40,7 @@ executables:
     - data-default-class
     - lifted-base
     - lifted-async
+    - microlens
 
     when:
       - condition: flag(with-clike-parser)

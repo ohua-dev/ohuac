@@ -3,11 +3,11 @@ ns some_ns;
 use sf ohua::math (add, isZero);
 use algo some::module (a);
 
-fn square (x) {
+fn square (x : int) -> int{
     add(x, x)
 }
 
-fn algo1 (someParam, coll) {
+fn algo1 (someParam : HashMap<Key, Val>, coll : List<A>) -> Bool {
     let a = square(someParam);
 
     let coll0 = for i in coll {
@@ -22,6 +22,6 @@ fn algo1 (someParam, coll) {
 
 }
 
-fn main (param) {
+fn main (param : HashMap<Key, Value<NestedType>>) {
     algo1(param, param)
 }

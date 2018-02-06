@@ -1,9 +1,0 @@
-[submodule "ohua-core"]
-	path = ohua-core
-	url = https://github.com/ohua-dev/ohua-core
-[submodule "alang-sexpr-parser"]
-	path = alang-sexpr-parser
-	url = https://github.com/ohua-dev/alang-sexpr-parser
-[submodule "alang-clike-parser"]
-	path = alang-clike-parser
-	url = https://github.com/ohua-dev/alang-clike-parser

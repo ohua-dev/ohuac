@@ -61,30 +61,34 @@ import qualified Ohua.Compat.Clike.Lexer         as CLex
 import qualified Ohua.Compat.Clike.Parser        as CParse
 #endif
 
+type LParser = L.ByteString -> (Maybe TyAnnMap, RawNamespace)
+
+definedLangs :: [(String, String, LParser)]
+definedLangs =
+#ifdef WITH_SEXPR_PARSER
+  ( ".ohuas"
+  , "S-Expression frontend for the algorithm language"
+  , (Nothing,) . SParse.parseNS . SLex.tokenize
+  ) :
+#endif
+#ifdef WITH_CLIKE_PARSER
+  ( ".ohuac"
+  , "C/Rust-like frontent for the algorithm language"
+  , let reNS :: Namespace (Annotated (FunAnn SomeBinding) (Expr SomeBinding)) -> (Maybe TyAnnMap, RawNamespace)
+        reNS ns = (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
+          where
+            (anns, newDecls) = unzip $ map (\(name, Annotated tyAnn expr) -> ((name, tyAnn), (name, expr))) (HM.toList $ ns ^. decls)
+    in reNS . CParse.parseNS . CLex.tokenize
+  ) :
+#endif
+  []
+
+
 
 getParser :: String -> L.ByteString -> (Maybe TyAnnMap, RawNamespace)
-#ifdef WITH_SEXPR_PARSER
-getParser ".ohuas" = (Nothing,) . SParse.parseNS . SLex.tokenize
-#endif
-#ifdef WITH_CLIKE_PARSER
-getParser ".ohuac" = reNS . CParse.parseNS . CLex.tokenize
-  where
-    reNS :: Namespace (Annotated (FunAnn SomeBinding) (Expr SomeBinding)) -> (Maybe TyAnnMap, RawNamespace)
-    reNS ns = (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
-      where
-        (anns, newDecls) = unzip $ map (\(name, Annotated tyAnn expr) -> ((name, tyAnn), (name, expr))) (HM.toList $ ns ^. decls)
-#endif
-getParser ext = error $ "No parser defined for files with extension '" ++ ext ++ "'"
+getParser ext | Just a <- find ((== ext) . (^. _1)) definedLangs = a ^. _3
+              | otherwise = error $ "No parser defined for files with extension '" ++ ext ++ "'"
 
-supportedExtensions :: [(String, String)]
-supportedExtensions =
-#ifdef WITH_SEXPR_PARSER
-        (".ohuas", "S-Expression frontend for the algorithm language") :
-#endif
-#ifdef WITH_CLIKE_PARSER
-        (".ohuac", "C/Rust-like frontent for the algorithm language") :
-#endif
-        []
 
 type IFaceDefs = HM.HashMap QualifiedBinding Expression
 type ModMap = HM.HashMap NSRef (MVar ResolvedNamespace)
@@ -200,7 +204,7 @@ findSourceFile modname = do
         files -> error $ "Found multiple files matching " ++ show modname ++ ": " ++ show files
   where
     asFile = intercalate "/" $ map (Str.toString . unBinding) $ nsRefToList modname
-    extensions = map fst supportedExtensions
+    extensions = map (^. _1) definedLangs
 
 
 loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
@@ -367,7 +371,7 @@ main = runCompM $ do
         ( fullDesc
         <> header "ohuac ~ the ohua standalone compiler"
         <> progDesc ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: "
-            <> intercalate ", " (map (\a -> "'" <> fst a <> "'") supportedExtensions)
+            <> intercalate ", " (map (\a -> "'" <> a ^. _1 <> "'") definedLangs)
             )
         )
     dumpOpts = DumpOpts
@@ -394,6 +398,6 @@ main = runCompM $ do
             $  long "output"
             <> metavar "PATH"
             <> short 'o'
-            <> help "Path to write the output to (default: input filename with '.ohuao' extension)"
+            <> help "Path to write the output to (default: input filename with '.ohuao' extension for 'build' and '.type-dump' for 'dump-main-type')"
             )
 

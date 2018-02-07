@@ -2,9 +2,8 @@ resolver: lts-9.3
 packages:
 - .
 - location:
-    ../core
-    #git: git@github.com:ohua-dev/ohua-core
-    #commit: 8b982a27f335e480982c0f47f966962ee8bf7bb9
+    git: git@github.com:ohua-dev/ohua-core
+    commit: 32e06a06cf5dbb8a66397ce674b874273f0576ce
   extra-dep: true
 - location:
     git: git@github.com:ohua-dev/alang-clike-parser

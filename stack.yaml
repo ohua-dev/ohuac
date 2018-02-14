@@ -1,16 +1,16 @@
-resolver: lts-9.3
+resolver: lts-10.4
 packages:
 - .
 - location:
-    git: git@github.com:ohua-dev/ohua-core
-    commit: 32e06a06cf5dbb8a66397ce674b874273f0576ce
+    git: https://github.com/ohua-dev/ohua-core
+    commit: 53ca8948f08819129b41ec6211d7ae0fd0f9d66a
   extra-dep: true
 - location:
-    git: git@github.com:ohua-dev/alang-clike-parser
-    commit: 2b35c741a362dbad20c2bf17b62161ffb210fa22
+    git: https://github.com/ohua-dev/alang-clike-parser
+    commit: 8505b3674468f7f8d33319f4857738db45c649b6
   extra-dep: true
 - location:
-    git: git@github.com:ohua-dev/alang-sexpr-parser
+    git: https://github.com/ohua-dev/alang-sexpr-parser
     commit: 40b3370d080db3bb075d0dbef31e7f7fcd5ddc78
   extra-dep: true
 extra-deps: []

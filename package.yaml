@@ -15,6 +15,27 @@ extra-source-files:
 #   dependencies:
 #   - base >=4.7 && <5
 #   - ohua-core
+default-extensions:
+- OverloadedStrings
+- OverloadedLists
+- MultiParamTypeClasses
+- FunctionalDependencies
+- TypeFamilies
+- GADTs
+- FlexibleContexts
+- FlexibleInstances
+- TypeSynonymInstances
+- LambdaCase
+- TupleSections
+- BangPatterns
+- ExplicitForAll
+- ScopedTypeVariables
+- DefaultSignatures
+- DeriveFunctor
+- DeriveFoldable
+- DeriveTraversable
+- DeriveGeneric
+- PatternSynonyms
 executables:
   ohuac:
     main: Main.hs

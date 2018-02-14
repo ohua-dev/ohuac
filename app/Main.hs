@@ -31,10 +31,12 @@ import           Data.String                     (fromString)
 import qualified Data.Text                       as T
 import           GHC.Generics
 import           Lens.Micro
+import           Lens.Micro.Mtl
 import           Ohua.ALang.Lang
 import           Ohua.ALang.NS                   as NS
 import           Ohua.Compile
 import           Ohua.DFGraph
+import qualified Ohua.LensClasses                as OLC
 import           Ohua.Monad
 import           Ohua.Serialize.JSON
 import           Ohua.Types
@@ -66,11 +68,12 @@ definedLangs =
 #ifdef WITH_CLIKE_PARSER
   ( ".ohuac"
   , "C/Rust-like frontent for the algorithm language"
-  , let reNS :: Namespace (Annotated (FunAnn SomeBinding) (Expr SomeBinding)) -> (Maybe TyAnnMap, RawNamespace)
+  , let reNS :: Namespace (Annotated (FunAnn (TyExpr SomeBinding)) (Expr SomeBinding)) -> (Maybe TyAnnMap, RawNamespace)
         reNS ns = (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
           where
             (anns, newDecls) = unzip $ map (\(name, Annotated tyAnn expr) -> ((name, tyAnn), (name, expr))) (HM.toList $ ns ^. decls)
-    in reNS . CParse.parseNS . CLex.tokenize
+        remMutAnn = decls . each . OLC.annotation %~ fmap (view OLC.value)
+    in reNS . remMutAnn . CParse.parseNS . CLex.tokenize
   ) :
 #endif
   []
@@ -88,7 +91,7 @@ type ModTracker = IORef ModMap
 type RawNamespace = Namespace (Expr SomeBinding)
 type ResolvedNamespace = Namespace Expression
 type CompM = ExceptT Error (LoggingT IO)
-type TyAnnMap = HM.HashMap Binding (FunAnn SomeBinding)
+type TyAnnMap = HM.HashMap Binding (FunAnn (TyExpr SomeBinding))
 
 
 data GraphFile = GraphFile

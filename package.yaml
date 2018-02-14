@@ -62,7 +62,7 @@ executables:
     - lifted-base
     - lifted-async
     - microlens
-
+    - microlens-mtl
     when:
       - condition: flag(with-clike-parser)
         dependencies:

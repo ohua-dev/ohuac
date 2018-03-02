@@ -54,6 +54,7 @@ import qualified Ohua.Compat.SExpr.Parser        as SParse
 #ifdef WITH_CLIKE_PARSER
 import qualified Ohua.Compat.Clike.Lexer         as CLex
 import qualified Ohua.Compat.Clike.Parser        as CParse
+import qualified Ohua.Compat.Clike.Types         as CTy
 #endif
 
 type LParser = L.ByteString -> (Maybe TyAnnMap, RawNamespace)
@@ -282,6 +283,7 @@ mainToEnv = go 0 id
     go !i f (Lambda assign body) = go (i+1) (f . Let assign (Var $ Env $ HostExpr i)) body
     go !i f rest = (i, f rest)
 
+#if WITH_CLIKE_PARSER
 formatRustType :: TyExpr SomeBinding -> String
 formatRustType = go []
   where
@@ -291,11 +293,18 @@ formatRustType = go []
                  Unqual b                       -> [b]
                  Qual (QualifiedBinding ns bnd) -> nsRefToList ns ++ [bnd]
 
-    go l (TyRef ref) = formatRef ref ++
-      if null l
-      then ""
-      else "<" ++ intercalate "," l ++ ">"
-    go l (TyApp t1 t2) = go (formatRustType t2:l) t1
+    go l e
+      | e == CTy.tupleConstructor = "(" <> arglist <> ")"
+      | otherwise =
+        case e of
+          TyRef ref -> formatRef ref <>
+                       if null l
+                       then ""
+                       else "<" <> arglist  <> ">"
+          TyApp t1 t2 -> go (formatRustType t2:l) t1
+      where
+        arglist = intercalate "," l
+#endif
 
 data Command
   = Build
@@ -305,7 +314,10 @@ type LangFormatter = TyExpr SomeBinding -> String
 
 langs :: [(String, LangFormatter)]
 langs =
-  [("rust", formatRustType)]
+#if WITH_CLIKE_PARSER
+  ("rust", formatRustType) :
+#endif
+  []
 
 data DumpOpts = DumpOpts
   { dumpLang :: LangFormatter

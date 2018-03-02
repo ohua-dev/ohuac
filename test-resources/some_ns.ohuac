@@ -7,7 +7,7 @@ fn square (x : int) -> int{
     add(x, x)
 }
 
-fn algo1 (someParam : HashMap<Key, Val>, coll : List<A>) -> Bool {
+fn algo1 (someParam : HashMap<Key, Val>, coll : List<A>) -> (A, Bool) {
     let a = square(someParam);
 
     let coll0 = for i in coll {

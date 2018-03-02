@@ -40,6 +40,7 @@ import qualified Ohua.LensClasses                as OLC
 import           Ohua.Monad
 import           Ohua.Serialize.JSON
 import           Ohua.Types
+import           Ohua.Util.Str                   (showS)
 import qualified Ohua.Util.Str                   as Str
 import           Options.Applicative
 import           System.Directory
@@ -81,7 +82,7 @@ definedLangs =
 
 
 getParser :: String -> L.ByteString -> (Maybe TyAnnMap, RawNamespace)
-getParser ext | Just a <- find ((== ext) . (^. _1)) definedLangs = a ^. _3
+getParser ext | Just a <- find ((== ext) . view _1) definedLangs = a ^. _3
               | otherwise = error $ "No parser defined for files with extension '" ++ ext ++ "'"
 
 
@@ -111,46 +112,45 @@ stdNamespace =
     )
 
 
-resolveNS :: IFaceDefs -> RawNamespace -> ResolvedNamespace
-resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
-    ns & NS.decls .~ HM.fromList resDecls
+resolveNS :: forall m . MonadError Error m => IFaceDefs -> RawNamespace -> m ResolvedNamespace
+resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) = do
+  resDecls <- flip runReaderT (mempty, ifacem) $
+                go0 (topSortDecls
+                     (\case Unqual bnd | bnd `HS.member` locallyDefinedAlgos -> Just bnd
+                            _ -> Nothing)
+                     $ HM.toList decls)
+  pure $ ns & NS.decls .~ HM.fromList resDecls
   where
-    resDecls = flip runReader (mempty, ifacem) $
-        go0 (topSortDecls
-                (\case Unqual bnd | bnd `HS.member` locallyDefinedAlgos -> Just bnd ; _ -> Nothing)
-                $ HM.toList decls)
-
     go0 [] = pure []
     go0 ((name, expr):xs) = do
         done <- go expr
         local (second $ HM.insert (QualifiedBinding modname name) done) $
              ((name, done) :) <$> (go0 xs)
 
-    go :: Expr SomeBinding -> Reader (HS.HashSet Binding, IFaceDefs) Expression
+    go :: Expr SomeBinding -> ReaderT (HS.HashSet Binding, IFaceDefs) m Expression
     go (Let assign val body) =
         registerAssign assign $ Let assign <$> go val <*> go body
     go (Var (Unqual bnd)) = do
         isLocal <- asks (HS.member bnd . fst)
 
-        if isLocal then
-            pure $ Var $ Local bnd
-        else
+        if isLocal
+          then pure $ Var $ Local bnd
+          else
             case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
                 (Just algo, Just sf) ->
-                  error $ "Ambiguous ocurrence of unqualified binding " ++ show bnd
-                    ++ ". Could refer to algo " ++ show algo ++ " or sf " ++ show sf
+                  throwError $ "Ambiguous ocurrence of unqualified binding " <> showS bnd
+                                <> ". Could refer to algo " <> showS algo <> " or sf " <> showS sf
                 (Just algoname, _) ->
-                    fromMaybe (error $ "Algo not loaded " ++ show algoname)
-                      <$> asks (HM.lookup algoname . snd)
+                    maybe (throwError $ "Algo not loaded " <> showS algoname) pure
+                      =<< asks (HM.lookup algoname . snd)
                 (_, Just sf) -> pure $ Var $ Sf sf Nothing
-                _ -> error $ "Binding not in scope " ++ show bnd
+                _ -> throwError $ "Binding not in scope " <> showS bnd
     go (Var (Qual qb)) = do
         algo <- asks (HM.lookup qb . snd)
-        pure $
-            case algo of
-                Just algo -> algo
-                _ | qbNamespace qb `HS.member` importedSfNamespaces -> Var (Sf qb Nothing)
-                _ -> error $ "No matching algo available or namespace not loaded for " ++ show qb
+        case algo of
+          Just algo -> pure algo
+          _ | qbNamespace qb `HS.member` importedSfNamespaces -> pure $ Var (Sf qb Nothing)
+          _ -> throwError $ "No matching algo available or namespace not loaded for " <> showS qb
     go (Apply expr expr2) = Apply <$> go expr <*> go expr2
     go (Lambda assign body) =
         registerAssign assign $ Lambda assign <$> go body
@@ -173,7 +173,7 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) =
         ]
 
     reportCollidingRef a b =
-        error $ "Colliding refer for '" ++ show a ++ "' and '" ++ show b ++ "' in " ++ show modname
+        error $ "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <> show modname
 
 
 readAndParse :: MonadIO m => String -> m (Maybe TyAnnMap, RawNamespace)
@@ -194,9 +194,9 @@ findSourceFile :: NSRef -> CompM String
 findSourceFile modname = do
     candidates <- filterM (liftIO . doesFileExist) $ map (asFile <.>) extensions
     case candidates of
-        [] -> error $ "No file found for module " ++ show modname
+        [] -> throwError $ "No file found for module " <> showS modname
         [f] -> pure f
-        files -> error $ "Found multiple files matching " ++ show modname ++ ": " ++ show files
+        files -> throwError $ "Found multiple files matching " <> showS modname <> ": " <> showS files
   where
     asFile = intercalate "/" $ map (Str.toString . unBinding) $ nsRefToList modname
     extensions = map (^. _1) definedLangs
@@ -212,7 +212,7 @@ loadModule tracker modname = do
 
 
 loadDepsAndResolve :: ModTracker -> RawNamespace -> CompM ResolvedNamespace
-loadDepsAndResolve tracker rawMod = flip resolveNS rawMod <$> gatherDeps tracker rawMod
+loadDepsAndResolve tracker rawMod = flip resolveNS rawMod =<< gatherDeps tracker rawMod
 
 
 registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
@@ -241,7 +241,7 @@ gatherSFDeps = cata $ \case
 
 
 topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
-topSortMods = topSortWith (^. name) (map fst . (^. algoImports))
+topSortMods = topSortWith (^. name) (map fst . view algoImports)
 
 
 topSortWith :: (Hashable b, Eq b) => (a -> b) -> (a -> [b]) -> [a] -> [a]

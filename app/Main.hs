@@ -52,7 +52,6 @@ import qualified Ohua.Compat.SExpr.Lexer         as SLex
 import qualified Ohua.Compat.SExpr.Parser        as SParse
 #endif
 #ifdef WITH_CLIKE_PARSER
-import qualified Ohua.Compat.Clike.Lexer         as CLex
 import qualified Ohua.Compat.Clike.Parser        as CParse
 import qualified Ohua.Compat.Clike.Types         as CTy
 #endif
@@ -75,7 +74,7 @@ definedLangs =
           where
             (anns, newDecls) = unzip $ map (\(name, Annotated tyAnn expr) -> ((name, tyAnn), (name, expr))) (HM.toList $ ns ^. decls)
         remMutAnn = decls . each . OLC.annotation %~ fmap (view OLC.value)
-    in reNS . remMutAnn . CParse.parseNS . CLex.tokenize
+    in reNS . remMutAnn . CParse.parseNS
   ) :
 #endif
   []

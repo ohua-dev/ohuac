@@ -1,51 +1,54 @@
-{-# LANGUAGE CPP              #-}
-{-# LANGUAGE NamedFieldPuns   #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE OverloadedLists #-}
+
 module Main where
 
-
-import           Control.Arrow
-import           Control.Concurrent.Async.Lifted
-import           Control.Concurrent.MVar.Lifted
-import           Control.Monad
-import           Control.Monad.Except
-import           Control.Monad.IO.Class
-import           Control.Monad.Reader
-import           Control.Monad.RWS
-import           Control.Monad.Writer
-import           Data.Aeson                      as A
-import qualified Data.ByteString.Lazy.Char8      as L
-import qualified Data.Char                       as C
-import           Data.Default.Class
-import           Data.Foldable
-import           Data.Functor.Foldable           hiding (fold)
-import           Data.Hashable
-import qualified Data.HashMap.Strict             as HM
-import qualified Data.HashSet                    as HS
-import           Data.IORef.Lifted
-import           Data.List                       (partition)
-import           Data.List                       (intercalate, intersperse)
-import           Data.Maybe
-import           Data.Monoid
-import           Data.String                     (fromString)
-import qualified Data.Text                       as T
-import           GHC.Generics
-import           Lens.Micro
-import           Lens.Micro.Mtl
-import           Ohua.ALang.Lang
-import           Ohua.ALang.NS                   as NS
-import           Ohua.Compile
-import           Ohua.DFGraph
-import qualified Ohua.LensClasses                as OLC
-import           Ohua.Monad
-import           Ohua.Serialize.JSON
-import           Ohua.Types
-import           Ohua.Util.Str                   (showS)
-import qualified Ohua.Util.Str                   as Str
-import           Options.Applicative
-import           System.Directory
-import           System.Environment
-import           System.FilePath                 (takeExtension, (-<.>), (<.>))
+import Control.Arrow
+import Control.Concurrent.Async.Lifted
+import Control.Concurrent.MVar.Lifted
+import Control.Monad
+import Control.Monad.Except
+import Control.Monad.IO.Class
+import Control.Monad.RWS
+import Control.Monad.Reader
+import Control.Monad.Writer
+import Data.Aeson as A
+import qualified Data.ByteString.Lazy.Char8 as L
+import qualified Data.Char as C
+import Data.Default.Class
+import Data.Foldable
+import Data.Functor.Foldable hiding (fold)
+import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
+import Data.Hashable
+import Data.IORef.Lifted
+import Data.List (partition)
+import Data.List (intercalate, intersperse)
+import Data.Maybe
+import Data.Monoid
+import Data.String (fromString)
+import qualified Data.Text as T
+import GHC.Generics
+import Lens.Micro
+import Lens.Micro.Mtl
+import Lens.Micro.Internal (Ixed, Index, IxValue)
+import Ohua.ALang.Lang
+import Ohua.ALang.NS as NS
+import Ohua.Compile
+import Ohua.DFGraph
+import qualified Ohua.LensClasses as OLC
+import Ohua.Monad
+import Ohua.Serialize.JSON
+import Ohua.Types
+import Ohua.Util (mapLeft)
+import Ohua.Util.Str (showS)
+import qualified Ohua.Util.Str as Str
+import Options.Applicative
+import System.Directory
+import System.Environment
+import System.FilePath ((-<.>), (<.>), takeExtension)
 
 #ifdef WITH_SEXPR_PARSER
 import qualified Ohua.Compat.SExpr.Lexer         as SLex
@@ -61,29 +64,37 @@ type LParser = L.ByteString -> (Maybe TyAnnMap, RawNamespace)
 definedLangs :: [(String, String, LParser)]
 definedLangs =
 #ifdef WITH_SEXPR_PARSER
-  ( ".ohuas"
-  , "S-Expression frontend for the algorithm language"
-  , (Nothing,) . SParse.parseNS . SLex.tokenize
-  ) :
+    ( ".ohuas"
+    , "S-Expression frontend for the algorithm language"
+    , (Nothing, ) . SParse.parseNS . SLex.tokenize) :
 #endif
 #ifdef WITH_CLIKE_PARSER
-  ( ".ohuac"
-  , "C/Rust-like frontent for the algorithm language"
-  , let reNS :: Namespace (Annotated (FunAnn (TyExpr SomeBinding)) (Expr SomeBinding)) -> (Maybe TyAnnMap, RawNamespace)
-        reNS ns = (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
-          where
-            (anns, newDecls) = unzip $ map (\(name, Annotated tyAnn expr) -> ((name, tyAnn), (name, expr))) (HM.toList $ ns ^. decls)
-        remMutAnn = decls . each . OLC.annotation %~ fmap (view OLC.value)
-    in reNS . remMutAnn . CParse.parseNS
-  ) :
+    ( ".ohuac"
+    , "C/Rust-like frontent for the algorithm language"
+    , let reNS ::
+                 Namespace (Annotated (FunAnn (TyExpr SomeBinding)) (Expr SomeBinding))
+              -> (Maybe TyAnnMap, RawNamespace)
+          reNS ns =
+              (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
+            where
+              (anns, newDecls) =
+                  unzip $
+                  map
+                      (\(name, Annotated tyAnn expr) ->
+                           ((name, tyAnn), (name, expr)))
+                      (HM.toList $ ns ^. decls)
+          remMutAnn = decls . each . OLC.annotation %~ fmap (view OLC.value)
+       in reNS . remMutAnn . CParse.parseNS) :
 #endif
-  []
+    []
 
 
 
 getParser :: String -> L.ByteString -> (Maybe TyAnnMap, RawNamespace)
-getParser ext | Just a <- find ((== ext) . view _1) definedLangs = a ^. _3
-              | otherwise = error $ "No parser defined for files with extension '" ++ ext ++ "'"
+getParser ext
+    | Just a <- find ((== ext) . view _1) definedLangs = a ^. _3
+    | otherwise =
+        error $ "No parser defined for files with extension '" ++ ext ++ "'"
 
 
 type IFaceDefs = HM.HashMap QualifiedBinding Expression
@@ -96,84 +107,101 @@ type TyAnnMap = HM.HashMap Binding (FunAnn (TyExpr SomeBinding))
 
 
 data GraphFile = GraphFile
-  { graph          :: OutGraph
-  , mainArity      :: Int
-  , sfDependencies :: HS.HashSet QualifiedBinding
-  } deriving (Eq, Show, Generic)
+    { graph :: OutGraph
+    , mainArity :: Int
+    , sfDependencies :: HS.HashSet QualifiedBinding
+    } deriving (Eq, Show, Generic)
 
 
-instance ToJSON GraphFile where toEncoding = genericToEncoding defaultOptions
-instance FromJSON GraphFile where parseJSON = genericParseJSON defaultOptions
+instance ToJSON GraphFile where
+    toEncoding = genericToEncoding defaultOptions
+instance FromJSON GraphFile where
+    parseJSON = genericParseJSON defaultOptions
 
 
+stdNamespace :: (NSRef, [Binding])
 stdNamespace =
-    ( nsRefFromList ["ohua", "lang"]
-    , [ "id", "smap", "if" ] -- TODO complete list
-    )
+    ( ["ohua", "lang"]
+    , ["id", "smap", "if"] -- TODO complete list
+     )
 
 
-resolveNS :: forall m . MonadError Error m => IFaceDefs -> RawNamespace -> m ResolvedNamespace
+resolveNS ::
+       forall m. MonadError Error m
+    => IFaceDefs
+    -> RawNamespace
+    -> m ResolvedNamespace
 resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) = do
-  resDecls <- flip runReaderT (mempty, ifacem) $
-                go0 (topSortDecls
-                     (\case Unqual bnd | bnd `HS.member` locallyDefinedAlgos -> Just bnd
-                            _ -> Nothing)
-                     $ HM.toList decls)
-  pure $ ns & NS.decls .~ HM.fromList resDecls
+    resDecls <-
+        flip runReaderT (mempty, ifacem) $
+        go0
+            (topSortDecls
+                 (\case
+                      Unqual bnd
+                          | bnd `HS.member` locallyDefinedAlgos -> Just bnd
+                      _ -> Nothing) $
+             HM.toList decls)
+    pure $ ns & NS.decls .~ HM.fromList resDecls
   where
     go0 [] = pure []
     go0 ((name, expr):xs) = do
         done <- go expr
         local (second $ HM.insert (QualifiedBinding modname name) done) $
-             ((name, done) :) <$> (go0 xs)
-
-    go :: Expr SomeBinding -> ReaderT (HS.HashSet Binding, IFaceDefs) m Expression
+            ((name, done) :) <$> (go0 xs)
+    go :: Expr SomeBinding
+       -> ReaderT (HS.HashSet Binding, IFaceDefs) m Expression
     go (Let assign val body) =
         registerAssign assign $ Let assign <$> go val <*> go body
     go (Var (Unqual bnd)) = do
         isLocal <- asks (HS.member bnd . fst)
-
         if isLocal
-          then pure $ Var $ Local bnd
-          else
-            case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
-                (Just algo, Just sf) ->
-                  throwError $ "Ambiguous ocurrence of unqualified binding " <> showS bnd
-                                <> ". Could refer to algo " <> showS algo <> " or sf " <> showS sf
-                (Just algoname, _) ->
-                    maybe (throwError $ "Algo not loaded " <> showS algoname) pure
-                      =<< asks (HM.lookup algoname . snd)
-                (_, Just sf) -> pure $ Var $ Sf sf Nothing
-                _ -> throwError $ "Binding not in scope " <> showS bnd
+            then pure $ Var $ Local bnd
+            else case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
+                     (Just algo, Just sf) ->
+                         throwError $
+                         "Ambiguous ocurrence of unqualified binding " <>
+                         showS bnd <>
+                         ". Could refer to algo " <>
+                         showS algo <>
+                         " or sf " <>
+                         showS sf
+                     (Just algoname, _) ->
+                         maybe
+                             (throwError $ "Algo not loaded " <> showS algoname)
+                             pure =<<
+                         asks (HM.lookup algoname . snd)
+                     (_, Just sf) -> pure $ Var $ Sf sf Nothing
+                     _ -> throwError $ "Binding not in scope " <> showS bnd
     go (Var (Qual qb)) = do
         algo <- asks (HM.lookup qb . snd)
         case algo of
-          Just algo -> pure algo
-          _ | qbNamespace qb `HS.member` importedSfNamespaces -> pure $ Var (Sf qb Nothing)
-          _ -> throwError $ "No matching algo available or namespace not loaded for " <> showS qb
+            Just algo -> pure algo
+            _
+                | qbNamespace qb `HS.member` importedSfNamespaces ->
+                    pure $ Var (Sf qb Nothing)
+            _ ->
+                throwError $
+                "No matching algo available or namespace not loaded for " <>
+                showS qb
     go (Apply expr expr2) = Apply <$> go expr <*> go expr2
-    go (Lambda assign body) =
-        registerAssign assign $ Lambda assign <$> go body
-
+    go (Lambda assign body) = registerAssign assign $ Lambda assign <$> go body
     sfImports = stdNamespace : sfImports'
-
-    registerAssign = local . first . HS.union . HS.fromList . flattenAssign
-
+    registerAssign = local . first . HS.union . HS.fromList . extractBindings
     locallyDefinedAlgos = HS.fromMap $ HM.map (const ()) decls
-
     importedSfNamespaces = HS.fromList $ map fst sfImports
-
     algoRefers = mkReferMap $ (modname, HM.keys decls) : algoImports
     sfRefers = mkReferMap sfImports
-
-    mkReferMap importList = HM.fromListWith reportCollidingRef
-        [ (shortname, QualifiedBinding sourceNS shortname)
-        | (sourceNS, referList) <- importList
-        , shortname <- referList
-        ]
-
+    mkReferMap importList =
+        HM.fromListWith
+            reportCollidingRef
+            [ (shortname, QualifiedBinding sourceNS shortname)
+            | (sourceNS, referList) <- importList
+            , shortname <- referList
+            ]
     reportCollidingRef a b =
-        error $ "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <> show modname
+        error $
+        "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <>
+        show modname
 
 
 readAndParse :: MonadIO m => String -> m (Maybe TyAnnMap, RawNamespace)
@@ -198,7 +226,7 @@ findSourceFile modname = do
         [f] -> pure f
         files -> throwError $ "Found multiple files matching " <> showS modname <> ": " <> showS files
   where
-    asFile = intercalate "/" $ map (Str.toString . unBinding) $ nsRefToList modname
+    asFile = intercalate "/" $ map (Str.toString . unwrap) $ unwrap modname
     extensions = map (^. _1) definedLangs
 
 
@@ -267,40 +295,47 @@ topSortDecls f decls = map fst $ topSortWith (fst . fst) snd declsWDeps
     localAlgos = HS.fromList $ map fst decls
     getDeps e = HS.toList $ snd $ evalRWS (go e) mempty ()
       where
-        go = cata $ \case
-          LetF assign val body -> local (HS.union $ HS.fromList $ flattenAssign assign) $ val >> body
-          VarF thing | Just bnd <- f thing -> unlessM (asks $ HS.member bnd) $ when (bnd `HS.member` localAlgos) $ tell [bnd]
-          LambdaF assign body -> local (HS.union $ HS.fromList $ flattenAssign assign) body
-          e -> sequence_ e
-
+        go =
+            cata $ \case
+                LetF assign val body -> withRegisterBinds assign $ val >> body
+                VarF thing
+                    | Just bnd <- f thing ->
+                        unlessM (asks $ HS.member bnd) $
+                        when (bnd `HS.member` localAlgos) $ tell [bnd]
+                LambdaF assign body -> withRegisterBinds assign body
+                e -> sequence_ e
+        withRegisterBinds = local . HS.union . HS.fromList . extractBindings
     declsWDeps = zip decls $ map (getDeps . snd) decls
 
 
 mainToEnv :: Expression -> (Int, Expression)
 mainToEnv = go 0 id
   where
-    go !i f (Lambda assign body) = go (i+1) (f . Let assign (Var $ Env $ HostExpr i)) body
+    go !i f (Lambda assign body) =
+        go (i + 1) (f . Let assign (Var $ Env $ makeThrow i)) body
     go !i f rest = (i, f rest)
 
 #if WITH_CLIKE_PARSER
 formatRustType :: TyExpr SomeBinding -> String
 formatRustType = go []
   where
-    formatRef sb = concat $ intersperse "::" (map (Str.toString . unBinding) $ bnds)
+    formatRef sb =
+        concat $ intersperse "::" (map (Str.toString . unwrap) $ bnds)
       where
-        bnds = case sb of
-                 Unqual b                       -> [b]
-                 Qual (QualifiedBinding ns bnd) -> nsRefToList ns ++ [bnd]
-
+        bnds =
+            case sb of
+                Unqual b -> [b]
+                Qual (QualifiedBinding ns bnd) -> unwrap ns ++ [bnd]
     go l e
-      | e == CTy.tupleConstructor = "(" <> arglist <> ")"
-      | otherwise =
-        case e of
-          TyRef ref -> formatRef ref <>
-                       if null l
-                       then ""
-                       else "<" <> arglist  <> ">"
-          TyApp t1 t2 -> go (formatRustType t2:l) t1
+        | e == CTy.tupleConstructor = "(" <> arglist <> ")"
+        | otherwise =
+            case e of
+                TyRef ref ->
+                    formatRef ref <>
+                    if null l
+                        then ""
+                        else "<" <> arglist <> ">"
+                TyApp t1 t2 -> go (formatRustType t2 : l) t1
       where
         arglist = intercalate "," l
 #endif
@@ -319,91 +354,108 @@ langs =
   []
 
 data DumpOpts = DumpOpts
-  { dumpLang :: LangFormatter
-  }
+    { dumpLang :: LangFormatter
+    }
 
 data CmdOpts = CmdOpts
-    { command_        :: Command
+    { command_ :: Command
     , inputModuleFile :: FilePath
-    , entrypoint      :: Str.Str
-    , outputPath      :: Maybe FilePath
+    , entrypoint :: Binding
+    , outputPath :: Maybe FilePath
     }
 
 
 runCompM :: CompM () -> IO ()
-runCompM c = runStderrLoggingT $ runExceptT c >>= either (logErrorN . T.pack . Str.toString) pure
+runCompM c =
+    runStderrLoggingT $
+    runExceptT c >>= either (logErrorN . T.pack . Str.toString) pure
 
 
 main :: IO ()
-main = runCompM $ do
-    opts@CmdOpts { inputModuleFile = inputModFile, outputPath = out, entrypoint } <- liftIO $ execParser odef
-
-    modTracker <- newIORef HM.empty
-
-    (mainAnns, rawMainMod) <- readAndParse inputModFile
-
-    case command_ opts of
-      DumpType (DumpOpts format) ->
-        case mainAnns of
-          Nothing -> throwError "No annotations present for the module"
-          Just m ->
-            case m ^? ix (Binding entrypoint) of
-              Nothing -> throwError "Could not find chosen main module"
-              Just (FunAnn args ret) ->
-                liftIO $ L.writeFile (fromMaybe (inputModFile -<.> "type-dump") out) $ encode $ object
-                  [ "arguments" A..= map format args
-                  , "return" A..= format ret
-                  ]
-      Build -> do
-        mainMod <- registerAnd modTracker (rawMainMod ^. name) $ loadDepsAndResolve modTracker rawMainMod
-
-        case mainMod ^? decls . ix (Binding entrypoint) of
-          Nothing -> throwError $ "Module does not define specified entry point '" <> entrypoint <> "'"
-          Just expr -> do
-
-            let sfDeps = gatherSFDeps expr
-
-            let (mainArity, completeExpr) = mainToEnv expr
-
-            gr <- compile def def completeExpr
-            liftIO $ L.writeFile (fromMaybe (inputModFile -<.> "ohuao") out) $ encode $ GraphFile
-              { graph = gr
-              , mainArity = mainArity
-              , sfDependencies = sfDeps
-              }
+main =
+    runCompM $ do
+        opts@CmdOpts { inputModuleFile = inputModFile
+                     , outputPath = out
+                     , entrypoint
+                     } <- liftIO $ execParser odef
+        modTracker <- newIORef HM.empty
+        (mainAnns, rawMainMod) <- readAndParse inputModFile
+        let getMain ::
+                   (Ixed m, Index m ~ Binding, MonadError Error mo)
+                => m
+                -> mo (IxValue m)
+            getMain m =
+                case m ^? ix entrypoint of
+                    Nothing ->
+                        throwError $
+                        "Module does not define specified entry point '" <>
+                        unwrap entrypoint <>
+                        "'"
+                    Just x -> pure x
+        case command_ opts of
+            DumpType (DumpOpts format) ->
+                case mainAnns of
+                    Nothing ->
+                        throwError "No annotations present for the module"
+                    Just m -> do
+                        FunAnn args ret <- getMain m
+                        liftIO $
+                            L.writeFile
+                                (fromMaybe (inputModFile -<.> "type-dump") out) $
+                            encode $
+                            object
+                                [ "arguments" A..= map format args
+                                , "return" A..= format ret
+                                ]
+            Build -> do
+                mainMod <-
+                    registerAnd modTracker (rawMainMod ^. name) $
+                    loadDepsAndResolve modTracker rawMainMod
+                expr <- getMain $ mainMod ^. decls
+                let sfDeps = gatherSFDeps expr
+                let (mainArity, completeExpr) = mainToEnv expr
+                gr <- compile def def completeExpr
+                liftIO $
+                    L.writeFile (fromMaybe (inputModFile -<.> "ohuao") out) $
+                    encode $
+                    GraphFile
+                        { graph = gr
+                        , mainArity = mainArity
+                        , sfDependencies = sfDeps
+                        }
   where
-    odef = info
-        (helper <*> optsParser)
-        ( fullDesc
-        <> header "ohuac ~ the ohua standalone compiler"
-        <> progDesc ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: "
-            <> intercalate ", " (map (\a -> "'" <> a ^. _1 <> "'") definedLangs)
-            )
-        )
-    dumpOpts = DumpOpts
-      <$> argument (maybeReader $ flip lookup langs . map C.toLower)
-        (  metavar "LANG"
-        <> help "Language format for the types"
-        )
-    optsParser = CmdOpts
-        <$> hsubparser
-          (  command "build" (info (pure Build) (progDesc "Build the ohua graph"))
-          <> command "dump-main-type" (info (DumpType <$> dumpOpts) (progDesc "Dump the type of the main function"))
-          )
-        <*> argument str
-            (  metavar "SOURCE"
-            <> help "Source file to compile"
-            )
-        <*> argument (Str.fromString <$> str)
-            (  metavar "MAIN"
-            <> help "Algorithm that serves as entry point"
-            <> value "main"
-            )
-        <*> optional
-            (  strOption
-            $  long "output"
-            <> metavar "PATH"
-            <> short 'o'
-            <> help "Path to write the output to (default: input filename with '.ohuao' extension for 'build' and '.type-dump' for 'dump-main-type')"
-            )
-
+    odef =
+        info
+            (helper <*> optsParser)
+            (fullDesc <> header "ohuac ~ the ohua standalone compiler" <>
+             progDesc
+                 ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: " <>
+                  intercalate
+                      ", "
+                      (map (\a -> "'" <> a ^. _1 <> "'") definedLangs)))
+    dumpOpts =
+        DumpOpts <$>
+        argument
+            (maybeReader $ flip lookup langs . map C.toLower)
+            (metavar "LANG" <> help "Language format for the types")
+    optsParser =
+        CmdOpts <$>
+        hsubparser
+            (command
+                 "build"
+                 (info (pure Build) (progDesc "Build the ohua graph")) <>
+             command
+                 "dump-main-type"
+                 (info
+                      (DumpType <$> dumpOpts)
+                      (progDesc "Dump the type of the main function"))) <*>
+        argument str (metavar "SOURCE" <> help "Source file to compile") <*>
+        argument
+            (eitherReader $ mapLeft Str.toString . make . Str.fromString)
+            (metavar "MAIN" <> help "Algorithm that serves as entry point" <>
+             value "main") <*>
+        optional
+            (strOption $
+             long "output" <> metavar "PATH" <> short 'o' <>
+             help
+                 "Path to write the output to (default: input filename with '.ohuao' extension for 'build' and '.type-dump' for 'dump-main-type')")

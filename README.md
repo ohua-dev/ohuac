@@ -9,8 +9,8 @@ For a complete list of the options available use the `--help` flag.
 
 ## Installing
 
-Prebuilt binaries are available for Linux and OSX. Provided for each release by
-[Travis CI](https://travis-ci.org/ohua-dev/ohuac).
+Prebuilt binaries are available for 64bit Linux and OSX. Provided for each
+release by [Travis CI](https://travis-ci.org/ohua-dev/ohuac).
 
 Simply download the appropriate executable for you platform (`ohuac-linux` or
 `ohuac-osx`) from the [releases page](/releases/latest).

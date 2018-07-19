@@ -1,40 +1,26 @@
-# This is the simple Travis configuration, which is intended for use
-# on applications which do not require cross-platform and
-# multiple-GHC-version support. For more information and other
-# options, see:
-#
-# https://docs.haskellstack.org/en/stable/travis_ci/
-#
-# Copy these contents into the root directory of your Github project in a file
-# named .travis.yml
-
-# Use new container infrastructure to enable caching
 sudo: false
-
-# Do not choose a language; we provide our own build tools.
 language: generic
-
-# Caching so the next build will be fast too.
 cache:
   directories:
-  - $HOME/.stack
-
-# Ensure necessary system libraries are present
+  - "$HOME/.stack"
 addons:
   apt:
     packages:
-      - libgmp-dev
-
+    - libgmp-dev
 before_install:
-# Download and unpack the stack executable
 - mkdir -p ~/.local/bin
 - export PATH=$HOME/.local/bin:$PATH
-- travis_retry curl -L https://www.stackage.org/stack/linux-x86_64 | tar xz --wildcards --strip-components=1 -C ~/.local/bin '*/stack'
-
+- travis_retry curl -L https://www.stackage.org/stack/linux-x86_64 | tar xz --wildcards
+  --strip-components=1 -C ~/.local/bin '*/stack'
 install:
-# Build dependencies
 - stack --no-terminal --install-ghc test --only-dependencies
-
 script:
-# Build the package, its tests, and its docs and run the tests
 - stack --no-terminal test --ghc-options=-Werror --haddock --no-haddock-deps
+deploy:
+  provider: releases
+  api_key:
+    secure: teUtqm38oILfBDKk4/S4DrO+n1+gO4Tz2L+1FRtwp0k8vj1hyxWgu1IoiREBTf9trQyBMa/vW0EegHt7SB+LP3tF8s8YRQveiQMcw6HDiMhHzfRfq5dVHPdCJmuk1hNA6GM7u7/+cpk7QJzwGSTmksm47TuPcXMGh/0DsmOnLzMlhaQcUqOxdZp6fVb0VyxoSWwwgKp+Ko5VUo+O3N9H62MG4cHRfxII1y1i1+6tHVn+6zX/BjSph25V3aD1GhNYwFcYFwv2k3Z9r1PYvBSASkO6pftcU4LAd5WS9ryT3jajqTBo2lKPviLCsz+sTNcOThiCeeQBB+ctgZUhp0crGXMd3Jqzsv7lNkvveiLQ7OVARHUTY6EkJvet7rPfXxYtwcTCWSZPuonYktK2Wi573/j1LjeolonDpKQSWNpNOucthmm80eRqpKp49N/8DnDCUI43xOLuERj1w1t8cKS/rivZCUS4/p9XwmsKTX7dSwVHkoNOyb3vZvzYZBvyMxqTCmRGIp/DW/BhQsMeVEogr69JiWcHy2p9eNEM80PbfiHeYHphtoZMoZaUZUwMRB/g/CvzB8lJCt1ZlVzPVZH/qyHzmkrWkWXQAkbpeAGP7Pd9XRAPCiRLECe+y7KJA9JRks8pDwTVo+vLEwFsqsIhBDw48fLk7q14Jj30mo0z/W8=
+  file: ohuac
+  on:
+    repo: ohua-dev/ohuac
+  before_deploy: "mv `stack exec -- which ohuac` ohuac"

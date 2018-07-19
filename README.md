@@ -1,9 +1,15 @@
-# The standalone ohua compiler: `ohuac`
+# The standalone Ohua compiler: `ohuac`
+
+[![Build Status](https://travis-ci.org/ohua-dev/ohuac.svg?branch=master)](https://travis-ci.org/ohua-dev/ohuac)
+[![Latest Release](https://img.shields.io/github/release/ohua-dev/ohuac.svg)](https://github.com/ohua-dev/ohuac/releases/latest)
 
 ## Installing
 
-You can download the `ohuac` executable directly for the [github releases
-page](/releases/latest).
+Prebuilt binaries are available for Linux and OSX. Provided for each release by
+[Travis CI](https://travis-ci.org/ohua-dev/ohuac).
+
+Simply download the appropriate executable for you platform (`ohuac-linux` or
+`ohuac-osx`) from the [releases page](/releases/latest).
 
 ## Building from source
 

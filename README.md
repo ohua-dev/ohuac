@@ -1,6 +1,11 @@
-# ohua-standalone
+# The standalone ohua compiler: `ohuac`
 
 ## Installing
+
+You can download the `ohuac` executable directly for the [github releases
+page](/releases/latest).
+
+## Building from source
 
 Required tools:
 

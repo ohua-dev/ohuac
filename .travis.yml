@@ -1,5 +1,8 @@
 sudo: false
 language: generic
+os:
+  - linux
+  - osx
 cache:
   directories:
   - "$HOME/.stack"
@@ -16,14 +19,15 @@ install:
 - stack --no-terminal --install-ghc test --only-dependencies
 script:
 - stack --no-terminal test --ghc-options=-Werror --haddock --no-haddock-deps
-before_deploy: "mv `stack exec -- which ohuac` ohuac"
+before_deploy: "mkdir deploy && mv `stack exec -- which ohuac` deploy/ohuac-$TRAVIS_OS_NAME"
 deploy:
   provider: releases
   skip_cleanup: true
+  file_glob: true
   on:
     tags: true
   api_key:
     secure: teUtqm38oILfBDKk4/S4DrO+n1+gO4Tz2L+1FRtwp0k8vj1hyxWgu1IoiREBTf9trQyBMa/vW0EegHt7SB+LP3tF8s8YRQveiQMcw6HDiMhHzfRfq5dVHPdCJmuk1hNA6GM7u7/+cpk7QJzwGSTmksm47TuPcXMGh/0DsmOnLzMlhaQcUqOxdZp6fVb0VyxoSWwwgKp+Ko5VUo+O3N9H62MG4cHRfxII1y1i1+6tHVn+6zX/BjSph25V3aD1GhNYwFcYFwv2k3Z9r1PYvBSASkO6pftcU4LAd5WS9ryT3jajqTBo2lKPviLCsz+sTNcOThiCeeQBB+ctgZUhp0crGXMd3Jqzsv7lNkvveiLQ7OVARHUTY6EkJvet7rPfXxYtwcTCWSZPuonYktK2Wi573/j1LjeolonDpKQSWNpNOucthmm80eRqpKp49N/8DnDCUI43xOLuERj1w1t8cKS/rivZCUS4/p9XwmsKTX7dSwVHkoNOyb3vZvzYZBvyMxqTCmRGIp/DW/BhQsMeVEogr69JiWcHy2p9eNEM80PbfiHeYHphtoZMoZaUZUwMRB/g/CvzB8lJCt1ZlVzPVZH/qyHzmkrWkWXQAkbpeAGP7Pd9XRAPCiRLECe+y7KJA9JRks8pDwTVo+vLEwFsqsIhBDw48fLk7q14Jj30mo0z/W8=
-  file: ohuac
+  file: deploy/*
   on:
     repo: ohua-dev/ohuac

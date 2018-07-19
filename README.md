@@ -3,6 +3,10 @@
 [![Build Status](https://travis-ci.org/ohua-dev/ohuac.svg?branch=master)](https://travis-ci.org/ohua-dev/ohuac)
 [![Latest Release](https://img.shields.io/github/release/ohua-dev/ohuac.svg)](https://github.com/ohua-dev/ohuac/releases/latest)
 
+## Usage
+
+For a complete list of the options available use the `--help` flag.
+
 ## Installing
 
 Prebuilt binaries are available for Linux and OSX. Provided for each release by
@@ -34,8 +38,6 @@ Required tools:
    It builds the executable `ohuac` and copies it to `~/.local/bin`. If you do
    not wish this use `stack build` instead and find the path of the binary using
    `stack exec -- which ohuac` afterwards
-
-3. Explore the options for the compiler using `ohuac --help`
 
 
 ## Examples

@@ -16,6 +16,7 @@ install:
 - stack --no-terminal --install-ghc test --only-dependencies
 script:
 - stack --no-terminal test --ghc-options=-Werror --haddock --no-haddock-deps
+before_deploy: "mv `stack exec -- which ohuac` ohuac"
 deploy:
   provider: releases
   skip_cleanup: true
@@ -26,4 +27,3 @@ deploy:
   file: ohuac
   on:
     repo: ohua-dev/ohuac
-  before_deploy: "mv `stack exec -- which ohuac` ohuac"

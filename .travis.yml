@@ -6,6 +6,7 @@ os:
 cache:
   directories:
   - "$HOME/.stack"
+  - $TRAVIS_BUILD_DIR/.stack-work
 addons:
   apt:
     packages:
@@ -13,8 +14,13 @@ addons:
 before_install:
 - mkdir -p ~/.local/bin
 - export PATH=$HOME/.local/bin:$PATH
-- travis_retry curl -L https://www.stackage.org/stack/linux-x86_64 | tar xz --wildcards
-  --strip-components=1 -C ~/.local/bin '*/stack'
+- |
+  if [ $TRAVIS_OS_NAME = "osx" ]
+  then
+    travis_retry curl --insecure -L https://get.haskellstack.org/stable/osx-x86_64.tar.gz | tar xz --strip-components=1 --include '*/stack' -C ~/.local/bin
+  else
+    travis_retry curl -L https://get.haskellstack.org/stable/linux-x86_64.tar.gz | tar xz --wildcards --strip-components=1 -C ~/.local/bin '*/stack'
+  fi
 install:
 - stack --no-terminal --install-ghc test --only-dependencies
 script:

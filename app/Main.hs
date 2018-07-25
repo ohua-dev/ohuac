@@ -17,9 +17,11 @@ import Control.Monad.Writer
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Char as C
+
 import Data.Default.Class
 import Data.Foldable
 import Data.Functor.Foldable hiding (fold)
+import Data.Generics.Uniplate.Direct
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as HS
 import Data.Hashable
@@ -32,8 +34,8 @@ import Data.String (fromString)
 import qualified Data.Text as T
 import GHC.Generics
 import Lens.Micro
+import Lens.Micro.Internal (Index, IxValue, Ixed)
 import Lens.Micro.Mtl
-import Lens.Micro.Internal (Ixed, Index, IxValue)
 import Ohua.ALang.Lang
 import Ohua.ALang.NS as NS
 import Ohua.Compile
@@ -263,9 +265,10 @@ registerAnd tracker mod ac = do
 
 
 gatherSFDeps :: Expression -> HS.HashSet QualifiedBinding
-gatherSFDeps = cata $ \case
-  VarF (Sf ref _) -> HS.singleton ref
-  other -> fold other
+gatherSFDeps e = HS.fromList [ref | Var (Sf ref _) <- universe e]
+-- gatherSFDeps = cata $ \case
+--   VarF (Sf ref _) -> HS.singleton ref
+--   other -> fold other
 
 
 topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]

@@ -24,7 +24,7 @@ before_install:
 install:
 - stack --no-terminal --install-ghc test --only-dependencies
 script:
-- stack --no-terminal test --ghc-options=-Werror --haddock --no-haddock-deps
+- stack --no-terminal test --haddock --no-haddock-deps --executable-stripping --library-stripping --ghc=options="-O2 -Werror"
 before_deploy: "mkdir deploy && mv `stack exec -- which ohuac` deploy/ohuac-$TRAVIS_OS_NAME"
 deploy:
   provider: releases

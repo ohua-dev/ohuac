@@ -63,6 +63,7 @@ executables:
     - lifted-async
     - microlens
     - microlens-mtl
+    - uniplate
     when:
       - condition: flag(with-clike-parser)
         dependencies:

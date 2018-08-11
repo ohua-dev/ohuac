@@ -1,9 +1,9 @@
-resolver: lts-10.4
+resolver: lts-12.5
 packages:
 - .
 - location:
     git: https://github.com/ohua-dev/ohua-core
-    commit: 868cfd3449515f38e3d9546578309af1b2bbf19f
+    commit: 4385684f0eb96105da83f2779e743e39774f216a
   extra-dep: true
 - location:
     git: https://github.com/ohua-dev/alang-clike-parser

@@ -1,360 +1,33 @@
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE OverloadedLists #-}
-
 module Main where
 
+import Protolude
+
 import Control.Arrow
-import Control.Concurrent.Async.Lifted
-import Control.Concurrent.MVar.Lifted
-import Control.Monad
-import Control.Monad.Except
-import Control.Monad.IO.Class
-import Control.Monad.RWS
-import Control.Monad.Reader
-import Control.Monad.Writer
+import Control.Category ((>>>))
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Char as C
-
 import Data.Default.Class
-import Data.Foldable
-import Data.Functor.Foldable hiding (fold)
-import Data.Generics.Uniplate.Direct
-import qualified Data.HashMap.Strict as HM
-import qualified Data.HashSet as HS
-import Data.Hashable
-import Data.IORef.Lifted
-import Data.List (partition)
-import Data.List (intercalate, intersperse)
-import Data.Maybe
-import Data.Monoid
-import Data.String (fromString)
-import qualified Data.Text as T
-import GHC.Generics
+import Data.IORef
+import Data.List (lookup)
 import Lens.Micro
 import Lens.Micro.Internal (Index, IxValue, Ixed)
 import Lens.Micro.Mtl
-import Ohua.ALang.Lang
-import Ohua.ALang.NS as NS
+import Options.Applicative as O
+import System.FilePath ((-<.>), takeDirectory)
+import System.Directory (createDirectoryIfMissing)
+
+import Ohua.ALang.NS
 import Ohua.Compile
-import Ohua.DFGraph
-import qualified Ohua.LensClasses as OLC
+import Ohua.DFGraph.File
 import Ohua.Monad
-import Ohua.Serialize.JSON
+import Ohua.Standalone
 import Ohua.Types
+import qualified Ohua.CodeGen.JSONObject as JSONGen
+import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
+import Ohua.CodeGen.Iface
 import Ohua.Util (mapLeft)
-import Ohua.Util.Str (showS)
 import qualified Ohua.Util.Str as Str
-import Options.Applicative
-import System.Directory
-import System.Environment
-import System.FilePath ((-<.>), (<.>), takeExtension)
-
-#ifdef WITH_SEXPR_PARSER
-import qualified Ohua.Compat.SExpr.Lexer         as SLex
-import qualified Ohua.Compat.SExpr.Parser        as SParse
-#endif
-#ifdef WITH_CLIKE_PARSER
-import qualified Ohua.Compat.Clike.Parser        as CParse
-import qualified Ohua.Compat.Clike.Types         as CTy
-#endif
-
-type LParser = L.ByteString -> (Maybe TyAnnMap, RawNamespace)
-
-definedLangs :: [(String, String, LParser)]
-definedLangs =
-#ifdef WITH_SEXPR_PARSER
-    ( ".ohuas"
-    , "S-Expression frontend for the algorithm language"
-    , (Nothing, ) . SParse.parseNS . SLex.tokenize) :
-#endif
-#ifdef WITH_CLIKE_PARSER
-    ( ".ohuac"
-    , "C/Rust-like frontent for the algorithm language"
-    , let reNS ::
-                 Namespace (Annotated (FunAnn (TyExpr SomeBinding)) (Expr SomeBinding))
-              -> (Maybe TyAnnMap, RawNamespace)
-          reNS ns =
-              (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
-            where
-              (anns, newDecls) =
-                  unzip $
-                  map
-                      (\(name, Annotated tyAnn expr) ->
-                           ((name, tyAnn), (name, expr)))
-                      (HM.toList $ ns ^. decls)
-          remMutAnn = decls . each . OLC.annotation %~ fmap (view OLC.value)
-       in reNS . remMutAnn . CParse.parseNS) :
-#endif
-    []
-
-
-
-getParser :: String -> L.ByteString -> (Maybe TyAnnMap, RawNamespace)
-getParser ext
-    | Just a <- find ((== ext) . view _1) definedLangs = a ^. _3
-    | otherwise =
-        error $ "No parser defined for files with extension '" ++ ext ++ "'"
-
-
-type IFaceDefs = HM.HashMap QualifiedBinding Expression
-type ModMap = HM.HashMap NSRef (MVar ResolvedNamespace)
-type ModTracker = IORef ModMap
-type RawNamespace = Namespace (Expr SomeBinding)
-type ResolvedNamespace = Namespace Expression
-type CompM = ExceptT Error (LoggingT IO)
-type TyAnnMap = HM.HashMap Binding (FunAnn (TyExpr SomeBinding))
-
-
-data GraphFile = GraphFile
-    { graph :: OutGraph
-    , mainArity :: Int
-    , sfDependencies :: HS.HashSet QualifiedBinding
-    } deriving (Eq, Show, Generic)
-
-
-instance ToJSON GraphFile where
-    toEncoding = genericToEncoding defaultOptions
-instance FromJSON GraphFile where
-    parseJSON = genericParseJSON defaultOptions
-
-
-stdNamespace :: (NSRef, [Binding])
-stdNamespace =
-    ( ["ohua", "lang"]
-    , ["id", "smap", "if"] -- TODO complete list
-     )
-
-
-resolveNS ::
-       forall m. MonadError Error m
-    => IFaceDefs
-    -> RawNamespace
-    -> m ResolvedNamespace
-resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) = do
-    resDecls <-
-        flip runReaderT (mempty, ifacem) $
-        go0
-            (topSortDecls
-                 (\case
-                      Unqual bnd
-                          | bnd `HS.member` locallyDefinedAlgos -> Just bnd
-                      _ -> Nothing) $
-             HM.toList decls)
-    pure $ ns & NS.decls .~ HM.fromList resDecls
-  where
-    go0 [] = pure []
-    go0 ((name, expr):xs) = do
-        done <- go expr
-        local (second $ HM.insert (QualifiedBinding modname name) done) $
-            ((name, done) :) <$> (go0 xs)
-    go :: Expr SomeBinding
-       -> ReaderT (HS.HashSet Binding, IFaceDefs) m Expression
-    go (Let assign val body) =
-        registerAssign assign $ Let assign <$> go val <*> go body
-    go (Var (Unqual bnd)) = do
-        isLocal <- asks (HS.member bnd . fst)
-        if isLocal
-            then pure $ Var $ Local bnd
-            else case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
-                     (Just algo, Just sf) ->
-                         throwError $
-                         "Ambiguous ocurrence of unqualified binding " <>
-                         showS bnd <>
-                         ". Could refer to algo " <>
-                         showS algo <>
-                         " or sf " <>
-                         showS sf
-                     (Just algoname, _) ->
-                         maybe
-                             (throwError $ "Algo not loaded " <> showS algoname)
-                             pure =<<
-                         asks (HM.lookup algoname . snd)
-                     (_, Just sf) -> pure $ Var $ Sf sf Nothing
-                     _ -> throwError $ "Binding not in scope " <> showS bnd
-    go (Var (Qual qb)) = do
-        algo <- asks (HM.lookup qb . snd)
-        case algo of
-            Just algo -> pure algo
-            _
-                | qbNamespace qb `HS.member` importedSfNamespaces ->
-                    pure $ Var (Sf qb Nothing)
-            _ ->
-                throwError $
-                "No matching algo available or namespace not loaded for " <>
-                showS qb
-    go (Apply expr expr2) = Apply <$> go expr <*> go expr2
-    go (Lambda assign body) = registerAssign assign $ Lambda assign <$> go body
-    sfImports = stdNamespace : sfImports'
-    registerAssign = local . first . HS.union . HS.fromList . extractBindings
-    locallyDefinedAlgos = HS.fromMap $ HM.map (const ()) decls
-    importedSfNamespaces = HS.fromList $ map fst sfImports
-    algoRefers = mkReferMap $ (modname, HM.keys decls) : algoImports
-    sfRefers = mkReferMap sfImports
-    mkReferMap importList =
-        HM.fromListWith
-            reportCollidingRef
-            [ (shortname, QualifiedBinding sourceNS shortname)
-            | (sourceNS, referList) <- importList
-            , shortname <- referList
-            ]
-    reportCollidingRef a b =
-        error $
-        "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <>
-        show modname
-
-
-readAndParse :: MonadIO m => String -> m (Maybe TyAnnMap, RawNamespace)
-readAndParse filename = getParser (takeExtension filename) <$> liftIO (L.readFile filename)
-
-
-gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
-gatherDeps tracker ns = do
-    mods <- mapConcurrently (registerAndLoad tracker) (map fst $ ns ^. algoImports)
-    pure $ HM.fromList
-        [ (QualifiedBinding (ns ^. NS.name) name, algo)
-        | ns <- mods
-        , (name, algo) <- HM.toList $ ns ^. decls
-        ]
-
-
-findSourceFile :: NSRef -> CompM String
-findSourceFile modname = do
-    candidates <- filterM (liftIO . doesFileExist) $ map (asFile <.>) extensions
-    case candidates of
-        [] -> throwError $ "No file found for module " <> showS modname
-        [f] -> pure f
-        files -> throwError $ "Found multiple files matching " <> showS modname <> ": " <> showS files
-  where
-    asFile = intercalate "/" $ map (Str.toString . unwrap) $ unwrap modname
-    extensions = map (^. _1) definedLangs
-
-
-loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
-loadModule tracker modname = do
-    filename <- findSourceFile modname
-    (anns, rawMod) <- readAndParse filename
-    unless (rawMod ^. name == modname) $
-        throwError $ "Expected module with name " <> Str.showS modname <> " but got " <> Str.showS (rawMod ^. name)
-    loadDepsAndResolve tracker rawMod
-
-
-loadDepsAndResolve :: ModTracker -> RawNamespace -> CompM ResolvedNamespace
-loadDepsAndResolve tracker rawMod = flip resolveNS rawMod =<< gatherDeps tracker rawMod
-
-
-registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
-registerAndLoad tracker mod = registerAnd tracker mod (loadModule tracker mod)
-
-
-registerAnd :: (Eq ref, Hashable ref) => IORef (HM.HashMap ref (MVar load)) -> ref -> CompM load -> CompM load
-registerAnd tracker mod ac = do
-    newModRef <- newEmptyMVar
-    actualRef <- atomicModifyIORef' tracker $ \map ->
-        case map ^? ix mod of
-            Just mvar -> (map, Left mvar)
-            Nothing   -> (HM.insert mod newModRef map, Right newModRef)
-    case actualRef of
-        Left toWait -> readMVar toWait
-        Right build -> do
-            compiled <- ac
-            putMVar build compiled
-            pure compiled
-
-
-gatherSFDeps :: Expression -> HS.HashSet QualifiedBinding
-gatherSFDeps e = HS.fromList [ref | Var (Sf ref _) <- universe e]
--- gatherSFDeps = cata $ \case
---   VarF (Sf ref _) -> HS.singleton ref
---   other -> fold other
-
-
-topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
-topSortMods = topSortWith (^. name) (map fst . view algoImports)
-
-
-topSortWith :: (Hashable b, Eq b) => (a -> b) -> (a -> [b]) -> [a] -> [a]
-topSortWith getIdent getDeps mods' = concat @[] $ ana (uncurry go) (mempty, mods')
-  where
-    go satisfied avail
-      | null newSat =
-        if null newAvail
-        then Nil
-        else error "Unsortable! (Probably due to a cycle)"
-      | otherwise = Cons newSat $ (HS.union (HS.fromList (map getIdent newSat)) satisfied, newAvail)
-      where
-        (newSat, newAvail) = partition (all (`HS.member` satisfied) . getDeps) avail
-
-
-unlessM :: Monad m => m Bool -> m () -> m ()
-unlessM cond a = cond >>= \b -> unless b a
-
-
-topSortDecls :: (a -> Maybe Binding) -> [(Binding, Expr a)] -> [(Binding, Expr a)]
-topSortDecls f decls = map fst $ topSortWith (fst . fst) snd declsWDeps
-  where
-    localAlgos = HS.fromList $ map fst decls
-    getDeps e = HS.toList $ snd $ evalRWS (go e) mempty ()
-      where
-        go =
-            cata $ \case
-                LetF assign val body -> withRegisterBinds assign $ val >> body
-                VarF thing
-                    | Just bnd <- f thing ->
-                        unlessM (asks $ HS.member bnd) $
-                        when (bnd `HS.member` localAlgos) $ tell [bnd]
-                LambdaF assign body -> withRegisterBinds assign body
-                e -> sequence_ e
-        withRegisterBinds = local . HS.union . HS.fromList . extractBindings
-    declsWDeps = zip decls $ map (getDeps . snd) decls
-
-
-mainToEnv :: Expression -> (Int, Expression)
-mainToEnv = go 0 id
-  where
-    go !i f (Lambda assign body) =
-        go (i + 1) (f . Let assign (Var $ Env $ makeThrow i)) body
-    go !i f rest = (i, f rest)
-
-#if WITH_CLIKE_PARSER
-formatRustType :: TyExpr SomeBinding -> String
-formatRustType = go []
-  where
-    formatRef sb =
-        concat $ intersperse "::" (map (Str.toString . unwrap) $ bnds)
-      where
-        bnds =
-            case sb of
-                Unqual b -> [b]
-                Qual (QualifiedBinding ns bnd) -> unwrap ns ++ [bnd]
-    go l e
-        | e == CTy.tupleConstructor = "(" <> arglist <> ")"
-        | otherwise =
-            case e of
-                TyRef ref ->
-                    formatRef ref <>
-                    if null l
-                        then ""
-                        else "<" <> arglist <> ">"
-                TyApp t1 t2 -> go (formatRustType t2 : l) t1
-      where
-        arglist = intercalate "," l
-#endif
-
-data Command
-  = Build
-  | DumpType DumpOpts
-
-type LangFormatter = TyExpr SomeBinding -> String
-
-langs :: [(String, LangFormatter)]
-langs =
-#if WITH_CLIKE_PARSER
-  ("rust", formatRustType) :
-#endif
-  []
 
 data DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
@@ -367,12 +40,34 @@ data CmdOpts = CmdOpts
     , outputPath :: Maybe FilePath
     }
 
+data CodeGenSelection
+    = GenJsonObject
+    | GenSimpleJavaClass
+    deriving (Read, Show, Bounded, Enum)
+
+selectionToGen :: CodeGenSelection -> CodeGen
+selectionToGen GenSimpleJavaClass = JavaGen.generate
+selectionToGen GenJsonObject = JSONGen.generate
+
+data BuildOpts = BuildOpts
+    { outputFormat :: CodeGenSelection
+    }
+
+data Command
+  = Build BuildOpts
+  | DumpType DumpOpts
+
+
+genTypes :: [Char] -> CodeGen
+genTypes "json-object" = JSONGen.generate
+genTypes "simple-java-class" = JavaGen.generate
+genTypes t = panic $ "Unsupported code gen type " <> toS t
 
 runCompM :: CompM () -> IO ()
 runCompM c =
     runStderrLoggingT $
-    runExceptT c >>= either (logErrorN . T.pack . Str.toString) pure
-
+    filterLogger (\_ level -> level >= LevelInfo) $
+    runExceptT c >>= either (logErrorN . toS . Str.toString) pure
 
 main :: IO ()
 main =
@@ -381,8 +76,8 @@ main =
                      , outputPath = out
                      , entrypoint
                      } <- liftIO $ execParser odef
-        modTracker <- newIORef HM.empty
-        (mainAnns, rawMainMod) <- readAndParse inputModFile
+        modTracker <- liftIO $ newIORef mempty
+        (mainAnns, rawMainMod) <- readAndParse $ toS inputModFile
         let getMain ::
                    (Ixed m, Index m ~ Binding, MonadError Error mo)
                 => m
@@ -410,7 +105,7 @@ main =
                                 [ "arguments" A..= map format args
                                 , "return" A..= format ret
                                 ]
-            Build -> do
+            Build BuildOpts {outputFormat} -> do
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
                     loadDepsAndResolve modTracker rawMainMod
@@ -418,14 +113,21 @@ main =
                 let sfDeps = gatherSFDeps expr
                 let (mainArity, completeExpr) = mainToEnv expr
                 gr <- compile def def completeExpr
-                liftIO $
-                    L.writeFile (fromMaybe (inputModFile -<.> "ohuao") out) $
-                    encode $
-                    GraphFile
-                        { graph = gr
-                        , mainArity = mainArity
-                        , sfDependencies = sfDeps
-                        }
+                (nameSuggest, code) <-
+                    flip runReaderT CodeGenOpts $
+                    selectionToGen
+                        outputFormat
+                        CodeGenData
+                            { graph = gr
+                            , entryPointArity = mainArity
+                            , sfDependencies = sfDeps
+                            , annotations = mainAnns
+                            , entryPointName = entrypoint
+                            , entryPointNamespace = rawMainMod ^. name
+                            }
+                let outputPath = fromMaybe (toS nameSuggest) out
+                liftIO $ createDirectoryIfMissing True (takeDirectory outputPath)
+                liftIO $ L.writeFile outputPath code
   where
     odef =
         info
@@ -435,18 +137,31 @@ main =
                  ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: " <>
                   intercalate
                       ", "
-                      (map (\a -> "'" <> a ^. _1 <> "'") definedLangs)))
+                      (map (\a -> toS $ "'" <> a ^. _1 <> "'") definedLangs)))
     dumpOpts =
         DumpOpts <$>
         argument
-            (maybeReader $ flip lookup langs . map C.toLower)
+            (maybeReader $ flip lookup langs . toS . map C.toLower)
             (metavar "LANG" <> help "Language format for the types")
+    buildOpts =
+        BuildOpts <$>
+        O.option
+            auto
+            (value GenJsonObject <>
+             help
+                 ("Format to emit the generated code in. Accepted choices: " <>
+                  intercalate
+                      ", "
+                      (map show [(minBound :: CodeGenSelection) ..])) <>
+             long "format" <>
+             short 'f' <>
+             showDefault)
     optsParser =
         CmdOpts <$>
         hsubparser
             (command
                  "build"
-                 (info (pure Build) (progDesc "Build the ohua graph")) <>
+                 (info (Build <$> buildOpts) (progDesc "Build the ohua graph")) <>
              command
                  "dump-main-type"
                  (info
@@ -461,4 +176,4 @@ main =
             (strOption $
              long "output" <> metavar "PATH" <> short 'o' <>
              help
-                 "Path to write the output to (default: input filename with '.ohuao' extension for 'build' and '.type-dump' for 'dump-main-type')")
+                 "Path to write the output to (default: input filename with '.ohuao' extension for 'build' with the JSON format and '.java' with the java format and '.type-dump' for 'dump-main-type')")

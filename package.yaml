@@ -36,45 +36,58 @@ default-extensions:
 - DeriveTraversable
 - DeriveGeneric
 - PatternSynonyms
+- NoImplicitPrelude
+- TypeApplications
+- NamedFieldPuns
+- RecordWildCards
+- RankNTypes
+- ViewPatterns
+dependencies:
+- protolude
+- base
+- microlens
+- microlens-mtl
+- ohua-core
+- bytestring
+- aeson
+- filepath
+- directory
+- data-default-class
+library:
+  source-dirs: src
+  dependencies:
+  - async
+  - mtl
+  - text
+  - recursion-schemes
+  - lifted-async
+  - uniplate
+  - unordered-containers
+  - containers
+  - casing
+  - language-java
+  when:
+    - condition: flag(with-clike-parser)
+      dependencies:
+      - alang-clike-parser
+      cpp-options:
+      - -DWITH_CLIKE_PARSER=1
+    - condition: flag(with-sexpr-parser)
+      dependencies:
+      - alang-sexpr-parser
+      cpp-options:
+      - -DWITH_SEXPR_PARSER=1
 executables:
   ohuac:
     main: Main.hs
     source-dirs: app
+    dependencies:
+    - ohuac
+    - optparse-applicative
     ghc-options:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
-    dependencies:
-    - base
-    - ohua-core
-    - mtl
-    - async
-    - bytestring
-    - unordered-containers
-    - directory
-    - text
-    - filepath
-    - aeson
-    - hashable
-    - optparse-applicative
-    - recursion-schemes
-    - data-default-class
-    - lifted-base
-    - lifted-async
-    - microlens
-    - microlens-mtl
-    - uniplate
-    when:
-      - condition: flag(with-clike-parser)
-        dependencies:
-        - alang-clike-parser
-        cpp-options:
-        - -DWITH_CLIKE_PARSER=1
-      - condition: flag(with-sexpr-parser)
-        dependencies:
-        - alang-sexpr-parser
-        cpp-options:
-        - -DWITH_SEXPR_PARSER=1
 
 flags:
   with-sexpr-parser:

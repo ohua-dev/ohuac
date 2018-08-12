@@ -47,10 +47,9 @@ tyExprToJava = RefType . go []
                 mkLast bnd
       where
         mkLast b = [(Ident $ Str.toString $ unwrap b, map ActualType l)]
-    go l e =
-        case e of
-            TyRef ref -> formatRef ref l
-            TyApp t1 t2 -> go (go [] t2 : l) t1
+    go l = \case
+      TyRef ref -> formatRef ref l
+      TyApp t1 t2 -> go (go [] t2 : l) t1
 
 isVoidType :: TyExpr SomeBinding -> Bool
 isVoidType = (== tupleConstructor)

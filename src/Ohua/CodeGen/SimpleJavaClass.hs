@@ -6,13 +6,13 @@ import Protolude
 import Text.Casing
 import qualified Data.Text as T
 import qualified Data.HashMap.Strict as HM
+import Data.List (nub)
 import Data.Version
 import Language.Java.Syntax as Java
 import Language.Java.Pretty (prettyPrint)
 
 import Ohua.DFGraph
 import Ohua.Types
-import Ohua.Standalone
 import Ohua.ALang.NS
 import Ohua.CodeGen.Iface
 import qualified Ohua.Util.Str as Str
@@ -21,6 +21,11 @@ import Paths_ohuac
 
 -- A hack for now, this should be shared later
 tupleConstructor = TyRef $ Qual $ QualifiedBinding (unsafeMake []) "(,)"
+
+
+generationInfoString :: LByteString
+generationInfoString = "Generated with ohuac, version " <> toS (showVersion version)
+
 
 stringifyQual :: QualifiedBinding -> [Char]
 stringifyQual QualifiedBinding {..} =
@@ -55,7 +60,7 @@ generate :: CodeGen
 generate CodeGenData {..} =
     pure
         ( T.intercalate "/" (map toS $ nsList ++ [classNameStr]) <> ".java"
-        , toS $ prettyPrint code)
+        , toS (prettyPrint code) <> "\n//" <> generationInfoString <> "\n")
   where
     -- Values computed from CodeGenData
     nsList =
@@ -63,7 +68,7 @@ generate CodeGenData {..} =
         unwrap entryPointNamespace
     classNameStr = toPascal $ fromAny $ Str.toString $ unwrap entryPointName
     className = Ident classNameStr
-    retId = maximum $ map operatorId $ operators graph
+    retId = succ $ maximum $ map operatorId $ operators graph
     enumerateArgs = map unsafeMake [0 .. entryPointArity - 1]
     entryPointAnnotations = annotations >>= HM.lookup entryPointName
     returnType =
@@ -80,7 +85,6 @@ generate CodeGenData {..} =
     localArcs = [a | a@Arc {source = LocalSource _} <- arcs graph]
     envArcs = [a | a@Arc {source = EnvSource _} <- arcs graph]
     envArcCount = length envArcs
-
     -- Name constants and functions
     opsFieldName = Ident "ops"
     arcsFieldName = Ident "arcs"
@@ -90,7 +94,6 @@ generate CodeGenData {..} =
     lazyI = Ident "Lazy"
     arcIdent = Ident "Arc"
     graphIdent = Ident "graph"
-
     -- Type constants
     objectI = Ident "Object"
     objectType = RefType objectRefType
@@ -99,14 +102,13 @@ generate CodeGenData {..} =
     lazyObjectRefT =
         ClassRefType $
         ClassType
-            [ ( lazyI
-              , [ActualType $ ClassRefType $ ClassType [(objectI, [])]])
-            ]
+            [(lazyI, [ActualType $ ClassRefType $ ClassType [(objectI, [])]])]
     arcI = Ident "Arc"
-    arcClassRef = ClassType [(arcI, [ActualType lazyObjectRefT])]
     nonGenericArcClassRef = ClassType [(arcI, [])]
     graphClassI = Ident "Graph"
-
+    codeGenHelperClassI = Ident "CodeGenHelper"
+    sfRefHelperClass =
+        ClassType [(codeGenHelperClassI, []), (Ident "SfRef", [])]
     -- Helpers
     isVoidFunction = isNothing returnType
     simpleImport path = ImportDecl False (Name $ map Ident path) False
@@ -123,7 +125,6 @@ generate CodeGenData {..} =
                  (ExpName (Name [arcsFieldName]))
                  [Lit $ Int $ toInteger idx])
             EqualA
-
     -- `new` expressions
     newTarget Target {..} =
         InstanceCreation
@@ -163,18 +164,15 @@ generate CodeGenData {..} =
     createRealizedLazyExp val =
         MethodInv $
         TypeMethodCall (Name [lazyI]) [] (Ident "createRealized") [val]
-
     returnValueArc =
         newArc $
         Arc (Target retId 0) (LocalSource $ returnArc graph :: Source HostExpr)
-
-    addCaptureOp
-        | isVoidFunction = identity
-        | otherwise = (Operator retId "ohua.lang/capture" :)
+    finalOperators
+        | isVoidFunction = operators graph
+        | otherwise = Operator retId "ohua.lang/capture" : operators graph
     addReturnCaptureArcs
         | isVoidFunction = identity
         | otherwise = (Lit Null :) . (returnValueArc :)
-
     code =
         CompilationUnit
             (if null nsList
@@ -185,6 +183,7 @@ generate CodeGenData {..} =
             , simpleImport ["ohua", "graph", "Target"]
             , simpleImport ["ohua", "graph", "Graph"]
             , simpleImport ["ohua", "graph", "Source"]
+            , simpleImport ["ohua", "loader", "CodeGenHelper"]
             , simpleImport ["ohua", "util", "Lazy"]
             , simpleImport ["ohua", "Runtime"]
             , simpleImport
@@ -200,7 +199,45 @@ generate CodeGenData {..} =
                $
               ClassBody
                   -- TODO load stateful functions
-                  [ MemberDecl $
+                  [ InitDecl True $
+                    Block $
+                    let functionsArrayIdent = Ident "functions"
+                     in [ LocalVars
+                              [Final]
+                              (RefType $
+                               ArrayType $
+                               RefType $ ClassRefType sfRefHelperClass)
+                              [ VarDecl (VarId functionsArrayIdent) $
+                                Just $
+                                InitArray $
+                                ArrayInit
+                                    [ InitExp $
+                                    InstanceCreation
+                                        []
+                                        (TypeDeclSpecifier sfRefHelperClass)
+                                        [ Lit $
+                                          String $
+                                          intercalate "." $
+                                          map (Str.toString . unwrap) $
+                                          unwrap namespace
+                                        , Lit $
+                                          String $ Str.toString $ unwrap name_
+                                        ]
+                                        Nothing
+                                    | QualifiedBinding namespace name_ <-
+                                          nub $ map operatorType finalOperators
+                                    ]
+                              ]
+                        , BlockStmt $
+                          ExpStmt $
+                          MethodInv $
+                          TypeMethodCall
+                              (Name [codeGenHelperClassI])
+                              []
+                              (Ident "ensureFunctionsAreLoaded")
+                              [ExpName (Name [functionsArrayIdent])]
+                        ]
+                  , MemberDecl $
                     FieldDecl
                         [Private, Static, Final]
                         (RefType $
@@ -208,15 +245,14 @@ generate CodeGenData {..} =
                         [ VarDecl (VarId opsFieldName) $
                           Just $
                           InitArray $
-                          ArrayInit
-                              (map (InitExp . newOp) $
-                               addCaptureOp $ operators graph)
+                          ArrayInit (map (InitExp . newOp) finalOperators)
                         ]
                   , MemberDecl $
                     FieldDecl
                         [Private, Static, Final]
                         (RefType $
-                         ArrayType $ RefType $ ClassRefType nonGenericArcClassRef)
+                         ArrayType $
+                         RefType $ ClassRefType nonGenericArcClassRef)
                         [ VarDecl (VarId arcsFieldName) $
                           Just $
                           InitArray $

@@ -42,6 +42,7 @@ default-extensions:
 - RecordWildCards
 - RankNTypes
 - ViewPatterns
+- NoImplicitPrelude
 dependencies:
 - protolude
 - base
@@ -53,6 +54,7 @@ dependencies:
 - filepath
 - directory
 - data-default-class
+- protolude
 library:
   source-dirs: src
   dependencies:
@@ -88,6 +90,11 @@ executables:
     - -threaded
     - -rtsopts
     - -with-rtsopts=-N
+    - -Wall
+    - -Wcompat
+    - -Wincomplete-record-updates
+    - -Wincomplete-uni-patterns
+    - -Wredundant-constraints
 
 flags:
   with-sexpr-parser:

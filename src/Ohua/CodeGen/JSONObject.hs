@@ -1,3 +1,4 @@
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 module Ohua.CodeGen.JSONObject where
 
 import Protolude
@@ -8,7 +9,6 @@ import Ohua.DFGraph.File
 import Ohua.Serialize.JSON ()
 import Ohua.CodeGen.Iface
 import Ohua.Types
-import qualified Ohua.Util.Str as Str
 
 instance ToJSON GraphFile where
     toEncoding = genericToEncoding defaultOptions
@@ -18,6 +18,4 @@ instance FromJSON GraphFile where
 
 generate :: CodeGen
 generate cgdf@CodeGenData {entryPointName} =
-    pure $
-    (toS $ Str.toString $ unwrap $ entryPointName <> ".ohuao", ) $
-    encode $ cgDataToGrFile cgdf
+    pure (unwrap $ entryPointName <> ".ohuao", encode $ cgDataToGrFile cgdf)

@@ -5,10 +5,7 @@ import Protolude
 
 import Control.Concurrent.Async.Lifted
 import Control.Monad.RWS
-import Control.Monad.Writer
-import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L
-import Data.Default.Class
 import Data.Functor.Foldable hiding (fold)
 import Data.Generics.Uniplate.Direct
 import qualified Data.HashMap.Strict as HM
@@ -17,24 +14,17 @@ import Data.List (partition)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import GHC.Generics
 import Lens.Micro
-import Lens.Micro.Internal (Index, IxValue, Ixed)
 import Lens.Micro.Mtl
 import System.Directory
 import System.FilePath as Path ((<.>), takeExtension)
+import Ohua.LensClasses (annotation, value)
 
 import Ohua.ALang.Lang
 import Ohua.ALang.NS as NS
-import Ohua.Compile
-import Ohua.DFGraph
-import Ohua.DFGraph.File
-import qualified Ohua.LensClasses as OLC
 import Ohua.Monad
 import Ohua.Serialize.JSON ()
 import Ohua.Types
-import Ohua.Util.Str (showS)
-import qualified Ohua.Util.Str as Str
 
 #ifdef WITH_SEXPR_PARSER
 import qualified Ohua.Compat.SExpr.Lexer         as SLex
@@ -66,10 +56,10 @@ definedLangs =
               (anns, newDecls) =
                   unzip $
                   map
-                      (\(name, Annotated tyAnn expr) ->
-                           ((name, tyAnn), (name, expr)))
+                      (\(bnd, Annotated tyAnn expr) ->
+                           ((bnd, tyAnn), (bnd, expr)))
                       (HM.toList $ ns ^. decls)
-          remMutAnn = decls . each . OLC.annotation %~ fmap (view OLC.value)
+          remMutAnn = decls . each . annotation %~ fmap (view value)
        in reNS . remMutAnn . CParse.parseNS) :
 #endif
     []
@@ -104,7 +94,7 @@ resolveNS ::
     => IFaceDefs
     -> RawNamespace
     -> m ResolvedNamespace
-resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) = do
+resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = do
     resDecls <-
         flip runReaderT (mempty, ifacem) $
         go0
@@ -113,18 +103,18 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) = do
                       Unqual bnd
                           | bnd `Set.member` locallyDefinedAlgos -> Just bnd
                       _ -> Nothing) $
-             HM.toList decls)
-    pure $ ns & NS.decls .~ HM.fromList resDecls
+             HM.toList declarations)
+    pure $ ns & decls .~ HM.fromList resDecls
   where
     go0 [] = pure []
-    go0 ((name, expr):xs) = do
+    go0 ((varName, expr):xs) = do
         done <- go expr
-        local (second $ Map.insert (QualifiedBinding modname name) done) $
-            ((name, done) :) <$> (go0 xs)
+        local (second $ Map.insert (QualifiedBinding modname varName) done) $
+            ((varName, done) :) <$> (go0 xs)
     go :: Expr SomeBinding
        -> ReaderT (Set.Set Binding, IFaceDefs) m Expression
-    go (Let assign val body) =
-        registerAssign assign $ Let assign <$> go val <*> go body
+    go (Let assignment val body) =
+        registerAssign assignment $ Let assignment <$> go val <*> go body
     go (Var (Unqual bnd)) = do
         isLocal <- asks (Set.member bnd . fst)
         if isLocal
@@ -133,37 +123,37 @@ resolveNS ifacem ns@(Namespace modname algoImports sfImports' decls) = do
                      (Just algo, Just sf) ->
                          throwError $
                          "Ambiguous ocurrence of unqualified binding " <>
-                         showS bnd <>
+                         show bnd <>
                          ". Could refer to algo " <>
-                         showS algo <>
+                         show algo <>
                          " or sf " <>
-                         showS sf
+                         show sf
                      (Just algoname, _) ->
                          maybe
-                             (throwError $ "Algo not loaded " <> showS algoname)
+                             (throwError $ "Algo not loaded " <> show algoname)
                              pure =<<
                          asks (Map.lookup algoname . snd)
                      (_, Just sf) -> pure $ Var $ Sf sf Nothing
-                     _ -> throwError $ "Binding not in scope " <> showS bnd
+                     _ -> throwError $ "Binding not in scope " <> show bnd
     go (Var (Qual qb)) = do
         algo <- asks (Map.lookup qb . snd)
         case algo of
-            Just algo -> pure algo
+            Just anAlgo -> pure anAlgo
             _
                 | qbNamespace qb `Set.member` importedSfNamespaces ->
                     pure $ Var (Sf qb Nothing)
             _ ->
                 throwError $
                 "No matching algo available or namespace not loaded for " <>
-                showS qb
+                show qb
     go (Apply expr expr2) = Apply <$> go expr <*> go expr2
-    go (Lambda assign body) = registerAssign assign $ Lambda assign <$> go body
-    sfImports = stdNamespace : sfImports'
+    go (Lambda assignment body) = registerAssign assignment $ Lambda assignment <$> go body
+    sfImports1 = stdNamespace : sfImports0
     registerAssign = local . first . Set.union . Set.fromList . extractBindings
-    locallyDefinedAlgos = Set.fromList $ HM.keys decls
-    importedSfNamespaces = Set.fromList $ map fst sfImports
-    algoRefers = mkReferMap $ (modname, HM.keys decls) : algoImports
-    sfRefers = mkReferMap sfImports
+    locallyDefinedAlgos = Set.fromList $ HM.keys declarations
+    importedSfNamespaces = Set.fromList $ map fst sfImports1
+    algoRefers = mkReferMap $ (modname, HM.keys declarations) : algoImports0
+    sfRefers = mkReferMap sfImports1
     mkReferMap importList =
         Map.fromListWith
             reportCollidingRef
@@ -197,11 +187,11 @@ findSourceFile :: NSRef -> CompM Text
 findSourceFile modname = do
     candidates <- filterM (liftIO . doesFileExist) $ map ((asFile Path.<.>) . toS) extensions
     case candidates of
-        [] -> throwError $ "No file found for module " <> showS modname
+        [] -> throwError $ "No file found for module " <> show modname
         [f] -> pure $ toS f
-        files -> throwError $ "Found multiple files matching " <> showS modname <> ": " <> showS files
+        files -> throwError $ "Found multiple files matching " <> show modname <> ": " <> show files
   where
-    asFile = intercalate "/" $ map (Str.toString . unwrap) $ unwrap modname
+    asFile = toS $ T.intercalate "/" $ map unwrap $ unwrap modname
     extensions = map (^. _1) definedLangs
 
 
@@ -210,7 +200,7 @@ loadModule tracker modname = do
     filename <- findSourceFile modname
     (_anns, rawMod) <- readAndParse filename
     unless (rawMod ^. name == modname) $
-        throwError $ "Expected module with name " <> Str.showS modname <> " but got " <> Str.showS (rawMod ^. name)
+        throwError $ "Expected module with name " <> show modname <> " but got " <> show (rawMod ^. name)
     loadDepsAndResolve tracker rawMod
 
 
@@ -290,8 +280,7 @@ mainToEnv = go 0 identity
 typeFormatterHelper :: Text -> TyExpr SomeBinding -> TyExpr SomeBinding -> Text
 typeFormatterHelper moduleSeparator tupleConstructor = go []
   where
-    formatRef sb =
-        T.intercalate moduleSeparator (map (toS . Str.toString . unwrap) bnds)
+    formatRef sb = T.intercalate moduleSeparator $ map unwrap bnds
       where
         bnds =
             case sb of

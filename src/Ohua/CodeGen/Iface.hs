@@ -10,7 +10,6 @@ import Ohua.Standalone -- Used for TyAnnMap, that alias should be moved so I can
                        -- remove that dependency here
 import Ohua.DFGraph
 import qualified Ohua.DFGraph.File as GR
-import qualified Ohua.Util.Str as Str
 
 data CodeGenOpts = CodeGenOpts
 
@@ -35,7 +34,7 @@ type NameSuggester = Text
 
 type CodeGen
      = forall m. ( MonadReader CodeGenOpts m
-                 , MonadError Str.Str m
+                 , MonadError Text m
                  , MonadLogger m
                  , MonadIO m
                  ) =>

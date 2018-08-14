@@ -2,8 +2,6 @@ module Main where
 
 import Protolude
 
-import Control.Arrow
-import Control.Category ((>>>))
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Char as C
@@ -12,14 +10,12 @@ import Data.IORef
 import Data.List (lookup)
 import Lens.Micro
 import Lens.Micro.Internal (Index, IxValue, Ixed)
-import Lens.Micro.Mtl
 import Options.Applicative as O
 import System.FilePath ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
 
 import Ohua.ALang.NS
 import Ohua.Compile
-import Ohua.DFGraph.File
 import Ohua.Monad
 import Ohua.Standalone
 import Ohua.Types
@@ -27,9 +23,8 @@ import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.CodeGen.Iface
 import Ohua.Util (mapLeft)
-import qualified Ohua.Util.Str as Str
 
-data DumpOpts = DumpOpts
+newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
     }
 
@@ -49,7 +44,7 @@ selectionToGen :: CodeGenSelection -> CodeGen
 selectionToGen GenSimpleJavaClass = JavaGen.generate
 selectionToGen GenJsonObject = JSONGen.generate
 
-data BuildOpts = BuildOpts
+newtype BuildOpts = BuildOpts
     { outputFormat :: CodeGenSelection
     }
 
@@ -67,7 +62,7 @@ runCompM :: CompM () -> IO ()
 runCompM c =
     runStderrLoggingT $
     filterLogger (\_ level -> level >= LevelInfo) $
-    runExceptT c >>= either (logErrorN . toS . Str.toString) pure
+    runExceptT c >>= either (logErrorN . toS) pure
 
 main :: IO ()
 main =
@@ -169,7 +164,7 @@ main =
                       (progDesc "Dump the type of the main function"))) <*>
         argument str (metavar "SOURCE" <> help "Source file to compile") <*>
         argument
-            (eitherReader $ mapLeft Str.toString . make . Str.fromString)
+            (eitherReader $ mapLeft toS . make . toS)
             (metavar "MAIN" <> help "Algorithm that serves as entry point" <>
              value "main") <*>
         optional

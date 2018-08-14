@@ -15,11 +15,11 @@ import Ohua.DFGraph
 import Ohua.Types
 import Ohua.ALang.NS
 import Ohua.CodeGen.Iface
-import qualified Ohua.Util.Str as Str
 
 import Paths_ohuac
 
 -- A hack for now, this should be shared later
+tupleConstructor :: TyExpr SomeBinding
 tupleConstructor = TyRef $ Qual $ QualifiedBinding (unsafeMake []) "(,)"
 
 
@@ -29,8 +29,8 @@ generationInfoString = "Generated with ohuac, version " <> toS (showVersion vers
 
 stringifyQual :: QualifiedBinding -> [Char]
 stringifyQual QualifiedBinding {..} =
-    intercalate "." (map (Str.toString . unwrap) $ unwrap qbNamespace) <> "/" <>
-    Str.toString (unwrap qbName)
+    toS $
+    T.intercalate "." (map unwrap $ unwrap qbNamespace) <> "/" <> unwrap qbName
 
 -- | Caveat: This function does not support all java types yet. Notably the
 -- primitive types and wildcard generics are missing
@@ -43,10 +43,10 @@ tyExprToJava = RefType . go []
         case sb of
             Unqual b -> mkLast b
             Qual (QualifiedBinding ns bnd) ->
-                map ((, []) . Ident . Str.toString . unwrap) (unwrap ns) ++
+                map ((, []) . Ident . toS . unwrap) (unwrap ns) ++
                 mkLast bnd
       where
-        mkLast b = [(Ident $ Str.toString $ unwrap b, map ActualType l)]
+        mkLast b = [(Ident $ toS $ unwrap b, map ActualType l)]
     go l = \case
       TyRef ref -> formatRef ref l
       TyApp t1 t2 -> go (go [] t2 : l) t1
@@ -63,9 +63,9 @@ generate CodeGenData {..} =
   where
     -- Values computed from CodeGenData
     nsList =
-        map (toSnake . fromAny . Str.toString . unwrap) $
+        map (toSnake . fromAny . toS . unwrap) $
         unwrap entryPointNamespace
-    classNameStr = toPascal $ fromAny $ Str.toString $ unwrap entryPointName
+    classNameStr = toPascal $ fromAny $ toS $ unwrap entryPointName
     className = Ident classNameStr
     retId = succ $ maximum $ map operatorId $ operators graph
     enumerateArgs = map unsafeMake [0 .. entryPointArity - 1]
@@ -217,10 +217,10 @@ generate CodeGenData {..} =
                                         [ Lit $
                                           String $
                                           intercalate "." $
-                                          map (Str.toString . unwrap) $
+                                          map (toS . unwrap) $
                                           unwrap namespace
                                         , Lit $
-                                          String $ Str.toString $ unwrap name_
+                                          String $ toS $ unwrap name_
                                         ]
                                         Nothing
                                     | QualifiedBinding namespace name_ <-
@@ -315,7 +315,7 @@ generate CodeGenData {..} =
                                 ]
                           ]
                         , [ BlockStmt $ assignArcArray arcIdx (newArc arc)
-                          | (arcIdx, arc) <- zip [0 ..] envArcs
+                          | (arcIdx, arc) <- zip [(0 :: Int) ..] envArcs
                           ]
                         , do guard (not isVoidFunction)
                              pure $

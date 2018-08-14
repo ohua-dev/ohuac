@@ -3,19 +3,19 @@ packages:
 - .
 - location:
     git: https://github.com/ohua-dev/ohua-core
-    commit: 0b753ebb33f8ea1b6745c8effd34624edb9d906f
+    commit: 843bcdca4abc1393076e3ae69d750af095ed7d59
   extra-dep: true
 - location:
     git: https://github.com/ohua-dev/alang-clike-parser
-    commit: 305290fbf38550c7252d88ee6b4b35f53b31303c
+    commit: 33170482ff9eb3cf44ba61d11384c059e1fefe4f
   extra-dep: true
 - location:
     git: https://github.com/ohua-dev/alang-sexpr-parser
-    commit: 845eeaefebca81c97b87a26e234fb682f6c03251
+    commit: a5391f20bb5b3448f23403f9d88792f46746f982
   extra-dep: true
 extra-deps: []
 flags:
   ohuac:
-    with-clike-parser: true
-    with-sexpr-parser: true
+    with-clike-parser: yes
+    with-sexpr-parser: yes
 extra-package-dbs: []

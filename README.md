@@ -13,7 +13,7 @@ Prebuilt binaries are available for 64bit Linux and OSX. Provided for each
 release by [Travis CI](https://travis-ci.org/ohua-dev/ohuac).
 
 Simply download the appropriate executable for you platform (`ohuac-linux` or
-`ohuac-osx`) from the [releases page](/releases/latest).
+`ohuac-osx`) from the [releases page](https://github.com/ohua-dev/ohuac/releases/latest).
 
 ## Building from source
 

@@ -2,6 +2,7 @@
 module Ohua.CodeGen.SimpleJavaClass (generate) where
 
 import Protolude
+import Prelude (String)
 
 import Text.Casing
 import qualified Data.Text as T
@@ -27,7 +28,7 @@ generationInfoString :: LByteString
 generationInfoString = "Generated with ohuac, version " <> toS (showVersion version)
 
 
-stringifyQual :: QualifiedBinding -> [Char]
+stringifyQual :: QualifiedBinding -> String
 stringifyQual QualifiedBinding {..} =
     toS $
     T.intercalate "." (map unwrap $ unwrap qbNamespace) <> "/" <> unwrap qbName
@@ -55,16 +56,228 @@ isVoidType :: TyExpr SomeBinding -> Bool
 isVoidType = (== tupleConstructor)
 
 
+-- Identities
+returnVarI, lazyI, arcIdent, graphIdent, objectI, arcI, graphClassI
+  , codeGenHelperClassI, opsFieldName, arcsFieldName, configuredClassI
+  , runtimeConfigurationFieldI, preparedClassI, cloneMethodI, runnableAlgoFieldI, configVarIdent :: Ident
+returnVarI = Ident "returnVar"
+lazyI = Ident "Lazy"
+arcIdent = Ident "Arc"
+graphIdent = Ident "graph"
+objectI = Ident "Object"
+arcI = Ident "Arc"
+graphClassI = Ident "Graph"
+codeGenHelperClassI = Ident "CodeGenHelper"
+opsFieldName = Ident "ops"
+arcsFieldName = Ident "arcs"
+configuredClassI = Ident "Configured"
+runtimeConfigurationFieldI = Ident "runtimeConfiguration"
+preparedClassI = Ident "Prepared"
+cloneMethodI = Ident "clone"
+runnableAlgoFieldI = Ident "runnableAlgo"
+configVarIdent = Ident "configuration"
+prepareMethodI = Ident "prepare"
+invokeMethodI = Ident "invoke"
+configureMethodI = Ident "configure"
+
+runtimeConfigurationFieldVarId :: VarDeclId
+runtimeConfigurationFieldVarId = VarId runtimeConfigurationFieldI
+
+-- Class types
+operatorClassRef, nonGenericArcClassRef, sfRefHelperClass, configurationClassType :: ClassType
+operatorClassRef = ClassType [(Ident "Operator", [])]
+sfRefHelperClass =
+        ClassType [(codeGenHelperClassI, []), (Ident "SfRef", [])]
+configurationClassType = ClassType [(Ident "RuntimeProcessConfiguration", [])]
+
+objectType, configurationType, graphType, runnableAlgoType :: Java.Type
+objectType = RefType objectRefType
+configurationType = RefType $ ClassRefType configurationClassType
+graphType =
+    RefType $
+    ClassRefType $ ClassType [(graphClassI, [ActualType lazyObjectRefT])]
+runnableAlgoType = RefType $ ClassRefType $ ClassType [(Ident "Runnable", [])]
+
+objectRefType, lazyObjectRefT :: RefType
+objectRefType = ClassRefType $ ClassType [(objectI, [])]
+lazyObjectRefT =
+    ClassRefType $
+    ClassType
+        [(lazyI, [ActualType $ ClassRefType $ ClassType [(objectI, [])]])]
+nonGenericArcClassRef = ClassType [(arcI, [])]
+
+indexToArgument, indexToArgumentLazy :: Int -> Ident
+indexToArgument = Ident . mappend "argument" . show
+indexToArgumentLazy = Ident . mappend "lazyArgument" . show
+
+simpleImport :: [String] -> ImportDecl
+simpleImport path = ImportDecl False (Name $ map Ident path) False
+
+envSourceTypeDeclSpec :: TypeDeclSpecifier
+envSourceTypeDeclSpec =
+    TypeDeclSpecifierWithDiamond
+        (ClassType [(Ident "Source", [])])
+        (Ident "Env")
+        Diamond
+
+-- | @assignArcArray idx exp@ creates a
+-- @
+--    arcs[idx] = exp;
+-- @
+-- statement
+assignArcArray :: Int -> Exp -> Stmt
+assignArcArray idx =
+    ExpStmt .
+    Assign
+        (ArrayLhs $
+          ArrayIndex
+              (ExpName (Name [arcsFieldName]))
+              [Lit $ Int $ toInteger idx])
+        EqualA
+
+-- `new` expressions
+
+-- | Create a @new Target(opId, index)@ from a 'Target' record
+newTarget :: Target -> Exp
+newTarget Target {..} =
+    InstanceCreation
+        []
+        (TypeDeclSpecifier $ ClassType [(Ident "Target", [])])
+        [ Lit $ Int $ toInteger $ unwrap operator
+        , Lit $ Int $ toInteger index
+        ]
+        Nothing
+
+-- | Creates a @new Source.Local(target)@ or @new Source.Env(lazyObject)@ from an 'Arc'
+newSource :: Source HostExpr -> Exp
+newSource (LocalSource target) =
+    InstanceCreation
+        []
+        (TypeDeclSpecifier $
+          ClassType [(Ident "Source", []), (Ident "Local", [])])
+        [newTarget target]
+        Nothing
+newSource (EnvSource idx) =
+    InstanceCreation
+        []
+        envSourceTypeDeclSpec
+        [ExpName $ Name $ pure $ indexToArgumentLazy $ unwrap idx]
+        Nothing
+
+-- | Creates an @new Operator(opId, opType)@ expression from an 'Operator' record.
+newOp :: Operator -> Exp
+newOp Operator {..} =
+    InstanceCreation
+        []
+        (TypeDeclSpecifier operatorClassRef)
+        [ Lit $ Int $ toInteger $ unwrap operatorId
+        , Lit $ String $ stringifyQual operatorType
+        ]
+        Nothing
+
+-- | Creates an @new Arc<>(target, source)@ expression from an 'Arc'
+newArc :: Arc HostExpr -> Exp
+newArc Arc {..} =
+    InstanceCreation
+        []
+        (TypeDeclSpecifierUnqualifiedWithDiamond arcIdent Diamond)
+        [newTarget target, newSource source]
+        Nothing
+
+-- | Creates an @Lazy.createRealized(argument)@ expression given the input
+-- argument to the method
+createRealizedLazyExp :: Argument -> Exp
+createRealizedLazyExp val =
+    MethodInv $
+    TypeMethodCall (Name [lazyI]) [] (Ident "createRealized") [val]
+
+mkCommonArrayField classRef fieldName initExprs =
+    FieldDecl
+        [Private, Static, Final]
+        (RefType $ ArrayType $ RefType $ ClassRefType classRef)
+        [VarDecl (VarId fieldName) initExprs]
+
+configuredClassDecl :: Ident -> [Java.Type] -> ClassDecl
+configuredClassDecl mainClassName invokeMethodTypes =
+    ClassDecl [Public, Final, Static] configuredClassI [] Nothing [] $
+    ClassBody
+        [ MemberDecl runtimeConfigurationFieldDecl
+        , MemberDecl configuredClassConstructorDecl
+        , MemberDecl prepareMethodDecl
+        ]
+  where
+    invokeMethodParamNames =
+        [indexToArgument i | i <- [0 .. length invokeMethodTypes - 1]]
+    invokeMethodParams =
+        map (\(t, i) -> FormalParam [Final] t False (VarId i)) $
+        zip invokeMethodTypes invokeMethodParamNames
+    preparedClassType :: ClassType
+    preparedClassType =
+        ClassType $ map (, []) [mainClassName, preparedClassI]
+    prepareMethodDecl :: MemberDecl
+    prepareMethodDecl =
+        MethodDecl
+            [Final]
+            []
+            (Just $ RefType $ ClassRefType preparedClassType)
+            prepareMethodI
+            invokeMethodParams
+            []
+            Nothing $
+        MethodBody $
+        Just $
+        Block
+            [ BlockStmt $
+              Return $
+              Just $
+              InstanceCreation
+                  []
+                  (TypeDeclSpecifier preparedClassType)
+                  (FieldAccess
+                       (PrimaryFieldAccess This runtimeConfigurationFieldI) :
+                   map (ExpName . Name . pure) invokeMethodParamNames)
+                  Nothing
+            ]
+
+runtimeConfigurationFieldDecl :: MemberDecl
+runtimeConfigurationFieldDecl =
+    FieldDecl
+        [Private, Final]
+        configurationType
+        [VarDecl runtimeConfigurationFieldVarId Nothing]
+
+configuredClassConstructorDecl :: MemberDecl
+configuredClassConstructorDecl =
+    ConstructorDecl
+        [Private]
+        []
+        configuredClassI
+        [ FormalParam
+              [Final]
+              configurationType
+              False
+              runtimeConfigurationFieldVarId
+        ]
+        [] $
+    ConstructorBody
+        Nothing
+        [ BlockStmt $
+          ExpStmt $
+          Assign
+              (FieldLhs $ PrimaryFieldAccess This runtimeConfigurationFieldI)
+              EqualA
+              (ExpName $ Name [runtimeConfigurationFieldI])
+        ]
+
+
 generate :: CodeGen
 generate CodeGenData {..} =
     pure
         ( T.intercalate "/" (map toS $ nsList ++ [classNameStr]) <> ".java"
-        , toS (prettyPrint code) <> "\n//" <> generationInfoString <> "\n")
-  where
+        , toS (prettyPrint classCode) <> "\n//" <> generationInfoString <> "\n")
     -- Values computed from CodeGenData
-    nsList =
-        map (toSnake . fromAny . toS . unwrap) $
-        unwrap entryPointNamespace
+  where
+    nsList = map (toSnake . fromAny . toS . unwrap) $ unwrap entryPointNamespace
     classNameStr = toPascal $ fromAny $ toS $ unwrap entryPointName
     className = Ident classNameStr
     retId = succ $ maximum $ map operatorId $ operators graph
@@ -76,6 +289,7 @@ generate CodeGenData {..} =
             Just (retType -> ann)
                 | isVoidType ann -> Nothing
                 | otherwise -> Just $ tyExprToJava ann
+    argumentAnnotations :: [Java.Type]
     argumentAnnotations =
         maybe
             (replicate entryPointArity objectType)
@@ -85,84 +299,10 @@ generate CodeGenData {..} =
     envArcs = [a | a@Arc {source = EnvSource _} <- arcs graph]
     envArcCount = length envArcs
     -- Name constants and functions
-    opsFieldName = Ident "ops"
-    arcsFieldName = Ident "arcs"
-    indexToArgument = Ident . mappend "argument" . show
-    indexToArgumentLazy = Ident . mappend "lazyArgument" . show
-    returnVarI = Ident "returnVar"
-    lazyI = Ident "Lazy"
-    arcIdent = Ident "Arc"
-    graphIdent = Ident "graph"
     -- Type constants
-    objectI = Ident "Object"
-    objectType = RefType objectRefType
-    objectRefType = ClassRefType $ ClassType [(objectI, [])]
-    operatorClassRef = ClassType [(Ident "Operator", [])]
-    lazyObjectRefT =
-        ClassRefType $
-        ClassType
-            [(lazyI, [ActualType $ ClassRefType $ ClassType [(objectI, [])]])]
-    arcI = Ident "Arc"
-    nonGenericArcClassRef = ClassType [(arcI, [])]
-    graphClassI = Ident "Graph"
-    codeGenHelperClassI = Ident "CodeGenHelper"
-    sfRefHelperClass =
-        ClassType [(codeGenHelperClassI, []), (Ident "SfRef", [])]
     -- Helpers
     isVoidFunction = isNothing returnType
-    simpleImport path = ImportDecl False (Name $ map Ident path) False
-    envSourceTypeDeclSpec =
-        TypeDeclSpecifierWithDiamond
-            (ClassType [(Ident "Source", [])])
-            (Ident "Env")
-            Diamond
-    assignArcArray idx =
-        ExpStmt .
-        Assign
-            (ArrayLhs $
-             ArrayIndex
-                 (ExpName (Name [arcsFieldName]))
-                 [Lit $ Int $ toInteger idx])
-            EqualA
-    -- `new` expressions
-    newTarget Target {..} =
-        InstanceCreation
-            []
-            (TypeDeclSpecifier $ ClassType [(Ident "Target", [])])
-            [ Lit $ Int $ toInteger $ unwrap operator
-            , Lit $ Int $ toInteger index
-            ]
-            Nothing
-    newSource (LocalSource target) =
-        InstanceCreation
-            []
-            (TypeDeclSpecifier $
-             ClassType [(Ident "Source", []), (Ident "Local", [])])
-            [newTarget target]
-            Nothing
-    newSource (EnvSource idx) =
-        InstanceCreation
-            []
-            envSourceTypeDeclSpec
-            [ExpName $ Name $ pure $ indexToArgumentLazy idx]
-            Nothing
-    newOp Operator {..} =
-        InstanceCreation
-            []
-            (TypeDeclSpecifier operatorClassRef)
-            [ Lit $ Int $ toInteger $ unwrap operatorId
-            , Lit $ String $ stringifyQual operatorType
-            ]
-            Nothing
-    newArc Arc {..} =
-        InstanceCreation
-            []
-            (TypeDeclSpecifierUnqualifiedWithDiamond arcIdent Diamond)
-            [newTarget target, newSource source]
-            Nothing
-    createRealizedLazyExp val =
-        MethodInv $
-        TypeMethodCall (Name [lazyI]) [] (Ident "createRealized") [val]
+    mainClassName = Name $ map Ident nsList <> [className]
     returnValueArc =
         newArc $
         Arc (Target retId 0) (LocalSource $ returnArc graph :: Source HostExpr)
@@ -172,11 +312,160 @@ generate CodeGenData {..} =
     addReturnCaptureArcs
         | isVoidFunction = identity
         | otherwise = (Lit Null :) . (returnValueArc :)
-    code =
+    invokeMethodArgNames = map (indexToArgument . unwrap) enumerateArgs
+    invokeParams =
+        [ FormalParam [] ty False (VarId vname)
+        | (ty, vname) <- zip argumentAnnotations invokeMethodArgNames
+        ]
+    preparedClassDecl :: ClassDecl
+    preparedClassDecl =
+        ClassDecl [Public, Final, Static] preparedClassI [] Nothing [] $
+        ClassBody $
+        concat
+            [ pure $ MemberDecl runnableFieldDecl
+            , returnArcDecl
+            , pure $ MemberDecl constructorDecl
+            , pure $ MemberDecl invokeFunctionDecl
+            ]
+      where
+        returnArcDecl =
+            let aRefId = Ident "AtomicReference"
+             in do guard (not isVoidFunction)
+                   pure $
+                       MemberDecl $
+                       FieldDecl
+                           [Final, Private]
+                           (RefType $
+                            ClassRefType $
+                            ClassType [(aRefId, [ActualType objectRefType])])
+                           [ VarDecl (VarId returnVarI) $
+                             Just $
+                             InitExp $
+                             InstanceCreation
+                                 []
+                                 (TypeDeclSpecifierUnqualifiedWithDiamond
+                                      aRefId
+                                      Diamond)
+                                 []
+                                 Nothing
+                           ]
+        assignToField fieldName =
+            BlockStmt .
+            ExpStmt .
+            Assign (FieldLhs $ PrimaryFieldAccess This fieldName) EqualA
+        cloneArr fieldName =
+            MethodInv $
+            PrimaryMethodCall
+                (FieldAccess $
+                 PrimaryFieldAccess (ExpName mainClassName) fieldName)
+                []
+                cloneMethodI
+                []
+        runnableFieldDecl =
+            FieldDecl
+                [Private, Final]
+                runnableAlgoType
+                [VarDecl (VarId runnableAlgoFieldI) Nothing]
+        constructorDecl =
+            ConstructorDecl
+                [Private]
+                []
+                preparedClassI
+                (FormalParam
+                     [Final]
+                     configurationType
+                     False
+                     (VarId configVarIdent) :
+                 invokeParams)
+                [] $
+            ConstructorBody Nothing constructorCode
+        constructorCode =
+            concat
+                [ [ mkLocalArrVar operatorClassRef opsFieldName
+                  , mkLocalArrVar nonGenericArcClassRef arcsFieldName
+                  ]
+                , createArgumentLazies
+                , createAndAssignInputArcs
+                , createAndAssignReturnArc
+                , createLocalGraph
+                , createAndAssignRunnableAlgo
+                ]
+          where
+            mkLocalArrVar t fieldName =
+                LocalVars
+                    [Final]
+                    (RefType $ ArrayType $ RefType $ ClassRefType t)
+                    [ VarDecl
+                          (VarId fieldName)
+                          (Just $ InitExp $ cloneArr fieldName)
+                    ]
+            createArgumentLazies =
+                [ LocalVars
+                      [Final]
+                      (RefType lazyObjectRefT)
+                      [ VarDecl (VarId $ indexToArgumentLazy $ unwrap idx) $
+                      Just $
+                      InitExp $
+                      createRealizedLazyExp
+                          (ExpName $ Name $ pure $ indexToArgument $ unwrap idx)
+                      | idx <- enumerateArgs :: [HostExpr]
+                      ]
+                ]
+            createAndAssignInputArcs =
+                [ BlockStmt $ assignArcArray arcIdx (newArc arc)
+                | (arcIdx, arc) <- zip [(0 :: Int) ..] envArcs
+                ]
+            createAndAssignReturnArc = do
+                guard (not isVoidFunction)
+                pure $
+                    BlockStmt $
+                    assignArcArray envArcCount $
+                    InstanceCreation
+                        []
+                        (TypeDeclSpecifierUnqualifiedWithDiamond
+                             arcIdent
+                             Diamond)
+                        [ newTarget $ Target retId 1
+                        , InstanceCreation
+                              []
+                              envSourceTypeDeclSpec
+                              [ createRealizedLazyExp $
+                                FieldAccess $ PrimaryFieldAccess This returnVarI
+                              ]
+                              Nothing
+                        ]
+                        Nothing
+            createAndAssignRunnableAlgo =
+                pure $
+                assignToField runnableAlgoFieldI $
+                MethodInv $
+                TypeMethodCall
+                    (Name [Ident "Runtime"])
+                    []
+                    (Ident "prepare")
+                    [ ExpName $ Name [graphIdent]
+                    , ExpName $ Name [configVarIdent]
+                    ]
+        invokeFunctionDecl =
+            MethodDecl [Public] [] returnType (Ident "invoke") [] [] Nothing $
+            MethodBody $ Just invokeFunctionCode
+        invokeFunctionCode =
+            Block $
+            concat
+                [ pure $
+                  BlockStmt $
+                  ExpStmt $
+                  MethodInv $
+                  PrimaryMethodCall
+                      (FieldAccess $ PrimaryFieldAccess This runnableAlgoFieldI)
+                      []
+                      (Ident "run")
+                      []
+                , invokeMethodReturnStatement returnType
+                ]
+    classCode =
         CompilationUnit
-            (if null nsList
-                 then Nothing
-                 else Just $ PackageDecl $ Name $ map Ident nsList)
+            packageDecl
             [ simpleImport ["ohua", "graph", "Arc"]
             , simpleImport ["ohua", "graph", "Operator"]
             , simpleImport ["ohua", "graph", "Target"]
@@ -185,6 +474,8 @@ generate CodeGenData {..} =
             , simpleImport ["ohua", "loader", "CodeGenHelper"]
             , simpleImport ["ohua", "util", "Lazy"]
             , simpleImport ["ohua", "Runtime"]
+            , simpleImport
+                  ["ohua", "runtime", "engine", "RuntimeProcessConfiguration"]
             , simpleImport
                   ["java", "util", "concurrent", "atomic", "AtomicReference"]
             ]
@@ -197,195 +488,223 @@ generate CodeGenData {..} =
                   [] -- Implemented interfaces go here
                $
               ClassBody
-                  -- TODO load stateful functions
-                  [ InitDecl True $
-                    Block $
-                    let functionsArrayIdent = Ident "functions"
-                     in [ LocalVars
-                              [Final]
-                              (RefType $
-                               ArrayType $
-                               RefType $ ClassRefType sfRefHelperClass)
-                              [ VarDecl (VarId functionsArrayIdent) $
-                                Just $
-                                InitArray $
-                                ArrayInit
-                                    [ InitExp $
-                                    InstanceCreation
-                                        []
-                                        (TypeDeclSpecifier sfRefHelperClass)
-                                        [ Lit $
-                                          String $
-                                          intercalate "." $
-                                          map (toS . unwrap) $
-                                          unwrap namespace
-                                        , Lit $
-                                          String $ toS $ unwrap name_
-                                        ]
-                                        Nothing
-                                    | QualifiedBinding namespace name_ <-
-                                          nub $ map operatorType finalOperators
-                                    ]
-                              ]
-                        , BlockStmt $
-                          ExpStmt $
-                          MethodInv $
-                          TypeMethodCall
-                              (Name [codeGenHelperClassI])
-                              []
-                              (Ident "ensureFunctionsAreLoaded")
-                              [ExpName (Name [functionsArrayIdent])]
-                        ]
+                  [ InitDecl True $ mkStatefulFunctionLoadingCode finalOperators
+                  , MemberDecl operatorsArrayField
+                  , MemberDecl arcsArrayField
+                  , MemberDecl $ MemberClassDecl preparedClassDecl
                   , MemberDecl $
-                    FieldDecl
-                        [Private, Static, Final]
-                        (RefType $
-                         ArrayType $ RefType $ ClassRefType operatorClassRef)
-                        [ VarDecl (VarId opsFieldName) $
-                          Just $
-                          InitArray $
-                          ArrayInit (map (InitExp . newOp) finalOperators)
-                        ]
-                  , MemberDecl $
-                    FieldDecl
-                        [Private, Static, Final]
-                        (RefType $
-                         ArrayType $
-                         RefType $ ClassRefType nonGenericArcClassRef)
-                        [ VarDecl (VarId arcsFieldName) $
-                          Just $
-                          InitArray $
-                          ArrayInit $
-                          map InitExp $
-                          replicate envArcCount (Lit Null) ++
-                          addReturnCaptureArcs (map newArc localArcs)
-                        ]
-                  , MemberDecl $
-                    ConstructorDecl
-                        [Private]
-                        []
-                        className
-                        []
-                        []
-                        (ConstructorBody Nothing [])
-                  , MemberDecl $
-                    MethodDecl
-                        [Public, Static]
-                        []
-                        returnType
-                        (Ident "invoke")
-                        [ FormalParam [] ty False (VarId $ indexToArgument idx)
-                        | (ty, idx) <- zip argumentAnnotations enumerateArgs
-                        ]
-                        []
-                        Nothing $
-                    MethodBody $
-                    Just $
-                    Block $
-                    concat
-                        [ do guard (not isVoidFunction)
-                             let aRefId = Ident "AtomicReference"
-                             pure $
-                                 LocalVars
-                                     [Final]
-                                     (RefType $
-                                      ClassRefType $
-                                      ClassType
-                                          [(aRefId, [ActualType objectRefType])])
-                                     [ VarDecl (VarId returnVarI) $
-                                       Just $
-                                       InitExp $
-                                       InstanceCreation
-                                           []
-                                           (TypeDeclSpecifierUnqualifiedWithDiamond
-                                                aRefId
-                                                Diamond)
-                                           []
-                                           Nothing
-                                     ]
-                        , [ LocalVars
-                                [Final]
-                                (RefType lazyObjectRefT)
-                                [ VarDecl (VarId $ indexToArgumentLazy idx) $
-                                Just $
-                                InitExp $
-                                createRealizedLazyExp
-                                    (ExpName $ Name $ pure $ indexToArgument idx)
-                                | idx <- enumerateArgs :: [HostExpr]
-                                ]
-                          ]
-                        , [ BlockStmt $ assignArcArray arcIdx (newArc arc)
-                          | (arcIdx, arc) <- zip [(0 :: Int) ..] envArcs
-                          ]
-                        , do guard (not isVoidFunction)
-                             pure $
-                                 BlockStmt $
-                                 assignArcArray envArcCount $
-                                 InstanceCreation
-                                     []
-                                     (TypeDeclSpecifierUnqualifiedWithDiamond
-                                          arcIdent
-                                          Diamond)
-                                     [ newTarget $ Target retId 1
-                                     , InstanceCreation
-                                           []
-                                           envSourceTypeDeclSpec
-                                           [ createRealizedLazyExp $
-                                             ExpName $ Name $ pure returnVarI
-                                           ]
-                                           Nothing
-                                     ]
-                                     Nothing
-                        , [ LocalVars
-                                [Final]
-                                (RefType $
-                                 ClassRefType $
-                                 ClassType
-                                     [ ( graphClassI
-                                       , [ActualType lazyObjectRefT])
-                                     ])
-                                [ VarDecl
-                                      (VarId graphIdent)
-                                      (Just $
-                                       InitExp $
-                                       InstanceCreation
-                                           []
-                                           (TypeDeclSpecifierUnqualifiedWithDiamond
-                                                graphClassI
-                                                Diamond)
-                                           [ ExpName $ Name $ pure opsFieldName
-                                           , ExpName $ Name $ pure arcsFieldName
-                                           ]
-                                           Nothing)
-                                ]
-                          , BlockStmt $
-                            ExpStmt $
-                            MethodInv $
-                            PrimaryMethodCall
-                                (MethodInv $
-                                 TypeMethodCall
-                                     (Name [Ident "Runtime"])
-                                     []
-                                     (Ident "prepare")
-                                     [ExpName $ Name $ pure graphIdent])
-                                []
-                                (Ident "run")
-                                []
-                          ]
-                        , case returnType of
-                              Nothing -> empty
-                              Just t ->
-                                  [ BlockStmt $
-                                    Return $
-                                    Just $
-                                    Cast t $
-                                    MethodInv $
-                                    PrimaryMethodCall
-                                        (ExpName (Name [returnVarI]))
-                                        []
-                                        (Ident "get")
-                                        []
-                                  ]
-                        ]
+                    MemberClassDecl $
+                    configuredClassDecl className argumentAnnotations
+                  , MemberDecl classConstructor
+                  , MemberDecl configureFunctionDecl
+                  , MemberDecl invokeFunctionDecl
                   ]
             ]
+      where
+        packageDecl
+            | null nsList = Nothing
+            | otherwise = Just $ PackageDecl $ Name $ map Ident nsList
+        mkCommonArrayFieldWInit ref name init =
+            mkCommonArrayField
+                ref
+                name
+                (Just $ InitArray $ ArrayInit $ map InitExp init)
+        operatorsArrayField =
+            mkCommonArrayFieldWInit
+                operatorClassRef
+                opsFieldName
+                (map newOp finalOperators)
+        arcsArrayField =
+            mkCommonArrayFieldWInit
+                nonGenericArcClassRef
+                arcsFieldName
+                (replicate envArcCount (Lit Null) ++
+                 addReturnCaptureArcs (map newArc localArcs))
+        classConstructor =
+            ConstructorDecl
+                [Private]
+                []
+                className
+                []
+                []
+                (ConstructorBody Nothing [])
+        configureFunctionDecl =
+            MethodDecl
+                [Static, Final]
+                []
+                (Just $
+                 RefType $ ClassRefType $ ClassType [(configuredClassI, [])])
+                configureMethodI
+                [ FormalParam
+                      [Final]
+                      configurationType
+                      False
+                      (VarId configVarIdent)
+                ]
+                []
+                Nothing $
+            MethodBody $
+            Just $
+            Block
+                [ BlockStmt $
+                  Return $
+                  Just $
+                  InstanceCreation
+                      []
+                      (TypeDeclSpecifier $ ClassType [(configuredClassI, [])])
+                      [ExpName $ Name [configVarIdent]]
+                      Nothing
+                ]
+        invokeFunctionDecl :: MemberDecl
+        invokeFunctionDecl =
+            MethodDecl
+                [Final, Static, Public]
+                []
+                returnType
+                invokeMethodI
+                invokeParams
+                []
+                Nothing $
+            MethodBody $
+            Just $
+            Block $
+            let defaultRuntimeOptions =
+                    InstanceCreation
+                        []
+                        (TypeDeclSpecifier configurationClassType)
+                        []
+                        Nothing
+                callConfigure =
+                    MethodInv $
+                    MethodCall (Name [configureMethodI]) [defaultRuntimeOptions]
+                callPrepare =
+                    MethodInv $
+                    PrimaryMethodCall
+                        callConfigure
+                        []
+                        prepareMethodI
+                        (map (ExpName . Name . pure) invokeMethodArgNames)
+                callInvoke =
+                    MethodInv $
+                    PrimaryMethodCall callPrepare [] invokeMethodI []
+             in [BlockStmt $ Return $ Just callInvoke]
+-- | Produces
+-- @
+--    static {
+--              final CodeGenHelper.SfRef[] functions = { new CodeGenHelper.SfRef("ohua.lang", "capture"), ... };
+--              CodeGenHelper.ensureFunctionsAreLoaded(functions);
+--            }
+-- @
+-- from a list of operators
+mkStatefulFunctionLoadingCode :: [Operator] -> Block
+mkStatefulFunctionLoadingCode usedSfs =
+    Block $
+    let functionsArrayIdent = Ident "functions"
+     in [ LocalVars
+              [Final]
+              (RefType $ ArrayType $ RefType $ ClassRefType sfRefHelperClass)
+              [ VarDecl (VarId functionsArrayIdent) $
+                Just $ InitArray $ ArrayInit $ mkUsedStatefulFunctionsArray usedSfs
+              ]
+        , BlockStmt $
+          ExpStmt $
+          MethodInv $
+          TypeMethodCall
+              (Name [codeGenHelperClassI])
+              []
+              (Ident "ensureFunctionsAreLoaded")
+              [ExpName (Name [functionsArrayIdent])]
+        ]
+
+-- | Produces the array initializer
+-- @
+--    { new CodeGenHelper.SfRef("ohua.lang", "capture"), ... }
+-- @
+-- from a list of operators
+mkUsedStatefulFunctionsArray :: [Operator] -> [VarInit]
+mkUsedStatefulFunctionsArray operators =
+            [ InitExp $
+            InstanceCreation
+                []
+                (TypeDeclSpecifier sfRefHelperClass)
+                [ Lit $
+                  String $
+                  intercalate "." $ map (toS . unwrap) $ unwrap namespace
+                , Lit $ String $ toS $ unwrap name_
+                ]
+                Nothing
+            | QualifiedBinding namespace name_ <-
+                  nub $ map operatorType operators
+            ]
+
+-- | Produces the
+-- @
+--    final AtomicReference<Object> returnVar = new AtomicReference<>();
+-- @
+-- statement
+createCaptureReference :: [BlockStmt]
+createCaptureReference =
+    let aRefId = Ident "AtomicReference"
+     in pure $
+        LocalVars
+            [Final]
+            (RefType $
+             ClassRefType $ ClassType [(aRefId, [ActualType objectRefType])])
+            [ VarDecl (VarId returnVarI) $
+              Just $
+              InitExp $
+              InstanceCreation
+                  []
+                  (TypeDeclSpecifierUnqualifiedWithDiamond aRefId Diamond)
+                  []
+                  Nothing
+            ]
+
+
+-- | Produces the
+-- @
+--    return (Object) returnVar.get();
+-- @
+-- statement *iff* the return type is not @void@
+invokeMethodReturnStatement :: Maybe Java.Type -> [BlockStmt]
+invokeMethodReturnStatement returnType =
+    case returnType of
+        Nothing -> empty
+        Just t ->
+            [ BlockStmt $
+              Return $
+              Just $
+              Cast t $
+              MethodInv $
+              PrimaryMethodCall
+                  (ExpName (Name [returnVarI]))
+                  []
+                  (Ident "get")
+                  []
+            ]
+
+-- | Produces the
+-- @
+--   final Graph<Lazy<Object>> graph = new Graph<>(ops, arcs);
+-- @
+-- statement
+createLocalGraph :: [BlockStmt]
+createLocalGraph =
+    [ LocalVars
+          [Final]
+          graphType
+          [ VarDecl
+                (VarId graphIdent)
+                (Just $
+                 InitExp $
+                 InstanceCreation
+                     []
+                     (TypeDeclSpecifierUnqualifiedWithDiamond
+                          graphClassI
+                          Diamond)
+                     [ ExpName $ Name $ pure opsFieldName
+                     , ExpName $ Name $ pure arcsFieldName
+                     ]
+                     Nothing)
+          ]
+    ]

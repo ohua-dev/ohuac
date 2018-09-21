@@ -59,7 +59,9 @@ isVoidType = (== tupleConstructor)
 -- Identities
 returnVarI, lazyI, arcIdent, graphIdent, objectI, arcI, graphClassI
   , codeGenHelperClassI, opsFieldName, arcsFieldName, configuredClassI
-  , runtimeConfigurationFieldI, preparedClassI, cloneMethodI, runnableAlgoFieldI, configVarIdent :: Ident
+  , runtimeConfigurationFieldI, preparedClassI, cloneMethodI
+  , runnableAlgoFieldI, configVarIdent, prepareMethodI, invokeMethodI
+  , configureMethodI :: Ident
 returnVarI = Ident "returnVar"
 lazyI = Ident "Lazy"
 arcIdent = Ident "Arc"
@@ -84,7 +86,8 @@ runtimeConfigurationFieldVarId :: VarDeclId
 runtimeConfigurationFieldVarId = VarId runtimeConfigurationFieldI
 
 -- Class types
-operatorClassRef, nonGenericArcClassRef, sfRefHelperClass, configurationClassType :: ClassType
+operatorClassRef, nonGenericArcClassRef, sfRefHelperClass
+  , configurationClassType :: ClassType
 operatorClassRef = ClassType [(Ident "Operator", [])]
 sfRefHelperClass =
         ClassType [(codeGenHelperClassI, []), (Ident "SfRef", [])]
@@ -148,7 +151,8 @@ newTarget Target {..} =
         ]
         Nothing
 
--- | Creates a @new Source.Local(target)@ or @new Source.Env(lazyObject)@ from an 'Arc'
+-- | Creates a @new Source.Local(target)@ or @new Source.Env(lazyObject)@ from
+-- an 'Arc'
 newSource :: Source HostExpr -> Exp
 newSource (LocalSource target) =
     InstanceCreation
@@ -191,6 +195,7 @@ createRealizedLazyExp val =
     MethodInv $
     TypeMethodCall (Name [lazyI]) [] (Ident "createRealized") [val]
 
+mkCommonArrayField :: ClassType -> Ident -> Maybe VarInit -> MemberDecl
 mkCommonArrayField classRef fieldName initExprs =
     FieldDecl
         [Private, Static, Final]
@@ -298,9 +303,6 @@ generate CodeGenData {..} =
     localArcs = [a | a@Arc {source = LocalSource _} <- arcs graph]
     envArcs = [a | a@Arc {source = EnvSource _} <- arcs graph]
     envArcCount = length envArcs
-    -- Name constants and functions
-    -- Type constants
-    -- Helpers
     isVoidFunction = isNothing returnType
     mainClassName = Name $ map Ident nsList <> [className]
     returnValueArc =
@@ -328,27 +330,27 @@ generate CodeGenData {..} =
             , pure $ MemberDecl invokeFunctionDecl
             ]
       where
-        returnArcDecl =
+        returnArcDecl = do
             let aRefId = Ident "AtomicReference"
-             in do guard (not isVoidFunction)
-                   pure $
-                       MemberDecl $
-                       FieldDecl
-                           [Final, Private]
-                           (RefType $
-                            ClassRefType $
-                            ClassType [(aRefId, [ActualType objectRefType])])
-                           [ VarDecl (VarId returnVarI) $
-                             Just $
-                             InitExp $
-                             InstanceCreation
-                                 []
-                                 (TypeDeclSpecifierUnqualifiedWithDiamond
-                                      aRefId
-                                      Diamond)
-                                 []
-                                 Nothing
-                           ]
+            guard (not isVoidFunction)
+            pure $
+                MemberDecl $
+                FieldDecl
+                    [Final, Private]
+                    (RefType $
+                     ClassRefType $
+                     ClassType [(aRefId, [ActualType objectRefType])])
+                    [ VarDecl (VarId returnVarI) $
+                      Just $
+                      InitExp $
+                      InstanceCreation
+                          []
+                          (TypeDeclSpecifierUnqualifiedWithDiamond
+                               aRefId
+                               Diamond)
+                          []
+                          Nothing
+                    ]
         assignToField fieldName =
             BlockStmt .
             ExpStmt .
@@ -504,10 +506,10 @@ generate CodeGenData {..} =
         packageDecl
             | null nsList = Nothing
             | otherwise = Just $ PackageDecl $ Name $ map Ident nsList
-        mkCommonArrayFieldWInit ref name init =
+        mkCommonArrayFieldWInit ref fieldName init =
             mkCommonArrayField
                 ref
-                name
+                fieldName
                 (Just $ InitArray $ ArrayInit $ map InitExp init)
         operatorsArrayField =
             mkCommonArrayFieldWInit
@@ -588,6 +590,7 @@ generate CodeGenData {..} =
                     MethodInv $
                     PrimaryMethodCall callPrepare [] invokeMethodI []
              in [BlockStmt $ Return $ Just callInvoke]
+
 -- | Produces
 -- @
 --    static {
@@ -598,13 +601,13 @@ generate CodeGenData {..} =
 -- from a list of operators
 mkStatefulFunctionLoadingCode :: [Operator] -> Block
 mkStatefulFunctionLoadingCode usedSfs =
-    Block $
-    let functionsArrayIdent = Ident "functions"
-     in [ LocalVars
+    Block
+        [ LocalVars
               [Final]
               (RefType $ ArrayType $ RefType $ ClassRefType sfRefHelperClass)
               [ VarDecl (VarId functionsArrayIdent) $
-                Just $ InitArray $ ArrayInit $ mkUsedStatefulFunctionsArray usedSfs
+                Just $
+                InitArray $ ArrayInit $ mkUsedStatefulFunctionsArray usedSfs
               ]
         , BlockStmt $
           ExpStmt $
@@ -615,6 +618,8 @@ mkStatefulFunctionLoadingCode usedSfs =
               (Ident "ensureFunctionsAreLoaded")
               [ExpName (Name [functionsArrayIdent])]
         ]
+  where
+    functionsArrayIdent = Ident "functions"
 
 -- | Produces the array initializer
 -- @
@@ -623,42 +628,16 @@ mkStatefulFunctionLoadingCode usedSfs =
 -- from a list of operators
 mkUsedStatefulFunctionsArray :: [Operator] -> [VarInit]
 mkUsedStatefulFunctionsArray operators =
-            [ InitExp $
-            InstanceCreation
-                []
-                (TypeDeclSpecifier sfRefHelperClass)
-                [ Lit $
-                  String $
-                  intercalate "." $ map (toS . unwrap) $ unwrap namespace
-                , Lit $ String $ toS $ unwrap name_
-                ]
-                Nothing
-            | QualifiedBinding namespace name_ <-
-                  nub $ map operatorType operators
-            ]
-
--- | Produces the
--- @
---    final AtomicReference<Object> returnVar = new AtomicReference<>();
--- @
--- statement
-createCaptureReference :: [BlockStmt]
-createCaptureReference =
-    let aRefId = Ident "AtomicReference"
-     in pure $
-        LocalVars
-            [Final]
-            (RefType $
-             ClassRefType $ ClassType [(aRefId, [ActualType objectRefType])])
-            [ VarDecl (VarId returnVarI) $
-              Just $
-              InitExp $
-              InstanceCreation
-                  []
-                  (TypeDeclSpecifierUnqualifiedWithDiamond aRefId Diamond)
-                  []
-                  Nothing
-            ]
+    [ InitExp $
+    InstanceCreation
+        []
+        (TypeDeclSpecifier sfRefHelperClass)
+        [ Lit $ String $ intercalate "." $ map (toS . unwrap) $ unwrap namespace
+        , Lit $ String $ toS $ unwrap name_
+        ]
+        Nothing
+    | QualifiedBinding namespace name_ <- nub $ map operatorType operators
+    ]
 
 
 -- | Produces the
@@ -667,21 +646,15 @@ createCaptureReference =
 -- @
 -- statement *iff* the return type is not @void@
 invokeMethodReturnStatement :: Maybe Java.Type -> [BlockStmt]
-invokeMethodReturnStatement returnType =
-    case returnType of
-        Nothing -> empty
-        Just t ->
-            [ BlockStmt $
-              Return $
-              Just $
-              Cast t $
-              MethodInv $
-              PrimaryMethodCall
-                  (ExpName (Name [returnVarI]))
-                  []
-                  (Ident "get")
-                  []
-            ]
+invokeMethodReturnStatement Nothing = empty
+invokeMethodReturnStatement (Just returnType) =
+    [ BlockStmt $
+      Return $
+      Just $
+      Cast returnType $
+      MethodInv $
+      PrimaryMethodCall (ExpName (Name [returnVarI])) [] (Ident "get") []
+    ]
 
 -- | Produces the
 -- @

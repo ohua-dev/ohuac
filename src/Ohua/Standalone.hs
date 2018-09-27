@@ -14,14 +14,15 @@ import Data.List (partition)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import Lens.Micro
-import Lens.Micro.Mtl
+import Lens.Micro.Platform
 import System.Directory
 import System.FilePath as Path ((<.>), takeExtension)
 import Ohua.LensClasses (annotation, value)
 
 import Ohua.ALang.Lang
 import Ohua.ALang.NS as NS
+import Ohua.Unit
+import Ohua.ALang.PPrint
 import Ohua.Monad
 import Ohua.Serialize.JSON ()
 import Ohua.Types
@@ -88,6 +89,8 @@ stdNamespace =
     , ["id", "smap", "if"] -- TODO complete list
      )
 
+primitives :: HM.HashMap Binding Expression
+primitives = HM.fromList [(unitBinding, unitExpr)]
 
 resolveNS ::
        forall m. MonadError Error m
@@ -111,30 +114,32 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
         done <- go expr
         local (second $ Map.insert (QualifiedBinding modname varName) done) $
             ((varName, done) :) <$> (go0 xs)
-    go :: Expr SomeBinding
-       -> ReaderT (Set.Set Binding, IFaceDefs) m Expression
+    go :: Expr SomeBinding -> ReaderT (Set.Set Binding, IFaceDefs) m Expression
     go (Let assignment val body) =
         registerAssign assignment $ Let assignment <$> go val <*> go body
-    go (Var (Unqual bnd)) = do
-        isLocal <- asks (Set.member bnd . fst)
-        if isLocal
-            then pure $ Var $ Local bnd
-            else case (Map.lookup bnd algoRefers, Map.lookup bnd sfRefers) of
-                     (Just algo, Just sf) ->
-                         throwError $
-                         "Ambiguous ocurrence of unqualified binding " <>
-                         show bnd <>
-                         ". Could refer to algo " <>
-                         show algo <>
-                         " or sf " <>
-                         show sf
-                     (Just algoname, _) ->
-                         maybe
-                             (throwError $ "Algo not loaded " <> show algoname)
-                             pure =<<
-                         asks (Map.lookup algoname . snd)
-                     (_, Just sf) -> pure $ Var $ Sf sf Nothing
-                     _ -> throwError $ "Binding not in scope " <> show bnd
+    go (Var (Unqual bnd))
+        | Just alangVersion <- primitives ^? ix bnd = pure alangVersion
+        | otherwise = do
+            isLocal <- asks (Set.member bnd . fst)
+            if isLocal
+                then pure $ Var $ Local bnd
+                else case (Map.lookup bnd algoRefers, Map.lookup bnd sfRefers) of
+                         (Just algo, Just sf) ->
+                             throwError $
+                             "Ambiguous ocurrence of unqualified binding " <>
+                             show bnd <>
+                             ". Could refer to algo " <>
+                             show algo <>
+                             " or sf " <>
+                             show sf
+                         (Just algoname, _) ->
+                             maybe
+                                 (throwError $
+                                  "Algo not loaded " <> show algoname)
+                                 pure =<<
+                             asks (Map.lookup algoname . snd)
+                         (_, Just sf) -> pure $ Var $ Sf sf Nothing
+                         _ -> throwError $ "Binding not in scope " <> show bnd
     go (Var (Qual qb)) = do
         algo <- asks (Map.lookup qb . snd)
         case algo of
@@ -147,7 +152,8 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
                 "No matching algo available or namespace not loaded for " <>
                 show qb
     go (Apply expr expr2) = Apply <$> go expr <*> go expr2
-    go (Lambda assignment body) = registerAssign assignment $ Lambda assignment <$> go body
+    go (Lambda assignment body) =
+        registerAssign assignment $ Lambda assignment <$> go body
     sfImports1 = stdNamespace : sfImports0
     registerAssign = local . first . Set.union . Set.fromList . extractBindings
     locallyDefinedAlgos = Set.fromList $ HM.keys declarations
@@ -169,8 +175,14 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
 withS :: (StringConv a b, StringConv b c) => (b -> b) -> a -> c
 withS f = toS . f . toS
 
-readAndParse :: MonadIO m => Text -> m (Maybe TyAnnMap, RawNamespace)
-readAndParse filename = getParser (withS takeExtension filename) <$> liftIO (L.readFile $ toS filename)
+readAndParse :: (MonadLogger m, MonadIO m) => Text -> m (Maybe TyAnnMap, RawNamespace)
+readAndParse filename = do
+  (anns, ns) <- getParser (withS takeExtension filename) <$> liftIO (L.readFile $ toS filename)
+  logDebugN $ "Raw parse result for " <> filename
+  logDebugN $ quickRender ns
+  logDebugN "With annotations:"
+  logDebugN $ show anns
+  pure (anns, ns)
 
 
 gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
@@ -194,6 +206,7 @@ findSourceFile modname = do
     asFile = toS $ T.intercalate "/" $ map unwrap $ unwrap modname
     extensions = map (^. _1) definedLangs
 
+deriving instance Show RawNamespace
 
 loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
 loadModule tracker modname = do

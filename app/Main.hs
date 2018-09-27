@@ -22,6 +22,7 @@ import Ohua.Types
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.CodeGen.Iface
+import Ohua.Unit
 import Ohua.Util (mapLeft)
 
 newtype DumpOpts = DumpOpts
@@ -109,7 +110,11 @@ main = do
                 expr <- getMain $ mainMod ^. decls
                 let sfDeps = gatherSFDeps expr
                 let (mainArity, completeExpr) = mainToEnv expr
-                gr <- compile def def completeExpr
+                gr <-
+                    compile
+                        def
+                        (def {passAfterDFLowering = cleanUnits})
+                        completeExpr
                 (nameSuggest, code) <-
                     flip runReaderT CodeGenOpts $
                     selectionToGen

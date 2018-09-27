@@ -43,11 +43,12 @@ default-extensions:
 - RankNTypes
 - ViewPatterns
 - NoImplicitPrelude
+- StandaloneDeriving
 dependencies:
 - protolude
 - base
 - microlens
-- microlens-mtl
+- microlens-platform
 - ohua-core
 - bytestring
 - aeson

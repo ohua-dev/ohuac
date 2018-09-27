@@ -33,6 +33,7 @@ data CmdOpts = CmdOpts
     , inputModuleFile :: FilePath
     , entrypoint :: Binding
     , outputPath :: Maybe FilePath
+    , logLevel :: LogLevel
     }
 
 data CodeGenSelection
@@ -58,19 +59,20 @@ genTypes "json-object" = JSONGen.generate
 genTypes "simple-java-class" = JavaGen.generate
 genTypes t = panic $ "Unsupported code gen type " <> toS t
 
-runCompM :: CompM () -> IO ()
-runCompM c =
+runCompM :: LogLevel -> CompM () -> IO ()
+runCompM targetLevel c =
     runStderrLoggingT $
-    filterLogger (\_ level -> level >= LevelInfo) $
+    filterLogger (\_ level -> level >= targetLevel) $
     runExceptT c >>= either (logErrorN . toS) pure
 
 main :: IO ()
-main =
-    runCompM $ do
-        opts@CmdOpts { inputModuleFile = inputModFile
-                     , outputPath = out
-                     , entrypoint
-                     } <- liftIO $ execParser odef
+main = do
+    opts@CmdOpts { inputModuleFile = inputModFile
+                 , outputPath = out
+                 , entrypoint
+                 , logLevel
+                 } <- execParser odef
+    runCompM logLevel $ do
         modTracker <- liftIO $ newIORef mempty
         (mainAnns, rawMainMod) <- readAndParse $ toS inputModFile
         let getMain ::
@@ -121,7 +123,8 @@ main =
                             , entryPointNamespace = rawMainMod ^. name
                             }
                 let outputPath = fromMaybe (toS nameSuggest) out
-                liftIO $ createDirectoryIfMissing True (takeDirectory outputPath)
+                liftIO $
+                    createDirectoryIfMissing True (takeDirectory outputPath)
                 liftIO $ L.writeFile outputPath code
   where
     odef =
@@ -171,4 +174,16 @@ main =
             (strOption $
              long "output" <> metavar "PATH" <> short 'o' <>
              help
-                 "Path to write the output to (default: input filename with '.ohuao' extension for 'build' with the JSON format and '.java' with the java format and '.type-dump' for 'dump-main-type')")
+                 "Path to write the output to (default: input filename with '.ohuao' extension for 'build' with the JSON format and '.java' with the java format and '.type-dump' for 'dump-main-type')") <*>
+        ((\verbose debug ->
+              if debug
+                  then LevelDebug
+                  else if verbose
+                           then LevelInfo
+                           else LevelWarn) <$>
+         switch
+             (short 'v' <> long "verbose" <>
+              help "Print more detailed logging messages") <*>
+         switch
+             (long "debug" <>
+              help "Activate all logging messages for debugging purposes."))

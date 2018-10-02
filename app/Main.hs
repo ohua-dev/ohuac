@@ -13,6 +13,7 @@ import Lens.Micro.Internal (Index, IxValue, Ixed)
 import Options.Applicative as O
 import System.FilePath ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
+import qualified System.Exit.Codes as EX
 
 import Ohua.ALang.NS
 import Ohua.Compile
@@ -64,7 +65,11 @@ runCompM :: LogLevel -> CompM () -> IO ()
 runCompM targetLevel c =
     runStderrLoggingT $
     filterLogger (\_ level -> level >= targetLevel) $
-    runExceptT c >>= either (logErrorN . toS) pure
+    runExceptT c >>= either exitError pure
+  where
+    exitError message = do
+        logErrorN $ toS message
+        liftIO $ exitWith EX.codeSoftware
 
 main :: IO ()
 main = do

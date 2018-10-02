@@ -13,7 +13,7 @@ packages:
     git: https://github.com/ohua-dev/alang-sexpr-parser
     commit: a5391f20bb5b3448f23403f9d88792f46746f982
   extra-dep: true
-extra-deps: []
+extra-deps: [exit-codes-0.1.1.0]
 flags:
   ohuac:
     with-clike-parser: yes

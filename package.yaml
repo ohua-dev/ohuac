@@ -55,7 +55,6 @@ dependencies:
 - filepath
 - directory
 - data-default-class
-- protolude
 library:
   source-dirs: src
   dependencies:
@@ -88,6 +87,7 @@ executables:
     - ohuac
     - optparse-applicative
     - exit-codes
+    - template-haskell
     ghc-options:
     - -threaded
     - -rtsopts

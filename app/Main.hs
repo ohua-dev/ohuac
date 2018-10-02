@@ -1,3 +1,4 @@
+{-# LANGUAGE TemplateHaskell #-}
 module Main where
 
 import Protolude
@@ -7,13 +8,14 @@ import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Char as C
 import Data.Default.Class
 import Data.IORef
-import Data.List (lookup)
+import Data.List (lookup, intercalate)
 import Lens.Micro
 import Lens.Micro.Internal (Index, IxValue, Ixed)
 import Options.Applicative as O
 import qualified System.FilePath as FP ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
 import qualified System.Exit.Codes as EX
+import Language.Haskell.TH
 
 import Ohua.ALang.NS
 import Ohua.Compile
@@ -30,6 +32,14 @@ newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
     }
 
+newtype BuildOpts = BuildOpts
+    { outputFormat :: CodeGenSelection
+    }
+
+data Command
+  = Build BuildOpts
+  | DumpType DumpOpts
+
 data CmdOpts = CmdOpts
     { command_ :: Command
     , inputModuleFile :: Text
@@ -39,31 +49,64 @@ data CmdOpts = CmdOpts
     }
 
 data CodeGenSelection
-    = GenJsonObject
-    | GenSimpleJavaClass
+    = JsonGraph
+    | SimpleJavaClass
     deriving (Read, Show, Bounded, Enum)
 
 selectionToGen :: CodeGenSelection -> CodeGen
-selectionToGen GenSimpleJavaClass = JavaGen.generate
-selectionToGen GenJsonObject = JSONGen.generate
+selectionToGen SimpleJavaClass = JavaGen.generate
+selectionToGen JsonGraph = JSONGen.generate
 
-newtype BuildOpts = BuildOpts
-    { outputFormat :: CodeGenSelection
-    }
-
-data Command
-  = Build BuildOpts
-  | DumpType DumpOpts
+-- The following splice generates the following two conversions from the
+-- 'codeGenStrings' list
+--
+-- readCodeGen :: Text -> Maybe CodeGenSelection
+-- showCodeGen :: CodeGenSelection -> Text
+$(let codeGenStrings =
+          [('JsonGraph, "json-graph"), ('SimpleJavaClass, "simple-java-class")]
+      (readClauses, showClauses) =
+          unzip
+              [ ( Clause
+                      [LitP $ StringL strRep]
+                      (NormalB $ ConE 'Right `AppE` ConE constr)
+                      []
+                , Clause [ConP constr []] (NormalB $ LitE $ StringL strRep) [])
+              | (constr, strRep) <- codeGenStrings
+              ]
+      showN = mkName "showCodeGen"
+      readN = mkName "readCodeGen"
+      strVar = mkName "str"
+      errMgs =
+          "Unrecognized code gen type. Valid options: " ++
+          intercalate ", " (map snd codeGenStrings)
+      varIsStr var = ConT ''IsString `AppT` VarT var
+      strVarIsString = varIsStr strVar
+      errVar = mkName "err"
+   in pure
+          [ SigD showN $
+            ForallT [PlainTV strVar] [strVarIsString] $
+            ArrowT `AppT` ConT ''CodeGenSelection `AppT` VarT strVar
+          , FunD showN showClauses
+          , SigD readN $
+            ForallT
+                [PlainTV strVar, PlainTV errVar]
+                [strVarIsString, ConT ''Eq `AppT` VarT strVar, varIsStr errVar] $
+            ArrowT `AppT` VarT strVar `AppT`
+            (ConT ''Either `AppT` VarT errVar `AppT` ConT ''CodeGenSelection)
+          , FunD
+                readN
+                (readClauses ++
+                 [ Clause
+                       [WildP]
+                       (NormalB $ ConE 'Left `AppE` LitE (StringL errMgs))
+                       []
+                 ])
+          ])
 
 (-<.>) :: Text -> Text -> Text
 p1 -<.> p2 = toS $ toS p1 FP.-<.> toS p2
 takeDirectory :: Text -> Text
 takeDirectory = withS FP.takeDirectory
-
-genTypes :: [Char] -> CodeGen
-genTypes "json-object" = JSONGen.generate
-genTypes "simple-java-class" = JavaGen.generate
-genTypes t = panic $ "Unsupported code gen type " <> toS t
 
 runCompM :: LogLevel -> CompM () -> IO ()
 runCompM targetLevel c =
@@ -118,7 +161,8 @@ main = do
                             "' from '" <>
                             inputModFile <>
                             "' to '" <>
-                            outPath <> "'"
+                            outPath <>
+                            "'"
             Build BuildOpts {outputFormat} -> do
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
@@ -150,9 +194,10 @@ main = do
                         (toS $ takeDirectory outputPath)
                 liftIO $ L.writeFile (toS outputPath) code
                 logInfoN $
-                    "Compiled '" <> unwrap entrypoint <> "' from '" <> inputModFile <>
+                    "Compiled '" <> unwrap entrypoint <> "' from '" <>
+                    inputModFile <>
                     "' to " <>
-                    show outputFormat
+                    showCodeGen outputFormat
                 logInfoN $ "Code written to '" <> outputPath <> "'"
   where
     odef =
@@ -172,16 +217,16 @@ main = do
     buildOpts =
         BuildOpts <$>
         O.option
-            auto
-            (value GenJsonObject <>
+            (eitherReader readCodeGen)
+            (value JsonGraph <>
              help
                  ("Format to emit the generated code in. Accepted choices: " <>
                   intercalate
                       ", "
-                      (map show [(minBound :: CodeGenSelection) ..])) <>
-             long "format" <>
-             short 'f' <>
-             showDefault)
+                      (map showCodeGen [(minBound :: CodeGenSelection) ..]) <>
+                  " (default: json-graph)") <>
+             long "code-gen" <>
+             short 'g')
     optsParser =
         CmdOpts <$>
         hsubparser

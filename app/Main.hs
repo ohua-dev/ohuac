@@ -11,7 +11,7 @@ import Data.List (lookup)
 import Lens.Micro
 import Lens.Micro.Internal (Index, IxValue, Ixed)
 import Options.Applicative as O
-import System.FilePath ((-<.>), takeDirectory)
+import qualified System.FilePath as FP ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
 import qualified System.Exit.Codes as EX
 
@@ -32,9 +32,9 @@ newtype DumpOpts = DumpOpts
 
 data CmdOpts = CmdOpts
     { command_ :: Command
-    , inputModuleFile :: FilePath
+    , inputModuleFile :: Text
     , entrypoint :: Binding
-    , outputPath :: Maybe FilePath
+    , outputPath :: Maybe Text
     , logLevel :: LogLevel
     }
 
@@ -55,6 +55,10 @@ data Command
   = Build BuildOpts
   | DumpType DumpOpts
 
+(-<.>) :: Text -> Text -> Text
+p1 -<.> p2 = toS $ toS p1 FP.-<.> toS p2
+takeDirectory :: Text -> Text
+takeDirectory = withS FP.takeDirectory
 
 genTypes :: [Char] -> CodeGen
 genTypes "json-object" = JSONGen.generate
@@ -100,14 +104,21 @@ main = do
                         throwError "No annotations present for the module"
                     Just m -> do
                         FunAnn args ret <- getMain m
+                        let outPath =
+                                fromMaybe (inputModFile -<.> "type-dump") out
                         liftIO $
-                            L.writeFile
-                                (fromMaybe (inputModFile -<.> "type-dump") out) $
+                            L.writeFile (toS outPath) $
                             encode $
                             object
                                 [ "arguments" A..= map format args
                                 , "return" A..= format ret
                                 ]
+                        logInfoN $
+                            "Wrote a type dump of '" <> unwrap entrypoint <>
+                            "' from '" <>
+                            inputModFile <>
+                            "' to '" <>
+                            outPath <> "'"
             Build BuildOpts {outputFormat} -> do
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
@@ -134,8 +145,15 @@ main = do
                             }
                 let outputPath = fromMaybe (toS nameSuggest) out
                 liftIO $
-                    createDirectoryIfMissing True (takeDirectory outputPath)
-                liftIO $ L.writeFile outputPath code
+                    createDirectoryIfMissing
+                        True
+                        (toS $ takeDirectory outputPath)
+                liftIO $ L.writeFile (toS outputPath) code
+                logInfoN $
+                    "Compiled '" <> unwrap entrypoint <> "' from '" <> inputModFile <>
+                    "' to " <>
+                    show outputFormat
+                logInfoN $ "Code written to '" <> outputPath <> "'"
   where
     odef =
         info

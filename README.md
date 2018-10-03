@@ -3,6 +3,10 @@
 [![Build Status](https://travis-ci.org/ohua-dev/ohuac.svg?branch=master)](https://travis-ci.org/ohua-dev/ohuac)
 [![Latest Release](https://img.shields.io/github/release/ohua-dev/ohuac.svg)](https://github.com/ohua-dev/ohuac/releases/latest)
 
+For the complete documentation of the `ohuac` compiler see the [standalone
+compiler section of the ohua
+documentation](https://ohua.readthedocs.org/en/latest/ohuac.html)
+
 ## Usage
 
 For a complete list of the options available use the `--help` flag.
@@ -42,5 +46,5 @@ Required tools:
 
 ## Examples
 
-The [test-resources](test-resources) directory contains examples namespaces
-using both the ohua S-Expression syntax (ohuas) and C/Rust-like syntax (ohuac).
+The [test-resources](test-resources) directory contains example namespaces
+using both the ohua S-Expression syntax (`ohuas`) and C/Rust-like syntax (`ohuac`).

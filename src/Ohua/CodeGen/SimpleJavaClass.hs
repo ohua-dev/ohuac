@@ -222,7 +222,7 @@ configuredClassDecl mainClassName invokeMethodTypes =
     prepareMethodDecl :: MemberDecl
     prepareMethodDecl =
         MethodDecl
-            [Final]
+            [Final, Public]
             []
             (Just $ RefType $ ClassRefType preparedClassType)
             prepareMethodI
@@ -449,7 +449,7 @@ generate CodeGenData {..} =
                     , ExpName $ Name [configVarIdent]
                     ]
         invokeFunctionDecl =
-            MethodDecl [Public] [] returnType (Ident "invoke") [] [] Nothing $
+            MethodDecl [Public, Final] [] returnType (Ident "invoke") [] [] Nothing $
             MethodBody $ Just invokeFunctionCode
         invokeFunctionCode =
             Block $
@@ -532,7 +532,7 @@ generate CodeGenData {..} =
                 (ConstructorBody Nothing [])
         configureFunctionDecl =
             MethodDecl
-                [Static, Final]
+                [Static, Final, Public]
                 []
                 (Just $
                  RefType $ ClassRefType $ ClassType [(configuredClassI, [])])

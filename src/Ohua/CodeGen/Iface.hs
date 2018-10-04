@@ -1,11 +1,9 @@
 module Ohua.CodeGen.Iface where
 
-import Protolude
+import Ohua.Prelude
 
 import qualified Data.Set as Set
 
-import Ohua.Monad
-import Ohua.Types
 import Ohua.Standalone -- Used for TyAnnMap, that alias should be moved so I can
                        -- remove that dependency here
 import Ohua.DFGraph

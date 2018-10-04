@@ -1,15 +1,14 @@
 {-# LANGUAGE CPP #-}
 module Ohua.Standalone where
 
-import Protolude
+import Ohua.Prelude
 
 import Control.Concurrent.Async.Lifted
-import Control.Monad.RWS
+import Control.Monad.RWS (tell, evalRWS)
 import qualified Data.ByteString.Lazy.Char8 as L
 import Data.Functor.Foldable hiding (fold)
 import Data.Generics.Uniplate.Direct
 import qualified Data.HashMap.Strict as HM
-import Data.IORef
 import Data.List (partition)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
@@ -17,15 +16,12 @@ import qualified Data.Text as T
 import Lens.Micro.Platform
 import System.Directory
 import System.FilePath as Path ((<.>), takeExtension)
-import Ohua.LensClasses (annotation, value)
 
 import Ohua.ALang.Lang
 import Ohua.ALang.NS as NS
 import Ohua.Unit
 import Ohua.ALang.PPrint
-import Ohua.Monad
 import Ohua.Serialize.JSON ()
-import Ohua.Types
 
 #ifdef WITH_SEXPR_PARSER
 import qualified Ohua.Compat.SExpr.Lexer         as SLex
@@ -71,7 +67,7 @@ getParser :: Text -> L.ByteString -> (Maybe TyAnnMap, RawNamespace)
 getParser ext
     | Just a <- find ((== ext) . view _1) definedLangs = a ^. _3
     | otherwise =
-        panic $ "No parser defined for files with extension '" <> ext <> "'"
+        error $ "No parser defined for files with extension '" <> ext <> "'"
 
 
 type IFaceDefs = Map QualifiedBinding Expression
@@ -168,21 +164,21 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
             , shortname <- referList
             ]
     reportCollidingRef a b =
-        panic $
+        error $
         "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <>
         show modname
 
-withS :: (StringConv a b, StringConv b c) => (b -> b) -> a -> c
-withS f = toS . f . toS
-
 readAndParse :: (MonadLogger m, MonadIO m) => Text -> m (Maybe TyAnnMap, RawNamespace)
 readAndParse filename = do
-  (anns, ns) <- getParser (withS takeExtension filename) <$> liftIO (L.readFile $ toS filename)
-  logDebugN $ "Raw parse result for " <> filename
-  logDebugN $ quickRender ns
-  logDebugN "With annotations:"
-  logDebugN $ show anns
-  pure (anns, ns)
+    (anns, ns) <-
+        let strFname = toString filename
+         in getParser (toText $ takeExtension strFname) <$>
+            liftIO (L.readFile strFname)
+    logDebugN $ "Raw parse result for " <> filename
+    logDebugN $ quickRender ns
+    logDebugN "With annotations:"
+    logDebugN $ show anns
+    pure (anns, ns)
 
 
 gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
@@ -197,13 +193,18 @@ gatherDeps tracker ns = do
 
 findSourceFile :: NSRef -> CompM Text
 findSourceFile modname = do
-    candidates <- filterM (liftIO . doesFileExist) $ map ((asFile Path.<.>) . toS) extensions
+    candidates <-
+        filterM (liftIO . doesFileExist) $
+        map ((asFile Path.<.>) . toString) extensions
     case candidates of
         [] -> throwError $ "No file found for module " <> show modname
-        [f] -> pure $ toS f
-        files -> throwError $ "Found multiple files matching " <> show modname <> ": " <> show files
+        [f] -> pure $ toText f
+        files ->
+            throwError $
+            "Found multiple files matching " <> show modname <> ": " <>
+            show files
   where
-    asFile = toS $ T.intercalate "/" $ map unwrap $ unwrap modname
+    asFile = toString $ T.intercalate "/" $ map unwrap $ unwrap modname
     extensions = map (^. _1) definedLangs
 
 deriving instance Show RawNamespace
@@ -258,7 +259,7 @@ topSortWith getIdent getDeps mods' = concat @[] $ ana (uncurry go) (mempty, mods
       | null newSat =
         if null newAvail
         then Nil
-        else panic "Unsortable! (Probably due to a cycle)"
+        else error "Unsortable! (Probably due to a cycle)"
       | otherwise = Cons newSat $ (Set.union (Set.fromList (map getIdent newSat)) satisfied, newAvail)
       where
         (newSat, newAvail) = partition (all (`Set.member` satisfied) . getDeps) avail

@@ -45,7 +45,6 @@ default-extensions:
 - NoImplicitPrelude
 - StandaloneDeriving
 dependencies:
-- protolude
 - base
 - microlens
 - microlens-platform
@@ -54,7 +53,6 @@ dependencies:
 - aeson
 - filepath
 - directory
-- data-default-class
 library:
   source-dirs: src
   dependencies:

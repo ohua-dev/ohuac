@@ -1,11 +1,10 @@
 module Ohua.DFGraph.File where
 
-import Protolude
+import Ohua.Prelude
 
 import qualified Data.Set as Set
 
 import Ohua.DFGraph
-import Ohua.Types
 
 data GraphFile = GraphFile
     { graph :: OutGraph

@@ -1,8 +1,7 @@
 {-# LANGUAGE NoOverloadedLists #-}
 module Ohua.CodeGen.SimpleJavaClass (generate) where
 
-import Protolude
-import Prelude (String)
+import Ohua.Prelude
 
 import Text.Casing
 import qualified Data.Text as T
@@ -11,9 +10,9 @@ import Data.List (nub)
 import Data.Version
 import Language.Java.Syntax as Java
 import Language.Java.Pretty (prettyPrint)
+import qualified Data.ByteString.Lazy.Char8 as LB
 
 import Ohua.DFGraph
-import Ohua.Types
 import Ohua.ALang.NS
 import Ohua.CodeGen.Iface
 
@@ -25,12 +24,12 @@ tupleConstructor = TyRef $ Qual $ QualifiedBinding (unsafeMake []) "(,)"
 
 
 generationInfoString :: LByteString
-generationInfoString = "Generated with ohuac, version " <> toS (showVersion version)
+generationInfoString = "Generated with ohuac, version " <> LB.pack (showVersion version)
 
 
 stringifyQual :: QualifiedBinding -> String
 stringifyQual QualifiedBinding {..} =
-    toS $
+    toString $
     T.intercalate "." (map unwrap $ unwrap qbNamespace) <> "/" <> unwrap qbName
 
 -- | Caveat: This function does not support all java types yet. Notably the
@@ -44,10 +43,10 @@ tyExprToJava = RefType . go []
         case sb of
             Unqual b -> mkLast b
             Qual (QualifiedBinding ns bnd) ->
-                map ((, []) . Ident . toS . unwrap) (unwrap ns) ++
+                map ((, []) . Ident . toString . unwrap) (unwrap ns) ++
                 mkLast bnd
       where
-        mkLast b = [(Ident $ toS $ unwrap b, map ActualType l)]
+        mkLast b = [(Ident $ toString $ unwrap b, map ActualType l)]
     go l = \case
       TyRef ref -> formatRef ref l
       TyApp t1 t2 -> go (go [] t2 : l) t1
@@ -278,12 +277,12 @@ configuredClassConstructorDecl =
 generate :: CodeGen
 generate CodeGenData {..} =
     pure
-        ( T.intercalate "/" (map toS $ nsList ++ [classNameStr]) <> ".java"
-        , toS (prettyPrint classCode) <> "\n//" <> generationInfoString <> "\n")
+        ( T.intercalate "/" (map toText $ nsList ++ [classNameStr]) <> ".java"
+        , LB.pack (prettyPrint classCode) <> "\n//" <> generationInfoString <> "\n")
     -- Values computed from CodeGenData
   where
-    nsList = map (toSnake . fromAny . toS . unwrap) $ unwrap entryPointNamespace
-    classNameStr = toPascal $ fromAny $ toS $ unwrap entryPointName
+    nsList = map (toSnake . fromAny . toString . unwrap) $ unwrap entryPointNamespace
+    classNameStr = toPascal $ fromAny $ toString $ unwrap entryPointName
     className = Ident classNameStr
     retId = succ $ maximum $ map operatorId $ operators graph
     enumerateArgs = map unsafeMake [0 .. entryPointArity - 1]
@@ -632,8 +631,8 @@ mkUsedStatefulFunctionsArray operators =
     InstanceCreation
         []
         (TypeDeclSpecifier sfRefHelperClass)
-        [ Lit $ String $ intercalate "." $ map (toS . unwrap) $ unwrap namespace
-        , Lit $ String $ toS $ unwrap name_
+        [ Lit $ String $ intercalate "." $ map (toString . unwrap) $ unwrap namespace
+        , Lit $ String $ toString $ unwrap name_
         ]
         Nothing
     | QualifiedBinding namespace name_ <- nub $ map operatorType operators

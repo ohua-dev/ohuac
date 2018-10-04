@@ -1,16 +1,13 @@
 {-# LANGUAGE TemplateHaskell #-}
 module Main where
 
-import Protolude
+import Ohua.Prelude
 
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Char as C
-import Data.Default.Class
-import Data.IORef
 import Data.List (lookup, intercalate)
-import Lens.Micro
-import Lens.Micro.Internal (Index, IxValue, Ixed)
+import Lens.Micro.Internal (Index, IxValue, Ixed, ix)
 import Options.Applicative as O
 import qualified System.FilePath as FP ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
@@ -19,14 +16,11 @@ import Language.Haskell.TH
 
 import Ohua.ALang.NS
 import Ohua.Compile
-import Ohua.Monad
 import Ohua.Standalone
-import Ohua.Types
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.CodeGen.Iface
 import Ohua.Unit
-import Ohua.Util (mapLeft)
 
 newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
@@ -104,9 +98,7 @@ $(let codeGenStrings =
           ])
 
 (-<.>) :: Text -> Text -> Text
-p1 -<.> p2 = toS $ toS p1 FP.-<.> toS p2
-takeDirectory :: Text -> Text
-takeDirectory = withS FP.takeDirectory
+p1 -<.> p2 = toText $ toString p1 FP.-<.> toString p2
 
 runCompM :: LogLevel -> CompM () -> IO ()
 runCompM targetLevel c =
@@ -115,7 +107,7 @@ runCompM targetLevel c =
     runExceptT c >>= either exitError pure
   where
     exitError message = do
-        logErrorN $ toS message
+        logErrorN message
         liftIO $ exitWith EX.codeSoftware
 
 main :: IO ()
@@ -127,7 +119,7 @@ main = do
                  } <- execParser odef
     runCompM logLevel $ do
         modTracker <- liftIO $ newIORef mempty
-        (mainAnns, rawMainMod) <- readAndParse $ toS inputModFile
+        (mainAnns, rawMainMod) <- readAndParse inputModFile
         let getMain ::
                    (Ixed m, Index m ~ Binding, MonadError Error mo)
                 => m
@@ -150,7 +142,7 @@ main = do
                         let outPath =
                                 fromMaybe (inputModFile -<.> "type-dump") out
                         liftIO $
-                            L.writeFile (toS outPath) $
+                            L.writeFile (toString outPath) $
                             encode $
                             object
                                 [ "arguments" A..= map format args
@@ -187,12 +179,12 @@ main = do
                             , entryPointName = entrypoint
                             , entryPointNamespace = rawMainMod ^. name
                             }
-                let outputPath = fromMaybe (toS nameSuggest) out
+                let outputPath = fromMaybe (nameSuggest) out
                 liftIO $
                     createDirectoryIfMissing
                         True
-                        (toS $ takeDirectory outputPath)
-                liftIO $ L.writeFile (toS outputPath) code
+                        (FP.takeDirectory $ toString outputPath)
+                liftIO $ L.writeFile (toString outputPath) code
                 logInfoN $
                     "Compiled '" <> unwrap entrypoint <> "' from '" <>
                     inputModFile <>
@@ -208,17 +200,17 @@ main = do
                  ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: " <>
                   intercalate
                       ", "
-                      (map (\a -> toS $ "'" <> a ^. _1 <> "'") definedLangs)))
+                      (map (\a -> toString $ "'" <> a ^. _1 <> "'") definedLangs)))
     dumpOpts =
         DumpOpts <$>
         argument
-            (maybeReader $ flip lookup langs . toS . map C.toLower)
+            (maybeReader $ flip lookup langs . toText . map C.toLower)
             (metavar "LANG" <> help "Language format for the types")
     buildOpts =
         BuildOpts <$>
         O.option
             (eitherReader readCodeGen)
-            (value JsonGraph <>
+            (O.value JsonGraph <>
              help
                  ("Format to emit the generated code in. Accepted choices: " <>
                   intercalate
@@ -240,9 +232,9 @@ main = do
                       (progDesc "Dump the type of the main function"))) <*>
         argument str (metavar "SOURCE" <> help "Source file to compile") <*>
         argument
-            (eitherReader $ mapLeft toS . make . toS)
+            (eitherReader $ mapLeft toString . make . toText)
             (metavar "MAIN" <> help "Algorithm that serves as entry point" <>
-             value "main") <*>
+             O.value "main") <*>
         optional
             (strOption $
              long "output" <> metavar "PATH" <> short 'o' <>

@@ -1,14 +1,13 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Ohua.CodeGen.JSONObject where
 
-import Protolude
+import Ohua.Prelude
 
 import Data.Aeson
 
 import Ohua.DFGraph.File
 import Ohua.Serialize.JSON ()
 import Ohua.CodeGen.Iface
-import Ohua.Types
 
 instance ToJSON GraphFile where
     toEncoding = genericToEncoding defaultOptions

@@ -31,6 +31,9 @@ import qualified Ohua.Compat.SExpr.Parser        as SParse
 import qualified Ohua.Compat.Clike.Parser        as CParse
 import qualified Ohua.Compat.Clike.Types         as CTy
 #endif
+#ifdef WITH_ML_PARSER
+import qualified Ohua.Compat.ML.Parser as MLParse
+#endif
 
 type LParser = L.ByteString -> (Maybe TyAnnMap, RawNamespace)
 
@@ -58,6 +61,12 @@ definedLangs =
                       (HM.toList $ ns ^. decls)
           remMutAnn = decls . each . annotation %~ fmap (view value)
        in reNS . remMutAnn . CParse.parseNS) :
+#endif
+#ifdef WITH_ML_PARSER
+    ( ".ohuaml"
+    , "ML-style frontend for ALang"
+    , (Nothing, ) . MLParse.parseMod
+    ) :
 #endif
     []
 
@@ -93,7 +102,7 @@ resolveNS ::
     => IFaceDefs
     -> RawNamespace
     -> m ResolvedNamespace
-resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = do
+resolveNS ifacem ns = do
     resDecls <-
         flip runReaderT (mempty, ifacem) $
         go0
@@ -102,13 +111,13 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
                       Unqual bnd
                           | bnd `Set.member` locallyDefinedAlgos -> Just bnd
                       _ -> Nothing) $
-             HM.toList declarations)
+             HM.toList (ns ^. decls))
     pure $ ns & decls .~ HM.fromList resDecls
   where
     go0 [] = pure []
     go0 ((varName, expr):xs) = do
         done <- go expr
-        local (second $ Map.insert (QualifiedBinding modname varName) done) $
+        local (second $ Map.insert (QualifiedBinding (ns ^. name) varName) done) $
             ((varName, done) :) <$> (go0 xs)
     go :: Expr SomeBinding -> ReaderT (Set.Set Binding, IFaceDefs) m Expression
     go (Let assignment val body) =
@@ -150,11 +159,11 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
     go (Apply expr expr2) = Apply <$> go expr <*> go expr2
     go (Lambda assignment body) =
         registerAssign assignment $ Lambda assignment <$> go body
-    sfImports1 = stdNamespace : sfImports0
+    sfImports1 = stdNamespace : ns ^. sfImports
     registerAssign = local . first . Set.union . Set.fromList . extractBindings
-    locallyDefinedAlgos = Set.fromList $ HM.keys declarations
+    locallyDefinedAlgos = Set.fromList $ HM.keys (ns ^. decls)
     importedSfNamespaces = Set.fromList $ map fst sfImports1
-    algoRefers = mkReferMap $ (modname, HM.keys declarations) : algoImports0
+    algoRefers = mkReferMap $ (ns ^. name, HM.keys (ns ^. decls)) : ns ^. algoImports
     sfRefers = mkReferMap sfImports1
     mkReferMap importList =
         Map.fromListWith
@@ -166,7 +175,7 @@ resolveNS ifacem ns@(Namespace modname algoImports0 sfImports0 declarations) = d
     reportCollidingRef a b =
         error $
         "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <>
-        show modname
+        show (ns ^. name)
 
 readAndParse :: (MonadLogger m, MonadIO m) => Text -> m (Maybe TyAnnMap, RawNamespace)
 readAndParse filename = do
@@ -207,7 +216,6 @@ findSourceFile modname = do
     asFile = toString $ T.intercalate "/" $ map unwrap $ unwrap modname
     extensions = map (^. _1) definedLangs
 
-deriving instance Show RawNamespace
 
 loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
 loadModule tracker modname = do

@@ -1,0 +1,17 @@
+module ohua.std
+
+%feature tail-recursion
+
+import sf ohua.std (isEmpty, uncons, append)
+
+let undefined = ();;
+
+let zipWith f c1 c2 = undefined;;
+
+
+let reduce f init coll =
+    if isEmpty coll
+    then init
+    else
+      let (x, xs) = uncons coll
+      in reduce f (append (f x) init) xs;;

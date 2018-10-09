@@ -54,7 +54,7 @@ dependencies:
 - filepath
 - directory
 library:
-  source-dirs: src
+  source-dirs: src/hs
   dependencies:
   - async
   - mtl
@@ -77,6 +77,11 @@ library:
       - alang-sexpr-parser
       cpp-options:
       - -DWITH_SEXPR_PARSER=1
+    - condition: flag(with-ml-parser)
+      dependencies:
+      - alang-ml-parser
+      cpp-options:
+      - -DWITH_ML_PARSER=1
 executables:
   ohuac:
     main: Main.hs
@@ -101,8 +106,11 @@ flags:
     default: true
     manual: false
   with-clike-parser:
-    default: false
-    manual: true
+    default: true
+    manual: false
+  with-ml-parser:
+    default: true
+    manual: false
 tests:
   ohua-standalone-test:
     main: Spec.hs

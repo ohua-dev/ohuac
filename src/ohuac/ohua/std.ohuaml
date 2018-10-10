@@ -1,17 +1,47 @@
 module ohua.std
 
-%feature tail-recursion
 
-import sf ohua.std (isEmpty, uncons, append)
+let fold isEmpty uncons f init coll =
+    let go acc c =
+        if isEmpty c
+        then acc
+        else
+          let (e, cs) = uncons c in
+          go (f e acc) cs in
+    go init coll;;
 
-let undefined = ();;
 
-let zipWith f c1 c2 = undefined;;
+let zip isEmpty uncons append empty coll0 coll1 =
+    let go c0 c1 acc =
+        if isEmpty c0
+        then acc
+        else if isEmpty c1
+        then acc
+        else
+          let (e0, cs0) = uncons c0 in
+          let (e1, cs1) = uncons c1 in
+          go cs0 cs1 (append (e0, e1) acc) in
+    go coll0 coll1 empty;;
 
+let unzip isEmpty append empty uncons coll =
+    let fold0 = fold isEmpty uncons in
+    let f (as, bs) (a, b) = (append a as, append b bs) in
+    fold0 f empty coll;;
 
-let reduce f init coll =
-    if isEmpty coll
-    then init
-    else
-      let (x, xs) = uncons coll
-      in reduce f (append (f x) init) xs;;
+let map isEmpty uncons append empty coll =
+    let fold0 = fold isEmpty uncons in
+    let f acc elem = append (f elem) acc in
+    fold0 f empty coll;;
+
+let filter isEmpty uncons append empty predicate coll =
+    let fold0 = fold isEmpty uncons in
+    let f acc elem =
+        if predicate elem
+        then append elem acc
+        else acc in
+    fold0 f empty coll;;
+
+let scan isEmpty uncons append f empty coll =
+    let fold0 = fold isEmpty uncons in
+    let f0 acc elem = append (f elem) acc in
+    fold0 f0 empty coll;;

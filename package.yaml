@@ -3,18 +3,11 @@ version: '0.2.0'
 category: Devel
 author: Sebastian Ertel, Justus Adam
 maintainer: dev@justus.science
-copyright: © 2017 Sebastian Ertel, Justus Adam
+copyright: © 2017, 2018 Sebastian Ertel, Justus Adam
 license: OtherLicense
-github: ohua-dev/ohua-standalone
+github: ohua-dev/ohuac
 extra-source-files:
 - README.md
-# library:
-#   source-dirs: src
-#   exposed-modules:
-#   - Lib
-#   dependencies:
-#   - base >=4.7 && <5
-#   - ohua-core
 default-extensions:
 - OverloadedStrings
 - OverloadedLists

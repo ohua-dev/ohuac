@@ -53,6 +53,7 @@ dependencies:
 - aeson
 - filepath
 - directory
+- template-haskell
 library:
   source-dirs: src/hs
   dependencies:
@@ -82,6 +83,9 @@ library:
       - alang-ml-parser
       cpp-options:
       - -DWITH_ML_PARSER=1
+    - condition: flag(with-stdlib)
+      cpp-options:
+      - -DWITH_STDLIB=1
 executables:
   ohuac:
     main: Main.hs
@@ -90,7 +94,6 @@ executables:
     - ohuac
     - optparse-applicative
     - exit-codes
-    - template-haskell
     ghc-options:
     - -threaded
     - -rtsopts
@@ -111,6 +114,12 @@ flags:
   with-ml-parser:
     default: true
     manual: false
+  with-stdlib:
+    default: true
+    manual: false
+    description:
+      Compile and embed the standard library (needs `with-ml-parser` to be
+      enabled)
 tests:
   ohua-standalone-test:
     main: Spec.hs

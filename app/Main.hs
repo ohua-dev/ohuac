@@ -19,14 +19,16 @@ import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.Compile
 import Ohua.Standalone
+import Ohua.Stdlib (stdlib)
 import Ohua.Unit
 
 newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
     }
 
-newtype BuildOpts = BuildOpts
+data BuildOpts = BuildOpts
     { outputFormat :: CodeGenSelection
+    , useStdlib :: Bool
     }
 
 data Command
@@ -117,7 +119,7 @@ main = do
                  , logLevel
                  } <- execParser odef
     runCompM logLevel $ do
-        modTracker <- liftIO $ newIORef mempty
+        modTracker <- newIORef mempty
         (mainAnns, rawMainMod) <- readAndParse inputModFile
         let getMain ::
                    (Ixed m, Index m ~ Binding, MonadError Error mo)
@@ -154,7 +156,8 @@ main = do
                             "' to '" <>
                             outPath <>
                             "'"
-            Build BuildOpts {outputFormat} -> do
+            Build BuildOpts {outputFormat, useStdlib} -> do
+                when useStdlib $ void $ insertDirectly modTracker stdlib
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
                     loadDepsAndResolve modTracker rawMainMod
@@ -217,7 +220,11 @@ main = do
                       (map showCodeGen [(minBound :: CodeGenSelection) ..]) <>
                   " (default: json-graph)") <>
              long "code-gen" <>
-             short 'g')
+             short 'g') <*>
+        O.switch
+            (long "with-stdlib" <>
+             help
+                 "Link the `ohua.std` namespace of higher order functions into the program. (experimental)")
     optsParser =
         CmdOpts <$>
         hsubparser

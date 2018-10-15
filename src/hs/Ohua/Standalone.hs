@@ -233,6 +233,12 @@ registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
 registerAndLoad tracker reference = registerAnd tracker reference (loadModule tracker reference)
 
 
+insertDirectly :: MonadIO m => ModTracker -> ResolvedNamespace -> m (MVar ResolvedNamespace)
+insertDirectly tracker ns = do
+  nsRef <- newMVar ns
+  modifyIORef' tracker $ HM.insert (ns ^. name) nsRef
+  pure nsRef
+
 registerAnd :: (Eq ref, Hashable ref) => IORef (HashMap ref (MVar load)) -> ref -> CompM load -> CompM load
 registerAnd tracker reference ac = do
     newModRef <- liftIO newEmptyMVar

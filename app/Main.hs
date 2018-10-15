@@ -6,6 +6,7 @@ import Ohua.Prelude
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
+import qualified Data.HashSet as HS (fromList, member)
 import Data.List (intercalate, lookup)
 import Language.Haskell.TH
 import Lens.Micro.Internal (Index, IxValue, Ixed, ix)
@@ -29,6 +30,7 @@ newtype DumpOpts = DumpOpts
 data BuildOpts = BuildOpts
     { outputFormat :: CodeGenSelection
     , useStdlib :: Bool
+    , stageHandlingOpt :: StageHandling
     }
 
 data Command
@@ -156,7 +158,7 @@ main = do
                             "' to '" <>
                             outPath <>
                             "'"
-            Build BuildOpts {outputFormat, useStdlib} -> do
+            Build BuildOpts {outputFormat, useStdlib, stageHandlingOpt} -> do
                 when useStdlib $ void $ insertDirectly modTracker stdlib
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
@@ -166,7 +168,7 @@ main = do
                 let (mainArity, completeExpr) = mainToEnv expr
                 gr <-
                     compile
-                        def
+                        (def & stageHandling .~ stageHandlingOpt)
                         (def {passAfterDFLowering = cleanUnits})
                         completeExpr
                 (nameSuggest, code) <-
@@ -224,15 +226,33 @@ main = do
         O.switch
             (long "with-stdlib" <>
              help
-                 "Link the `ohua.std` namespace of higher order functions into the program. (experimental)")
+                 "Link the `ohua.std` namespace of higher order functions into the program. (experimental)") <*>
+        ((\stopOn dumpStages sname ->
+              ( if sname `HS.member` HS.fromList dumpStages
+                    then DumpPretty
+                    else Don'tDump
+              , stopOn == sname)) <$>
+         O.strOption
+             (long "stop-on" <> help "Stop execution after this stage." <>
+              metavar "STAGE") <*>
+         many
+             (O.strOption
+                  (long "dump-stage" <>
+                   help
+                       "Dump the code at this stage. (can be supplied multiple times)" <>
+                   metavar "STAGE")))
     optsParser =
         CmdOpts <$>
         hsubparser
             (command
                  "build"
-                 (info (Build <$> buildOpts) (progDesc "Build the ohua graph")) <>
+                 (info
+                      (Build <$> buildOpts)
+                      (progDesc $
+                       "Build the ohua graph. " <>
+                       "The options --dump-stage and --stop-on pertain to stages. See https://ohua.rtfd.io/en/latest/debugging.html#stages")) <>
              command
-                 "dump-main-type"
+                 "dump-ma in-type"
                  (info
                       (DumpType <$> dumpOpts)
                       (progDesc "Dump the type of the main function"))) <*>

@@ -28,9 +28,9 @@ let unzip isEmpty append empty uncons coll =
     let f (as, bs) (a, b) = (append a as, append b bs) in
     fold0 f empty coll;;
 
-let map isEmpty uncons append empty coll =
+let map isEmpty uncons append empty f coll =
     let fold0 = fold isEmpty uncons in
-    let f acc elem = append (f elem) acc in
+    let f0 acc elem = append (f elem) acc in
     fold0 f empty coll;;
 
 let filter isEmpty uncons append empty predicate coll =

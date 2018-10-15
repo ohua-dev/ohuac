@@ -5,7 +5,7 @@ import Ohua.Prelude
 
 import GHC.TypeLits as TL
 import qualified Data.ByteString.Lazy as LB (readFile)
-import qualified Language.Haskell.TH.Syntax as TH (lift)
+import qualified Language.Haskell.TH.Syntax as TH (lift, addDependentFile)
 
 import Ohua.ALang.Lang
 import Ohua.ALang.NS
@@ -21,7 +21,9 @@ import Ohua.Compat.ML.Parser (parseMod)
 stdlib :: Namespace Expression
 stdlib =
     $(let ifacem = mempty -- TODO check this is correct
-       in liftIO (LB.readFile "src/ohuac/ohua/std.ohuaml") >>=
+          stdlibFileName = "src/ohuac/ohua/std.ohuaml"
+       in TH.addDependentFile stdlibFileName >>
+          liftIO (LB.readFile stdlibFileName) >>=
           either (fail . toString) pure . resolveNS ifacem . parseMod >>=
           TH.lift)
 #else

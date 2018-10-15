@@ -11,7 +11,6 @@ import Lens.Micro.Internal (Index, IxValue, Ixed, ix)
 import Options.Applicative as O
 import qualified System.FilePath as FP ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
-import qualified System.Exit.Codes as EX
 import Language.Haskell.TH
 
 import Ohua.ALang.NS
@@ -108,7 +107,7 @@ runCompM targetLevel c =
   where
     exitError message = do
         logErrorN message
-        liftIO $ exitWith EX.codeSoftware
+        exitFailure
 
 main :: IO ()
 main = do

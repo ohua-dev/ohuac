@@ -86,7 +86,6 @@ executables:
     dependencies:
     - ohuac
     - optparse-applicative
-    - exit-codes
     ghc-options:
     - -threaded
     - -rtsopts

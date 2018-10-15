@@ -10,8 +10,7 @@ import Data.Functor.Foldable hiding (fold)
 import Data.Generics.Uniplate.Direct
 import qualified Data.HashMap.Strict as HM
 import Data.List (partition)
-import qualified Data.Map as Map
-import qualified Data.Set as Set
+import qualified Data.HashSet as Set
 import qualified Data.Text as T
 import Lens.Micro.Platform
 import System.Directory
@@ -79,8 +78,8 @@ getParser ext
         error $ "No parser defined for files with extension '" <> ext <> "'"
 
 
-type IFaceDefs = Map QualifiedBinding Expression
-type ModMap = Map NSRef (MVar ResolvedNamespace)
+type IFaceDefs = HashMap QualifiedBinding Expression
+type ModMap = HashMap NSRef (MVar ResolvedNamespace)
 type ModTracker = IORef ModMap
 type RawNamespace = Namespace (Expr SomeBinding)
 type ResolvedNamespace = Namespace Expression
@@ -117,9 +116,9 @@ resolveNS ifacem ns = do
     go0 [] = pure []
     go0 ((varName, expr):xs) = do
         done <- go expr
-        local (second $ Map.insert (QualifiedBinding (ns ^. name) varName) done) $
+        local (second $ HM.insert (QualifiedBinding (ns ^. name) varName) done) $
             ((varName, done) :) <$> (go0 xs)
-    go :: Expr SomeBinding -> ReaderT (Set.Set Binding, IFaceDefs) m Expression
+    go :: Expr SomeBinding -> ReaderT (Set.HashSet Binding, IFaceDefs) m Expression
     go (Let assignment val body) =
         registerAssign assignment $ Let assignment <$> go val <*> go body
     go (Var (Unqual bnd))
@@ -128,7 +127,7 @@ resolveNS ifacem ns = do
             isLocal <- asks (Set.member bnd . fst)
             if isLocal
                 then pure $ Var $ Local bnd
-                else case (Map.lookup bnd algoRefers, Map.lookup bnd sfRefers) of
+                else case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
                          (Just algo, Just sf) ->
                              throwError $
                              "Ambiguous ocurrence of unqualified binding " <>
@@ -142,11 +141,11 @@ resolveNS ifacem ns = do
                                  (throwError $
                                   "Algo not loaded " <> show algoname)
                                  pure =<<
-                             asks (Map.lookup algoname . snd)
+                             asks (HM.lookup algoname . snd)
                          (_, Just sf) -> pure $ Var $ Sf sf Nothing
                          _ -> throwError $ "Binding not in scope " <> show bnd
     go (Var (Qual qb)) = do
-        algo <- asks (Map.lookup qb . snd)
+        algo <- asks (HM.lookup qb . snd)
         case algo of
             Just anAlgo -> pure anAlgo
             _
@@ -166,7 +165,7 @@ resolveNS ifacem ns = do
     algoRefers = mkReferMap $ (ns ^. name, HM.keys (ns ^. decls)) : ns ^. algoImports
     sfRefers = mkReferMap sfImports1
     mkReferMap importList =
-        Map.fromListWith
+        HM.fromListWith
             reportCollidingRef
             [ (shortname, QualifiedBinding sourceNS shortname)
             | (sourceNS, referList) <- importList
@@ -193,7 +192,7 @@ readAndParse filename = do
 gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
 gatherDeps tracker ns = do
     mods <- mapConcurrently (registerAndLoad tracker) (map fst $ ns ^. algoImports)
-    pure $ Map.fromList
+    pure $ HM.fromList
         [ (QualifiedBinding (depNamespace ^. NS.name) depName, algo)
         | depNamespace <- mods
         , (depName, algo) <- HM.toList $ depNamespace ^. decls
@@ -234,13 +233,13 @@ registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
 registerAndLoad tracker reference = registerAnd tracker reference (loadModule tracker reference)
 
 
-registerAnd :: (Eq ref, Ord ref) => IORef (Map ref (MVar load)) -> ref -> CompM load -> CompM load
+registerAnd :: (Eq ref, Hashable ref) => IORef (HashMap ref (MVar load)) -> ref -> CompM load -> CompM load
 registerAnd tracker reference ac = do
     newModRef <- liftIO newEmptyMVar
     actualRef <- liftIO $ atomicModifyIORef' tracker $ \trackerMap ->
         case trackerMap ^? ix reference of
             Just mvar -> (trackerMap, Left mvar)
-            Nothing   -> (Map.insert reference newModRef trackerMap, Right newModRef)
+            Nothing   -> (HM.insert reference newModRef trackerMap, Right newModRef)
     case actualRef of
         Left toWait -> liftIO $ readMVar toWait
         Right build -> do
@@ -249,7 +248,7 @@ registerAnd tracker reference ac = do
             pure compiled
 
 
-gatherSFDeps :: Expression -> Set.Set QualifiedBinding
+gatherSFDeps :: Expression -> Set.HashSet QualifiedBinding
 gatherSFDeps e = Set.fromList [ref | Var (Sf ref _) <- universe e]
 -- gatherSFDeps = cata $ \case
 --   VarF (Sf ref _) -> Set.singleton ref
@@ -260,7 +259,7 @@ topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
 topSortMods = topSortWith (^. name) (map fst . view algoImports)
 
 
-topSortWith :: (Ord b, Eq b) => (a -> b) -> (a -> [b]) -> [a] -> [a]
+topSortWith :: (Hashable b, Eq b) => (a -> b) -> (a -> [b]) -> [a] -> [a]
 topSortWith getIdent getDeps mods' = concat @[] $ ana (uncurry go) (mempty, mods')
   where
     go satisfied avail

@@ -4,21 +4,21 @@ module Main where
 import Ohua.Prelude
 
 import Data.Aeson as A
-import qualified Data.ByteString.Lazy.Char8 as L
-import qualified Data.Char as C
-import Data.List (lookup, intercalate)
+import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
+import qualified Data.Char as C (toLower)
+import Data.List (intercalate, lookup)
+import Language.Haskell.TH
 import Lens.Micro.Internal (Index, IxValue, Ixed, ix)
 import Options.Applicative as O
-import qualified System.FilePath as FP ((-<.>), takeDirectory)
 import System.Directory (createDirectoryIfMissing)
-import Language.Haskell.TH
+import qualified System.FilePath as FP ((-<.>), takeDirectory)
 
 import Ohua.ALang.NS
-import Ohua.Compile
-import Ohua.Standalone
+import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
-import Ohua.CodeGen.Iface
+import Ohua.Compile
+import Ohua.Standalone
 import Ohua.Unit
 
 newtype DumpOpts = DumpOpts

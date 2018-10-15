@@ -2,7 +2,7 @@ module Ohua.CodeGen.Iface where
 
 import Ohua.Prelude
 
-import qualified Data.Set as Set
+import qualified Data.HashSet as Set
 
 import Ohua.Standalone -- Used for TyAnnMap, that alias should be moved so I can
                        -- remove that dependency here
@@ -14,7 +14,7 @@ data CodeGenOpts = CodeGenOpts
 data CodeGenData = CodeGenData
   { graph :: OutGraph
   , entryPointArity :: Int
-  , sfDependencies :: Set.Set QualifiedBinding
+  , sfDependencies :: Set.HashSet QualifiedBinding
   , annotations :: Maybe TyAnnMap
   , entryPointName :: Binding
   , entryPointNamespace :: NSRef

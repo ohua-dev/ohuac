@@ -8,9 +8,11 @@ import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
 import qualified Data.HashSet as HS (fromList, member)
 import Data.List (intercalate, lookup)
+import qualified Data.String as Str
 import Language.Haskell.TH
 import Lens.Micro.Internal (Index, IxValue, Ixed, ix)
 import Options.Applicative as O
+import Options.Applicative.Help.Pretty as O
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP ((-<.>), takeDirectory)
 
@@ -20,6 +22,7 @@ import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.Compile
 import Ohua.Standalone
+import Ohua.Stage (knownStages)
 import Ohua.Stdlib (stdlib)
 import Ohua.Unit
 
@@ -34,8 +37,8 @@ data BuildOpts = BuildOpts
     }
 
 data Command
-  = Build BuildOpts
-  | DumpType DumpOpts
+    = Build BuildOpts
+    | DumpType DumpOpts
 
 data CmdOpts = CmdOpts
     { command_ :: Command
@@ -57,8 +60,8 @@ selectionToGen JsonGraph = JSONGen.generate
 -- The following splice generates the following two conversions from the
 -- 'codeGenStrings' list
 --
--- readCodeGen :: Text -> Maybe CodeGenSelection
--- showCodeGen :: CodeGenSelection -> Text
+-- readCodeGen :: (IsString s, IsString err, Eq s) => s -> Either err CodeGenSelection
+-- showCodeGen :: IsString s => CodeGenSelection -> s
 $(let codeGenStrings =
           [('JsonGraph, "json-graph"), ('SimpleJavaClass, "simple-java-class")]
       (readClauses, showClauses) =
@@ -200,11 +203,14 @@ main = do
         info
             (helper <*> optsParser)
             (fullDesc <> header "ohuac ~ the ohua standalone compiler" <>
-             progDesc
-                 ("Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime. Supported module file extensions are: " <>
-                  intercalate
-                      ", "
-                      (map (\a -> toString $ "'" <> a ^. _1 <> "'") definedLangs)))
+             progDescDoc
+                 (Just $
+                  softStr
+                      "Compiles algorithm source files into a dataflow graph, which can be read and executed by a runtime." <$$>
+                  "Supported module file extensions are:" </>
+                  fillSep
+                      (punctuate comma $
+                       map (squotes . text . toString . view _1) definedLangs)))
     dumpOpts =
         DumpOpts <$>
         argument
@@ -215,12 +221,16 @@ main = do
         O.option
             (eitherReader readCodeGen)
             (O.value JsonGraph <>
-             help
-                 ("Format to emit the generated code in. Accepted choices: " <>
-                  intercalate
-                      ", "
-                      (map showCodeGen [(minBound :: CodeGenSelection) ..]) <>
-                  " (default: json-graph)") <>
+             helpDoc
+                 (Just $
+                  softStr "Format to emit the generated code in." <//>
+                  "Accepted choices:" <+>
+                  fillSep
+                      (punctuate
+                           comma
+                           (map (text . showCodeGen)
+                                [(minBound :: CodeGenSelection) ..])) </>
+                  "(default: json-graph)") <>
              long "code-gen" <>
              short 'g') <*>
         O.switch
@@ -231,16 +241,18 @@ main = do
               ( if sname `HS.member` HS.fromList dumpStages
                     then DumpPretty
                     else Don'tDump
-              , stopOn == sname)) <$>
-         O.strOption
-             (long "stop-on" <> help "Stop execution after this stage." <>
+              , stopOn == Just sname)) <$>
+         optional
+             (O.strOption $
+              long "stop-on" <> help "Stop execution after this stage." <>
               metavar "STAGE") <*>
          many
              (O.strOption
                   (long "dump-stage" <>
                    help
-                       "Dump the code at this stage. (can be supplied multiple times)" <>
+                       "Dump the code at this stage. (can be supplied multiple times) The code is dumped to a file called <stage-name>.dump" <>
                    metavar "STAGE")))
+    softStr = fillSep . map text . Str.words
     optsParser =
         CmdOpts <$>
         hsubparser
@@ -248,11 +260,16 @@ main = do
                  "build"
                  (info
                       (Build <$> buildOpts)
-                      (progDesc $
-                       "Build the ohua graph. " <>
-                       "The options --dump-stage and --stop-on pertain to stages. See https://ohua.rtfd.io/en/latest/debugging.html#stages")) <>
+                      (progDescDoc $
+                       Just $
+                       "Build the ohua graph. " <$$> "" <$$>
+                       softStr
+                           "The options --dump-stage and --stop-on pertain to stages. See https://ohua.rtfd.io/en/latest/debugging.html#stages." <$$>
+                       fillSep
+                           ("I know about the following stages:" :
+                            punctuate comma (map (text . toString) knownStages)))) <>
              command
-                 "dump-ma in-type"
+                 "dump-main-type"
                  (info
                       (DumpType <$> dumpOpts)
                       (progDesc "Dump the type of the main function"))) <*>

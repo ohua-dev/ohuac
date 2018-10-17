@@ -6,7 +6,7 @@ import Ohua.Prelude
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
-import qualified Data.HashSet as HS (fromList, member)
+import qualified Data.HashSet as HS (fromList, member, HashSet)
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
 import Language.Haskell.TH
@@ -34,6 +34,7 @@ data BuildOpts = BuildOpts
     { outputFormat :: CodeGenSelection
     , useStdlib :: Bool
     , stageHandlingOpt :: StageHandling
+    , extraFeatures :: HS.HashSet Feature
     }
 
 data Command
@@ -161,7 +162,11 @@ main = do
                             "' to '" <>
                             outPath <>
                             "'"
-            Build BuildOpts {outputFormat, useStdlib, stageHandlingOpt} -> do
+            Build BuildOpts { outputFormat
+                            , useStdlib
+                            , stageHandlingOpt
+                            , extraFeatures
+                            } -> do
                 when useStdlib $ void $ insertDirectly modTracker stdlib
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
@@ -171,7 +176,9 @@ main = do
                 let (mainArity, completeExpr) = mainToEnv expr
                 gr <-
                     compile
-                        (def & stageHandling .~ stageHandlingOpt)
+                        (def & stageHandling .~ stageHandlingOpt &
+                         transformRecursiveFunctions .~
+                         ("tail-recursion" `elem` extraFeatures))
                         (def {passAfterDFLowering = cleanUnits})
                         completeExpr
                 (nameSuggest, code) <-
@@ -251,7 +258,12 @@ main = do
                   (long "dump-stage" <>
                    help
                        "Dump the code at this stage. (can be supplied multiple times) The code is dumped to a file called <stage-name>.dump" <>
-                   metavar "STAGE")))
+                   metavar "STAGE"))) <*>
+        (HS.fromList <$>
+         many
+             (strOption
+                  (short 'f' <> long "feature" <>
+                   help "Enable extra (experimental) features")))
     softStr = fillSep . map text . Str.words
     optsParser =
         CmdOpts <$>

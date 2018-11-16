@@ -21,6 +21,7 @@ import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.Compile
+import Ohua.Configuration
 import Ohua.Standalone
 import Ohua.Stage (knownStages)
 import Ohua.Stdlib (stdlib)

@@ -338,3 +338,12 @@ langs =
   ("rust", formatRustType) :
 #endif
   []
+
+removeDestructuring :: Expression -> OhuaM Text Expression
+removeDestructuring = cata $ \case
+    LetF (Destructure bnds) exp rest -> do
+        bnd <- generateBinding
+
+
+        pure $ Let (Direct bnd)
+    other -> embed <$> sequenceA other

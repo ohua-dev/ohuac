@@ -13,7 +13,7 @@ import Language.Java.Pretty (prettyPrint)
 import qualified Data.ByteString.Lazy.Char8 as LB
 
 import Ohua.DFGraph
-import Ohua.ALang.NS
+import Ohua.Frontend.NS
 import Ohua.CodeGen.Iface
 
 import Paths_ohuac
@@ -28,9 +28,9 @@ generationInfoString = "Generated with ohuac, version " <> LB.pack (showVersion 
 
 
 stringifyQual :: QualifiedBinding -> String
-stringifyQual QualifiedBinding {..} =
+stringifyQual qb =
     toString $
-    T.intercalate "." (map unwrap $ unwrap qbNamespace) <> "/" <> unwrap qbName
+    T.intercalate "." (map unwrap $ unwrap $ qb ^. namespace) <> "/" <> unwrap (qb ^. name)
 
 -- | Caveat: This function does not support all java types yet. Notably the
 -- primitive types and wildcard generics are missing
@@ -152,7 +152,7 @@ newTarget Target {..} =
 
 -- | Creates a @new Source.Local(target)@ or @new Source.Env(lazyObject)@ from
 -- an 'Arc'
-newSource :: Source HostExpr -> Exp
+newSource :: Source Lit -> Exp
 newSource (LocalSource target) =
     InstanceCreation
         []
@@ -160,11 +160,17 @@ newSource (LocalSource target) =
           ClassType [(Ident "Source", []), (Ident "Local", [])])
         [newTarget target]
         Nothing
-newSource (EnvSource idx) =
+newSource (EnvSource lit) =
     InstanceCreation
         []
         envSourceTypeDeclSpec
-        [ExpName $ Name $ pure $ indexToArgumentLazy $ unwrap idx]
+        [ case lit of
+              EnvRefLit idx ->
+                  ExpName $ Name $ pure $ indexToArgumentLazy $ unwrap idx
+              UnitLit -> Lit Null
+              NumericLit n -> Lit $ Int n
+              FunRefLit _ -> error "Function reference literals are not yet supported"
+        ]
         Nothing
 
 -- | Creates an @new Operator(opId, opType)@ expression from an 'Operator' record.
@@ -179,7 +185,7 @@ newOp Operator {..} =
         Nothing
 
 -- | Creates an @new Arc<>(target, source)@ expression from an 'Arc'
-newArc :: Arc HostExpr -> Exp
+newArc :: Arc Lit -> Exp
 newArc Arc {..} =
     InstanceCreation
         []
@@ -306,7 +312,7 @@ generate CodeGenData {..} =
     mainClassName = Name $ map Ident nsList <> [className]
     returnValueArc =
         newArc $
-        Arc (Target retId 0) (LocalSource $ returnArc graph :: Source HostExpr)
+        Arc (Target retId 0) (LocalSource $ returnArc graph)
     finalOperators
         | isVoidFunction = operators graph
         | otherwise = Operator retId "ohua.lang/capture" : operators graph

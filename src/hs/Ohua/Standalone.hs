@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE CPP, ConstraintKinds #-}
 module Ohua.Standalone where
 
 import Ohua.Prelude
@@ -7,17 +7,18 @@ import Control.Concurrent.Async.Lifted
 import Control.Monad.RWS (tell, evalRWS)
 import qualified Data.ByteString.Lazy.Char8 as L
 import Data.Functor.Foldable hiding (fold)
-import Data.Generics.Uniplate.Direct
 import qualified Data.HashMap.Strict as HM
 import Data.List (partition)
 import qualified Data.HashSet as Set
 import qualified Data.Text as T
-import Lens.Micro.Platform
 import System.Directory
 import System.FilePath as Path ((<.>), takeExtension)
+import Control.Lens (each, view, (%~), (^?), ix)
+import Control.Monad.Trans.Control (MonadBaseControl)
 
 import Ohua.ALang.Lang
-import Ohua.ALang.NS as NS
+import qualified Ohua.Frontend.Lang as Fr
+import Ohua.Frontend.NS as NS
 import Ohua.Unit
 import Ohua.ALang.PPrint
 import Ohua.Serialize.JSON ()
@@ -47,7 +48,7 @@ definedLangs =
     ( ".ohuac"
     , "C/Rust-like frontent for the algorithm language"
     , let reNS ::
-                 Namespace (Annotated (FunAnn (TyExpr SomeBinding)) (Expr SomeBinding))
+                 Namespace (Annotated (FunAnn (TyExpr SomeBinding)) Fr.Expr)
               -> (Maybe TyAnnMap, RawNamespace)
           reNS ns =
               (Just $ HM.fromList anns, ns & decls .~ HM.fromList newDecls)
@@ -81,9 +82,10 @@ getParser ext
 type IFaceDefs = HashMap QualifiedBinding Expression
 type ModMap = HashMap NSRef (MVar ResolvedNamespace)
 type ModTracker = IORef ModMap
-type RawNamespace = Namespace (Expr SomeBinding)
+type RawNamespace = Namespace (Fr.Expr)
 type ResolvedNamespace = Namespace Expression
-type CompM = ExceptT Error (LoggingT IO)
+type CompM m
+     = (MonadIO m, MonadBaseControl IO m, MonadError Error m, MonadLogger m)
 type TyAnnMap = HM.HashMap Binding (FunAnn (TyExpr SomeBinding))
 
 
@@ -94,22 +96,18 @@ stdNamespace =
      )
 
 primitives :: HM.HashMap Binding Expression
-primitives = HM.fromList [(unitBinding, unitExpr)]
+primitives = HM.fromList []
 
 resolveNS ::
        forall m. MonadError Error m
     => IFaceDefs
-    -> RawNamespace
+    -> ResolvedNamespace
     -> m ResolvedNamespace
 resolveNS ifacem ns = do
     resDecls <-
         flip runReaderT (mempty, ifacem) $
         go0
-            (topSortDecls
-                 (\case
-                      Unqual bnd
-                          | bnd `Set.member` locallyDefinedAlgos -> Just bnd
-                      _ -> Nothing) $
+            (topSortDecls (`Set.member` locallyDefinedAlgos) $
              HM.toList (ns ^. decls))
     pure $ ns & decls .~ HM.fromList resDecls
   where
@@ -118,51 +116,59 @@ resolveNS ifacem ns = do
         done <- go expr
         local (second $ HM.insert (QualifiedBinding (ns ^. name) varName) done) $
             ((varName, done) :) <$> (go0 xs)
-    go :: Expr SomeBinding -> ReaderT (Set.HashSet Binding, IFaceDefs) m Expression
-    go (Let assignment val body) =
-        registerAssign assignment $ Let assignment <$> go val <*> go body
-    go (Var (Unqual bnd))
-        | Just alangVersion <- primitives ^? ix bnd = pure alangVersion
-        | otherwise = do
-            isLocal <- asks (Set.member bnd . fst)
-            if isLocal
-                then pure $ Var $ Local bnd
-                else case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
-                         (Just algo, Just sf) ->
-                             throwError $
-                             "Ambiguous ocurrence of unqualified binding " <>
-                             show bnd <>
-                             ". Could refer to algo " <>
-                             show algo <>
-                             " or sf " <>
-                             show sf
-                         (Just algoname, _) ->
-                             maybe
-                                 (throwError $
-                                  "Algo not loaded " <> show algoname)
-                                 pure =<<
-                             asks (HM.lookup algoname . snd)
-                         (_, Just sf) -> pure $ Var $ Sf sf Nothing
-                         _ -> throwError $ "Binding not in scope " <> show bnd
-    go (Var (Qual qb)) = do
-        algo <- asks (HM.lookup qb . snd)
-        case algo of
-            Just anAlgo -> pure anAlgo
-            _
-                | qbNamespace qb `Set.member` importedSfNamespaces ->
-                    pure $ Var (Sf qb Nothing)
-            _ ->
-                throwError $
-                "No matching algo available or namespace not loaded for " <>
-                show qb
-    go (Apply expr expr2) = Apply <$> go expr <*> go expr2
-    go (Lambda assignment body) =
-        registerAssign assignment $ Lambda assignment <$> go body
+    go :: Expr -> ReaderT (Set.HashSet Binding, IFaceDefs) m Expression
+    go = cata handleTerm
+    handleTerm e =
+        case e of
+            LetF bnd val body -> registered bnd
+            VarF bnd
+                | Just alangVersion <- primitives ^? ix bnd -> pure alangVersion
+                | otherwise -> do
+                    isLocal <- asks (Set.member bnd . fst)
+                    if isLocal
+                        then pure $ Var bnd
+                        else case ( HM.lookup bnd algoRefers
+                                  , HM.lookup bnd sfRefers) of
+                                 (Just algo, Just sf) ->
+                                     throwError $
+                                     "Ambiguous ocurrence of unqualified binding " <>
+                                     show bnd <>
+                                     ". Could refer to algo " <>
+                                     show algo <>
+                                     " or sf " <>
+                                     show sf
+                                 (Just algoname, _) ->
+                                     maybe
+                                         (throwError $
+                                          "Algo not loaded " <> show algoname)
+                                         pure =<<
+                                     asks (HM.lookup algoname . snd)
+                                 (_, Just sf) -> pure $ Sf sf Nothing
+                                 _ ->
+                                     throwError $
+                                     "Binding not in scope " <> show bnd
+            SfF qb _ -> do
+                algo <- asks (HM.lookup qb . snd)
+                case algo of
+                    Just anAlgo -> pure anAlgo
+                    _
+                        | isImported qb -> pure $ Sf qb Nothing
+                        | otherwise ->
+                            throwError $
+                            "No matching algo or stateful function available or namespace not loaded for " <>
+                            show qb
+            LambdaF bnd _ -> registered bnd
+            _ -> recursed
+      where
+        recursed = embed <$> sequence e
+        registered bnd = registerBnd bnd recursed
+    isImported qb =
+        (qb ^. namespace) `Set.member` Set.fromList (map fst sfImports1)
     sfImports1 = stdNamespace : ns ^. sfImports
-    registerAssign = local . first . Set.union . Set.fromList . extractBindings
+    registerBnd = local . first . Set.insert
     locallyDefinedAlgos = Set.fromList $ HM.keys (ns ^. decls)
-    importedSfNamespaces = Set.fromList $ map fst sfImports1
-    algoRefers = mkReferMap $ (ns ^. name, HM.keys (ns ^. decls)) : ns ^. algoImports
+    algoRefers =
+        mkReferMap $ (ns ^. name, HM.keys (ns ^. decls)) : ns ^. algoImports
     sfRefers = mkReferMap sfImports1
     mkReferMap importList =
         HM.fromListWith
@@ -176,22 +182,23 @@ resolveNS ifacem ns = do
         "Colliding refer for '" <> show a <> "' and '" <> show b <> "' in " <>
         show (ns ^. name)
 
-readAndParse :: (MonadLogger m, MonadIO m) => Text -> m (Maybe TyAnnMap, RawNamespace)
+readAndParse ::
+       (MonadLogger m, MonadIO m) => Text -> m (Maybe TyAnnMap, RawNamespace)
 readAndParse filename = do
     (anns, ns) <-
         let strFname = toString filename
          in getParser (toText $ takeExtension strFname) <$>
             liftIO (L.readFile strFname)
     logDebugN $ "Raw parse result for " <> filename
-    logDebugN $ quickRender ns
+    logDebugN $ "<Pretty printing not implemented for frontend lang yet>" -- quickRender ns
     logDebugN "With annotations:"
     logDebugN $ show anns
     pure (anns, ns)
 
 
-gatherDeps :: IORef ModMap -> Namespace a -> CompM IFaceDefs
-gatherDeps tracker ns = do
-    mods <- mapConcurrently (registerAndLoad tracker) (map fst $ ns ^. algoImports)
+gatherDeps :: CompM m => IORef ModMap -> [NSRef] -> m IFaceDefs
+gatherDeps tracker namespaces = do
+    mods <- mapConcurrently (registerAndLoad tracker) namespaces
     pure $ HM.fromList
         [ (QualifiedBinding (depNamespace ^. NS.name) depName, algo)
         | depNamespace <- mods
@@ -199,7 +206,7 @@ gatherDeps tracker ns = do
         ]
 
 
-findSourceFile :: NSRef -> CompM Text
+findSourceFile :: (MonadError Error m, MonadIO m) => NSRef -> m Text
 findSourceFile modname = do
     candidates <-
         filterM (liftIO . doesFileExist) $
@@ -216,36 +223,54 @@ findSourceFile modname = do
     extensions = map (^. _1) definedLangs
 
 
-loadModule :: ModTracker -> NSRef -> CompM ResolvedNamespace
+loadModule :: CompM m => ModTracker -> NSRef -> m ResolvedNamespace
 loadModule tracker modname = do
     filename <- findSourceFile modname
     (_anns, rawMod) <- readAndParse filename
     unless (rawMod ^. name == modname) $
-        throwError $ "Expected module with name " <> show modname <> " but got " <> show (rawMod ^. name)
+        throwError $
+        "Expected module with name " <> show modname <> " but got " <>
+        show (rawMod ^. name)
     loadDepsAndResolve tracker rawMod
 
 
-loadDepsAndResolve :: ModTracker -> RawNamespace -> CompM ResolvedNamespace
-loadDepsAndResolve tracker rawMod = flip resolveNS rawMod =<< gatherDeps tracker rawMod
+loadDepsAndResolve ::
+       CompM m => ModTracker -> RawNamespace -> m ResolvedNamespace
+loadDepsAndResolve tracker rawMod =
+    join $
+    resolveNS <$> gatherDeps tracker (map fst $ rawMod ^. algoImports) <*>
+    runGenBndT mempty ((decls . traverse) Fr.toAlang rawMod)
+
+registerAndLoad :: CompM m => ModTracker -> NSRef -> m ResolvedNamespace
+registerAndLoad tracker reference =
+    registerAnd tracker reference (loadModule tracker reference)
 
 
-registerAndLoad :: ModTracker -> NSRef -> CompM ResolvedNamespace
-registerAndLoad tracker reference = registerAnd tracker reference (loadModule tracker reference)
-
-
-insertDirectly :: MonadIO m => ModTracker -> ResolvedNamespace -> m (MVar ResolvedNamespace)
+insertDirectly ::
+       MonadIO m
+    => ModTracker
+    -> ResolvedNamespace
+    -> m (MVar ResolvedNamespace)
 insertDirectly tracker ns = do
-  nsRef <- newMVar ns
-  modifyIORef' tracker $ HM.insert (ns ^. name) nsRef
-  pure nsRef
+    nsRef <- newMVar ns
+    modifyIORef' tracker $ HM.insert (ns ^. name) nsRef
+    pure nsRef
 
-registerAnd :: (Eq ref, Hashable ref) => IORef (HashMap ref (MVar load)) -> ref -> CompM load -> CompM load
+registerAnd ::
+       (Eq ref, Hashable ref, MonadIO m)
+    => IORef (HashMap ref (MVar load))
+    -> ref
+    -> m load
+    -> m load
 registerAnd tracker reference ac = do
     newModRef <- liftIO newEmptyMVar
-    actualRef <- liftIO $ atomicModifyIORef' tracker $ \trackerMap ->
-        case trackerMap ^? ix reference of
-            Just mvar -> (trackerMap, Left mvar)
-            Nothing   -> (HM.insert reference newModRef trackerMap, Right newModRef)
+    actualRef <-
+        liftIO $
+        atomicModifyIORef' tracker $ \trackerMap ->
+            case trackerMap ^? ix reference of
+                Just mvar -> (trackerMap, Left mvar)
+                Nothing ->
+                    (HM.insert reference newModRef trackerMap, Right newModRef)
     case actualRef of
         Left toWait -> liftIO $ readMVar toWait
         Right build -> do
@@ -255,45 +280,51 @@ registerAnd tracker reference ac = do
 
 
 gatherSFDeps :: Expression -> Set.HashSet QualifiedBinding
-gatherSFDeps e = Set.fromList [ref | Var (Sf ref _) <- universe e]
+gatherSFDeps e = Set.fromList [ref | Sf ref _ <- universe e]
 -- gatherSFDeps = cata $ \case
 --   VarF (Sf ref _) -> Set.singleton ref
 --   other -> fold other
 
 
-topSortMods :: [Namespace ResolvedSymbol] -> [Namespace ResolvedSymbol]
+topSortMods :: [Namespace a] -> [Namespace a]
 topSortMods = topSortWith (^. name) (map fst . view algoImports)
 
 
 topSortWith :: (Hashable b, Eq b) => (a -> b) -> (a -> [b]) -> [a] -> [a]
-topSortWith getIdent getDeps mods' = concat @[] $ ana (uncurry go) (mempty, mods')
+topSortWith getIdent getDeps mods' =
+    concat @[] $ ana (uncurry go) (mempty, mods')
   where
     go satisfied avail
-      | null newSat =
-        if null newAvail
-        then Nil
-        else error "Unsortable! (Probably due to a cycle)"
-      | otherwise = Cons newSat $ (Set.union (Set.fromList (map getIdent newSat)) satisfied, newAvail)
+        | null newSat =
+            if null newAvail
+                then Nil
+                else error "Unsortable! (Probably due to a cycle)"
+        | otherwise =
+            Cons newSat $
+            (Set.union (Set.fromList (map getIdent newSat)) satisfied, newAvail)
       where
-        (newSat, newAvail) = partition (all (`Set.member` satisfied) . getDeps) avail
+        (newSat, newAvail) =
+            partition (all (`Set.member` satisfied) . getDeps) avail
 
 
-topSortDecls :: (a -> Maybe Binding) -> [(Binding, Expr a)] -> [(Binding, Expr a)]
+topSortDecls :: (Binding -> Bool) -> [(Binding, Expr)] -> [(Binding, Expr)]
 topSortDecls f declarations = map fst $ topSortWith (fst . fst) snd declsWDeps
   where
     localAlgos = Set.fromList $ map fst declarations
     getDeps e = Set.toList $ snd $ evalRWS (go e) mempty ()
       where
         go =
-            cata $ \case
-                LetF assignment val body -> withRegisterBinds assignment $ val >> body
-                VarF thing
-                    | Just bnd <- f thing ->
-                        unlessM (asks $ Set.member bnd) $
-                        when (bnd `Set.member` localAlgos) $ tell [bnd]
-                LambdaF assignment body -> withRegisterBinds assignment body
-                expression -> sequence_ expression
-        withRegisterBinds = local . Set.union . Set.fromList . extractBindings
+            cata $ \e ->
+                let recursed = sequence_ e
+                    registered bnd = local (Set.insert bnd) recursed
+                 in case e of
+                        LetF bnd val body -> registered bnd
+                        VarF bnd
+                            | f bnd ->
+                                unlessM (asks $ Set.member bnd) $
+                                when (bnd `Set.member` localAlgos) $ tell [bnd]
+                        LambdaF bnd body -> registered bnd
+                        _ -> recursed
     declsWDeps = zip declarations $ map (getDeps . snd) declarations
 
 
@@ -301,7 +332,7 @@ mainToEnv :: Expression -> (Int, Expression)
 mainToEnv = go 0 identity
   where
     go !i f (Lambda assignment body) =
-        go (i + 1) (f . Let assignment (Var $ Env $ makeThrow i)) body
+        go (i + 1) (f . Let assignment (Lit $ EnvRefLit $ makeThrow i)) body
     go !i f rest = (i, f rest)
 
 typeFormatterHelper :: Text -> TyExpr SomeBinding -> TyExpr SomeBinding -> Text
@@ -338,12 +369,3 @@ langs =
   ("rust", formatRustType) :
 #endif
   []
-
-removeDestructuring :: Expression -> OhuaM Text Expression
-removeDestructuring = cata $ \case
-    LetF (Destructure bnds) exp rest -> do
-        bnd <- generateBinding
-
-
-        pure $ Let (Direct bnd)
-    other -> embed <$> sequenceA other

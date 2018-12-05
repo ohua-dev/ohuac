@@ -10,18 +10,18 @@ import qualified Data.HashSet as HS (fromList, member, HashSet)
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
 import Language.Haskell.TH
-import Lens.Micro.Internal (Index, IxValue, Ixed, ix)
+import Control.Lens (Index, IxValue, Ixed, ix, (^?), view)
 import Options.Applicative as O
 import Options.Applicative.Help.Pretty as O
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP ((-<.>), takeDirectory)
 
-import Ohua.ALang.NS
+import Ohua.Frontend.NS
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.Compile
-import Ohua.Configuration
+import Ohua.Compile.Configuration
 import Ohua.Standalone
 import Ohua.Stage (knownStages)
 import Ohua.Stdlib (stdlib)
@@ -108,7 +108,7 @@ $(let codeGenStrings =
 (-<.>) :: Text -> Text -> Text
 p1 -<.> p2 = toText $ toString p1 FP.-<.> toString p2
 
-runCompM :: LogLevel -> CompM () -> IO ()
+runCompM :: LogLevel -> ExceptT Text (LoggingT IO) a -> IO a
 runCompM targetLevel c =
     runStderrLoggingT $
     filterLogger (\_ level -> level >= targetLevel) $

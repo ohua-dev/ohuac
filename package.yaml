@@ -1,5 +1,5 @@
 name: ohuac
-version: '0.2.0'
+version: '0.3.0'
 category: Devel
 author: Sebastian Ertel, Justus Adam
 maintainer: dev@justus.science
@@ -39,15 +39,15 @@ default-extensions:
 - StandaloneDeriving
 dependencies:
 - base
-- microlens
-- microlens-platform
-- ohua-core
+- ohua-core >= 0.3.0
 - bytestring
 - aeson
 - filepath
 - directory
 - template-haskell
 - unordered-containers
+- lens
+- monad-control
 library:
   source-dirs: src/hs
   dependencies:
@@ -56,7 +56,6 @@ library:
   - text
   - recursion-schemes
   - lifted-async
-  - uniplate
   - containers
   - casing
   - language-java

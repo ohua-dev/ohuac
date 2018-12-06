@@ -8,7 +8,7 @@ packages:
   extra-dep: true
 - location:
     git: https://github.com/ohua-dev/alang-clike-parser
-    commit: cf0cd6b2d1cd72d7cdfeda896aacf7d3e141bdf8
+    commit: 6d4c3d2433c3686928f608b0c84a8ad130884f08
   extra-dep: true
 - location:
     git: https://github.com/ohua-dev/alang-sexpr-parser

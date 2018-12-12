@@ -15,6 +15,7 @@ import qualified Data.ByteString.Lazy.Char8 as LB
 import Ohua.DFGraph
 import Ohua.Frontend.NS
 import Ohua.CodeGen.Iface
+import Ohua.DFLang.Lang (NodeType(FunctionNode))
 
 import Paths_ohuac
 
@@ -185,7 +186,7 @@ newOp Operator {..} =
         Nothing
 
 -- | Creates an @new Arc<>(target, source)@ expression from an 'Arc'
-newArc :: Arc Lit -> Exp
+newArc :: DirectArc Lit -> Exp
 newArc Arc {..} =
     InstanceCreation
         []
@@ -280,6 +281,7 @@ configuredClassConstructorDecl =
         ]
 
 
+-- | TODO handle compound and state arcs
 generate :: CodeGen
 generate CodeGenData {..} =
     pure
@@ -305,8 +307,8 @@ generate CodeGenData {..} =
             (replicate entryPointArity objectType)
             (map tyExprToJava . argTypes)
             entryPointAnnotations
-    localArcs = [a | a@Arc {source = LocalSource _} <- arcs graph]
-    envArcs = [a | a@Arc {source = EnvSource _} <- arcs graph]
+    localArcs = [a | a@Arc {source = LocalSource _} <- direct $ arcs graph]
+    envArcs = [a | a@Arc {source = EnvSource _} <- direct $ arcs graph]
     envArcCount = length envArcs
     isVoidFunction = isNothing returnType
     mainClassName = Name $ map Ident nsList <> [className]
@@ -315,7 +317,7 @@ generate CodeGenData {..} =
         Arc (Target retId 0) (LocalSource $ returnArc graph)
     finalOperators
         | isVoidFunction = operators graph
-        | otherwise = Operator retId "ohua.lang/capture" : operators graph
+        | otherwise = Operator retId "ohua.lang/capture" FunctionNode : operators graph
     addReturnCaptureArcs
         | isVoidFunction = identity
         | otherwise = (Lit Null :) . (returnValueArc :)

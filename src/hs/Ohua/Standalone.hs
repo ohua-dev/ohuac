@@ -143,16 +143,16 @@ resolveNS ifacem ns = do
                                           "Algo not loaded " <> show algoname)
                                          pure =<<
                                      asks (HM.lookup algoname . snd)
-                                 (_, Just sf) -> pure $ Sf sf Nothing
+                                 (_, Just sf) -> pure $ Lit $ FunRefLit $ FunRef sf Nothing
                                  _ ->
                                      throwError $
                                      "Binding not in scope " <> show bnd
-            SfF qb _ -> do
+            LitF (FunRefLit (FunRef qb _)) -> do
                 algo <- asks (HM.lookup qb . snd)
                 case algo of
                     Just anAlgo -> pure anAlgo
                     _
-                        | isImported qb -> pure $ Sf qb Nothing
+                        | isImported qb -> pure $ Lit $ FunRefLit $ FunRef qb Nothing
                         | otherwise ->
                             throwError $
                             "No matching algo or stateful function available or namespace not loaded for " <>
@@ -280,7 +280,7 @@ registerAnd tracker reference ac = do
 
 
 gatherSFDeps :: Expression -> Set.HashSet QualifiedBinding
-gatherSFDeps e = Set.fromList [ref | Sf ref _ <- universe e]
+gatherSFDeps e = Set.fromList [ref | Lit (FunRefLit (FunRef ref _)) <- universe e]
 -- gatherSFDeps = cata $ \case
 --   VarF (Sf ref _) -> Set.singleton ref
 --   other -> fold other

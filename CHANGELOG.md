@@ -4,8 +4,9 @@
 
 ### Stateful functions
 
-This release features the first version of the explicit state proposal
-(ohua-dev/ohua-core#22). With the following changes
+This release features the first version of the [explicit state
+proposal](https://github.com/ohua-dev/ohua-core/issues/22). With the following
+changes
 
 - Rust, ML and S-Expression frontend support of the `function with state` syntax
   which associates `function` with the state formed by the expression `state`.
@@ -20,16 +21,16 @@ the top level scope (i.e. not in an `if`, `smap` etc context).
 
 - Functions with no return expression (i.e. last expression is terminated with
   `;`) are now supported and implicitly return `()`
-  (ohua-dev/alang-clike-parser#4)
+  [ohua-dev/alang-clike-parser#4](https://github.com/ohua-dev/alang-clike-parser/issues/4)
 - Syntax for lambdas has been tweaked to more closely resemble actual rust
   syntax with the form `| arg1, ... args | expr` or `| arg1, ... args | { stmts
-  }` (ohua-dev/alang-clike-parser#10)
+  }` [ohua-dev/alang-clike-parser#10](https://github.com/ohua-dev/alang-clike-parser/issues/10)
 - Import syntax now also supports actual rust style with the forms
   `name::space::import_item` or `name::space::{import_item, ...items}`
-  (ohua-dev/alang-clike-parser#6)
+  [ohua-dev/alang-clike-parser#6](https://github.com/ohua-dev/alang-clike-parser/issues/6)
 - Variable names beginning with `_` are no longer rejected by the parser. This
   also enables the use of `_` as an identifier for ignored values
-  (ohua-dev/alang-clike-parser#5)
+  [ohua-dev/alang-clike-parser#5](https://github.com/ohua-dev/alang-clike-parser/issues/5)
 - Literals
   - `()` (empty parentheses) is accepted as a literal for the unit value
   - Numeric literals are supported i.e. `1`, `2`, `-100`
@@ -55,7 +56,8 @@ the top level scope (i.e. not in an `if`, `smap` etc context).
 ### Literals
 
 ALang as well as the `.ohuaml`, `.ohuac` and `.ohuas` formats now support
-numeric literals and a unit literal. (ohua-dev/ohua-core#23)
+numeric literals and a unit literal.
+[ohua-dev/ohua-core#23](https://github.com/ohua-dev/ohua-core/issues/23)
 
 In general the literals for `()` are supported both as expressions as well as in
 patterns. Integer literals are currently not supported in patterns.
@@ -67,12 +69,14 @@ using literals.)
 ### New intermediate language
 
 A new, rich frontend intermediate language has been introduced
-(ohua-dev/ohua-core#23). This enabled the following features:
+[ohua-dev/ohua-core#23](https://github.com/ohua-dev/ohua-core/issues/23). This
+enabled the following features:
 
 - Features of the individual parsers are now more similar, as they do not need
   to be desugared in the parser itself but are handled uniformly by the compiler.
 - Destructuring/pattern matching is now a desugaring feature and supports
-  arbitrarily nested patterns. (ohua-dev/ohua-core#17)
+  arbitrarily nested patterns.
+  [ohua-dev/ohua-core#17](https://github.com/ohua-dev/ohua-core/issues/17)
 
 ## Breaking changes
 

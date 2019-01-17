@@ -16,6 +16,7 @@ import Options.Applicative.Help.Pretty as O
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP ((-<.>), takeDirectory)
 
+import Ohua.ALang.Lang
 import Ohua.Frontend.NS
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
@@ -172,7 +173,11 @@ main = do
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
                     loadDepsAndResolve modTracker rawMainMod
-                expr <- getMain $ mainMod ^. decls
+                expr' <- getMain $ mainMod ^. decls
+                let expr = case expr' of
+                               -- FIXME this is technically not correct for edge cases
+                               Lambda "_" body -> body
+                               e -> e
                 let sfDeps = gatherSFDeps expr
                 let (mainArity, completeExpr) = mainToEnv expr
                 gr <-
@@ -194,7 +199,7 @@ main = do
                             , entryPointName = entrypoint
                             , entryPointNamespace = rawMainMod ^. name
                             }
-                let outputPath = fromMaybe (nameSuggest) out
+                let outputPath = fromMaybe nameSuggest out
                 liftIO $
                     createDirectoryIfMissing
                         True

@@ -1,16 +1,17 @@
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TemplateHaskell, CPP #-}
 module Main where
 
 import Ohua.Prelude
 
+import Control.Lens (Index, IxValue, Ixed, (^?), ix, view)
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
-import qualified Data.HashSet as HS (fromList, member, HashSet)
+import qualified Data.HashSet as HS (HashSet, fromList, member)
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
+import Data.Time (getCurrentTime)
 import Language.Haskell.TH
-import Control.Lens (Index, IxValue, Ixed, ix, (^?), view)
 import Options.Applicative as O
 import Options.Applicative.Help.Pretty as O
 import System.Directory (createDirectoryIfMissing)
@@ -40,16 +41,17 @@ data BuildOpts = BuildOpts
     }
 
 data Command
-    = Build BuildOpts
-    | DumpType DumpOpts
+    = Build CommonCmdOpts BuildOpts
+    | DumpType CommonCmdOpts DumpOpts
+    | ShowVersion
 
-data CmdOpts = CmdOpts
-    { command_ :: Command
-    , inputModuleFile :: Text
+data CommonCmdOpts = CommonCmdOpts
+    { inputModuleFile :: Text
     , entrypoint :: Binding
     , outputPath :: Maybe Text
     , logLevel :: LogLevel
     }
+
 
 data CodeGenSelection
     = JsonGraph
@@ -121,35 +123,24 @@ runCompM targetLevel c =
 
 main :: IO ()
 main = do
-    opts@CmdOpts { inputModuleFile = inputModFile
-                 , outputPath = out
-                 , entrypoint
-                 , logLevel
-                 } <- execParser odef
-    runCompM logLevel $ do
-        modTracker <- newIORef mempty
-        (mainAnns, rawMainMod) <- readAndParse inputModFile
-        let getMain ::
-                   (Ixed m, Index m ~ Binding, MonadError Error mo)
-                => m
-                -> mo (IxValue m)
-            getMain m =
-                case m ^? ix entrypoint of
-                    Nothing ->
-                        throwError $
-                        "Module does not define specified entry point '" <>
-                        unwrap entrypoint <>
-                        "'"
-                    Just x -> pure x
-        case command_ opts of
-            DumpType (DumpOpts format) ->
+    opts <- execParser odef
+    case opts of
+        ShowVersion -> do
+            putStrLn ("ohuac v" <> CURRENT_PACKAGE_VERSION :: Text)
+            putStrLn
+                ("Compiled at " <>
+                 $(LitE . StringL . show <$> liftIO getCurrentTime) :: Text)
+        DumpType common@CommonCmdOpts {..} (DumpOpts format) ->
+            withCommonSetup common $ \_ mainAnns _ getMain ->
                 case mainAnns of
                     Nothing ->
                         throwError "No annotations present for the module"
                     Just m -> do
                         FunAnn args ret <- getMain m
                         let outPath =
-                                fromMaybe (inputModFile -<.> "type-dump") out
+                                fromMaybe
+                                    (inputModuleFile -<.> "type-dump")
+                                    outputPath
                         liftIO $
                             L.writeFile (toString outPath) $
                             encode $
@@ -160,24 +151,27 @@ main = do
                         logInfoN $
                             "Wrote a type dump of '" <> unwrap entrypoint <>
                             "' from '" <>
-                            inputModFile <>
+                            inputModuleFile <>
                             "' to '" <>
                             outPath <>
-                            "'"
-            Build BuildOpts { outputFormat
-                            , useStdlib
-                            , stageHandlingOpt
-                            , extraFeatures
-                            } -> do
+                            ("'" :: Text)
+        Build common@CommonCmdOpts {..} BuildOpts { outputFormat
+                                                  , useStdlib
+                                                  , stageHandlingOpt
+                                                  , extraFeatures
+                                                  } ->
+            withCommonSetup common $ \modTracker mainAnns rawMainMod getMain -> do
                 when useStdlib $ void $ insertDirectly modTracker stdlib
                 mainMod <-
                     registerAnd modTracker (rawMainMod ^. name) $
                     loadDepsAndResolve modTracker rawMainMod
                 expr' <- getMain $ mainMod ^. decls
-                let expr = case expr' of
+                let expr =
+                        case expr'
                                -- FIXME this is technically not correct for edge cases
-                               Lambda "_" body -> body
-                               e -> e
+                              of
+                            Lambda "_" body -> body
+                            e -> e
                 let sfDeps = gatherSFDeps expr
                 let (mainArity, completeExpr) = mainToEnv expr
                 gr <-
@@ -199,19 +193,44 @@ main = do
                             , entryPointName = entrypoint
                             , entryPointNamespace = rawMainMod ^. name
                             }
-                let outputPath = fromMaybe nameSuggest out
+                let outputPath0 = fromMaybe nameSuggest outputPath
                 liftIO $
                     createDirectoryIfMissing
                         True
-                        (FP.takeDirectory $ toString outputPath)
-                liftIO $ L.writeFile (toString outputPath) code
+                        (FP.takeDirectory $ toString outputPath0)
+                liftIO $ L.writeFile (toString outputPath0) code
                 logInfoN $
                     "Compiled '" <> unwrap entrypoint <> "' from '" <>
-                    inputModFile <>
+                    inputModuleFile <>
                     "' to " <>
                     showCodeGen outputFormat
-                logInfoN $ "Code written to '" <> outputPath <> "'"
+                logInfoN $ "Code written to '" <> outputPath0 <> "'"
   where
+    withCommonSetup ::
+           (m ~ ExceptT Text (LoggingT IO))
+        => CommonCmdOpts
+        -> (IORef ModMap -> Maybe TyAnnMap -> RawNamespace -> (forall map. ( Ixed map
+                                                                           , Index map ~ Binding
+                                                                           ) =>
+                                                                               map -> m (IxValue map)) -> m a)
+        -> IO a
+    withCommonSetup CommonCmdOpts {..} f =
+        runCompM logLevel $ do
+            modTracker <- newIORef mempty
+            (mainAnns, rawMainMod) <- readAndParse inputModuleFile
+            let getMain ::
+                       (Ixed m, Index m ~ Binding, MonadError Error mo)
+                    => m
+                    -> mo (IxValue m)
+                getMain m =
+                    case m ^? ix entrypoint of
+                        Nothing ->
+                            throwError $
+                            "Module does not define specified entry point '" <>
+                            unwrap entrypoint <>
+                            "'"
+                        Just x -> pure x
+            f modTracker mainAnns rawMainMod getMain
     odef =
         info
             (helper <*> optsParser)
@@ -272,12 +291,11 @@ main = do
                    help "Enable extra (experimental) features")))
     softStr = fillSep . map text . Str.words
     optsParser =
-        CmdOpts <$>
         hsubparser
             (command
                  "build"
                  (info
-                      (Build <$> buildOpts)
+                      (Build <$> commonOptsParser <*> buildOpts)
                       (progDescDoc $
                        Just $
                        "Build the ohua graph. " <$$> "" <$$>
@@ -289,8 +307,16 @@ main = do
              command
                  "dump-main-type"
                  (info
-                      (DumpType <$> dumpOpts)
-                      (progDesc "Dump the type of the main function"))) <*>
+                      (DumpType <$> commonOptsParser <*> dumpOpts)
+                      (progDesc "Dump the type of the main function")) <>
+             command
+                 "version"
+                 (info
+                      (pure ShowVersion)
+                      (progDesc
+                           "Show information, such as the version, about this binary.")))
+    commonOptsParser =
+        CommonCmdOpts <$>
         argument str (metavar "SOURCE" <> help "Source file to compile") <*>
         argument
             (eitherReader $ mapLeft toString . make . toText)

@@ -307,7 +307,7 @@ main = do
              command
                  "dump-main-type"
                  (info
-                      (DumpType <$> commonOptsParser <*> dumpOpts)
+                      (flip DumpType <$> dumpOpts <*> commonOptsParser)
                       (progDesc "Dump the type of the main function")) <>
              command
                  "version"

@@ -88,7 +88,6 @@ type CompM m
      = (MonadIO m, MonadBaseControl IO m, MonadError Error m, MonadLogger m)
 type TyAnnMap = HM.HashMap Binding (FunAnn (TyExpr SomeBinding))
 
-
 stdNamespace :: (NSRef, [Binding])
 stdNamespace =
     ( ["ohua", "lang"]
@@ -99,7 +98,7 @@ primitives :: HM.HashMap Binding Expression
 primitives = HM.fromList []
 
 resolveNS ::
-       forall m. MonadError Error m
+       forall m. (MonadError Error m)
     => IFaceDefs
     -> ResolvedNamespace
     -> m ResolvedNamespace
@@ -113,46 +112,47 @@ resolveNS ifacem ns = do
   where
     go0 [] = pure []
     go0 ((varName, expr):xs) = do
-        done <- go expr
+        done <- go varName expr
         local (second $ HM.insert (QualifiedBinding (ns ^. name) varName) done) $
             ((varName, done) :) <$> (go0 xs)
-    go :: Expr -> ReaderT (Set.HashSet Binding, IFaceDefs) m Expression
-    go = cata handleTerm
-    handleTerm e =
+    go :: Binding -> Expr -> ReaderT (Set.HashSet Binding, IFaceDefs) m Expression
+    go self = cata (handleTerm self)
+    handleTerm self e =
         case e of
-            LetF bnd val body -> registered bnd
+            LetF bnd _ _ -> registered bnd
             VarF bnd
                 | Just alangVersion <- primitives ^? ix bnd -> pure alangVersion
                 | otherwise -> do
                     isLocal <- asks (Set.member bnd . fst)
-                    if isLocal
-                        then pure $ Var bnd
-                        else case ( HM.lookup bnd algoRefers
-                                  , HM.lookup bnd sfRefers) of
-                                 (Just algo, Just sf) ->
-                                     throwError $
-                                     "Ambiguous ocurrence of unqualified binding " <>
-                                     show bnd <>
-                                     ". Could refer to algo " <>
-                                     show algo <>
-                                     " or sf " <>
-                                     show sf
-                                 (Just algoname, _) ->
-                                     maybe
-                                         (throwError $
-                                          "Algo not loaded " <> show algoname)
-                                         pure =<<
-                                     asks (HM.lookup algoname . snd)
-                                 (_, Just sf) -> pure $ Lit $ FunRefLit $ FunRef sf Nothing
-                                 _ ->
-                                     throwError $
-                                     "Binding not in scope " <> show bnd
+                    let isSelf = bnd == self
+                    case (HM.lookup bnd algoRefers, HM.lookup bnd sfRefers) of
+                        _
+                            | isLocal || isSelf -> pure $ Var bnd
+                        (Just algo, Just sf) ->
+                            throwError $
+                            "Ambiguous ocurrence of unqualified binding " <>
+                            show bnd <>
+                            ". Could refer to algo " <>
+                            show algo <>
+                            " or sf " <>
+                            show sf
+                        (Just algoname, _) ->
+                            flip (Let bnd) (Var bnd) <$>
+                            (maybe
+                                 (throwError $
+                                  "Algo not loaded " <> show algoname)
+                                 pure =<<
+                             asks (HM.lookup algoname . snd))
+                        (_, Just sf) ->
+                            pure $ Lit $ FunRefLit $ FunRef sf Nothing
+                        _ -> throwError $ "Binding not in scope " <> show bnd
             LitF (FunRefLit (FunRef qb _)) -> do
                 algo <- asks (HM.lookup qb . snd)
                 case algo of
                     Just anAlgo -> pure anAlgo
                     _
-                        | isImported qb -> pure $ Lit $ FunRefLit $ FunRef qb Nothing
+                        | isImported qb ->
+                            pure $ Lit $ FunRefLit $ FunRef qb Nothing
                         | otherwise ->
                             throwError $
                             "No matching algo or stateful function available or namespace not loaded for " <>
@@ -311,7 +311,10 @@ topSortDecls :: (Binding -> Bool) -> [(Binding, Expr)] -> [(Binding, Expr)]
 topSortDecls f declarations = map fst $ topSortWith (fst . fst) snd declsWDeps
   where
     localAlgos = Set.fromList $ map fst declarations
-    getDeps e = Set.toList $ snd $ evalRWS (go e) mempty ()
+    getDeps (item, e) =
+        Set.toList $
+        Set.delete item $
+        snd $ evalRWS (go e) mempty ()
       where
         go =
             cata $ \e ->
@@ -325,7 +328,7 @@ topSortDecls f declarations = map fst $ topSortWith (fst . fst) snd declsWDeps
                                 when (bnd `Set.member` localAlgos) $ tell [bnd]
                         LambdaF bnd body -> registered bnd
                         _ -> recursed
-    declsWDeps = zip declarations $ map (getDeps . snd) declarations
+    declsWDeps = zip declarations $ map getDeps declarations
 
 
 mainToEnv :: Expression -> (Int, Expression)

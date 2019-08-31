@@ -1,4 +1,5 @@
 {-# LANGUAGE TemplateHaskell, CPP #-}
+
 module Main where
 
 import Ohua.Prelude
@@ -7,6 +8,7 @@ import Control.Lens (Index, IxValue, Ixed, (^?), ix, view)
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
+import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HS (HashSet, fromList, member)
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
@@ -15,19 +17,23 @@ import Language.Haskell.TH
 import Options.Applicative as O
 import Options.Applicative.Help.Pretty as O
 import System.Directory (createDirectoryIfMissing)
-import qualified System.FilePath as FP ((-<.>), takeDirectory)
+import qualified System.FilePath as FP
+import Ohua.ALang.Lang (Expr(Lambda))
 
-import Ohua.ALang.Lang
-import Ohua.Frontend.NS
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
+import qualified Ohua.CodeGen.NoriaUDF as NoriaUDFGen
 import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.Compile
 import Ohua.Compile.Configuration
-import Ohua.Standalone
+import Ohua.Frontend.NS
+import qualified Ohua.Helpers.Template as TemplateHelper
 import Ohua.Stage (knownStages)
+import Ohua.Standalone
 import Ohua.Stdlib (stdlib)
 import Ohua.Unit
+
+import Paths_ohuac
 
 newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
@@ -38,6 +44,7 @@ data BuildOpts = BuildOpts
     , useStdlib :: Bool
     , stageHandlingOpt :: StageHandling
     , extraFeatures :: HS.HashSet Feature
+    , sandbox :: Bool
     }
 
 data Command
@@ -56,11 +63,13 @@ data CommonCmdOpts = CommonCmdOpts
 data CodeGenSelection
     = JsonGraph
     | SimpleJavaClass
-    deriving (Read, Show, Bounded, Enum)
+    | NoriaUDF
+    deriving (Read, Show, Bounded, Enum, Eq)
 
 selectionToGen :: CodeGenSelection -> CodeGen
 selectionToGen SimpleJavaClass = JavaGen.generate
 selectionToGen JsonGraph = JSONGen.generate
+selectionToGen NoriaUDF = NoriaUDFGen.generate
 
 -- The following splice generates the following two conversions from the
 -- 'codeGenStrings' list
@@ -68,7 +77,10 @@ selectionToGen JsonGraph = JSONGen.generate
 -- readCodeGen :: (IsString s, IsString err, Eq s) => s -> Either err CodeGenSelection
 -- showCodeGen :: IsString s => CodeGenSelection -> s
 $(let codeGenStrings =
-          [('JsonGraph, "json-graph"), ('SimpleJavaClass, "simple-java-class")]
+          [ ('JsonGraph, "json-graph")
+          , ('SimpleJavaClass, "simple-java-class")
+          , ('NoriaUDF, "noria-udf")
+          ]
       (readClauses, showClauses) =
           unzip
               [ ( Clause
@@ -159,6 +171,7 @@ main = do
                                                   , useStdlib
                                                   , stageHandlingOpt
                                                   , extraFeatures
+                                                  , sandbox
                                                   } ->
             withCommonSetup common $ \modTracker mainAnns rawMainMod getMain -> do
                 when useStdlib $ void $ insertDirectly modTracker stdlib
@@ -174,12 +187,21 @@ main = do
                             e -> e
                 let sfDeps = gatherSFDeps expr
                 let (mainArity, completeExpr) = mainToEnv expr
+                udfs <- newIORef []
+                let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
                 gr <-
                     compile
                         (def & stageHandling .~ stageHandlingOpt &
                          transformRecursiveFunctions .~
                          ("tail-recursion" `elem` extraFeatures))
-                        (def {passAfterDFLowering = cleanUnits})
+                        (def
+                             { passAfterDFLowering = cleanUnits
+                             , passAfterNormalize =
+                                   case outputFormat of
+                                       NoriaUDF ->
+                                           NoriaUDFGen.generateNoriaUDFs addUdf
+                                       _ -> pure
+                             })
                         completeExpr
                 (nameSuggest, code) <-
                     flip runReaderT CodeGenOpts $
@@ -198,6 +220,9 @@ main = do
                     createDirectoryIfMissing
                         True
                         (FP.takeDirectory $ toString outputPath0)
+                when (outputFormat == NoriaUDF) $
+                    NoriaUDFGen.noriaUdfExtraProcessing sandbox =<<
+                    readIORef udfs
                 liftIO $ L.writeFile (toString outputPath0) code
                 logInfoN $
                     "Compiled '" <> unwrap entrypoint <> "' from '" <>
@@ -288,7 +313,11 @@ main = do
          many
              (strOption
                   (short 'f' <> long "feature" <>
-                   help "Enable extra (experimental) features")))
+                   help "Enable extra (experimental) features"))) <*>
+        O.switch
+            (long "sandbox" <>
+             help
+                 "Write database linking files to a temporary directory (only used for noria codegen)")
     softStr = fillSep . map text . Str.words
     optsParser =
         hsubparser

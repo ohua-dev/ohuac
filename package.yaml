@@ -59,6 +59,9 @@ library:
   - containers
   - casing
   - language-java
+  - prettyprinter
+  - attoparsec
+  - temporary
   when:
     - condition: flag(with-clike-parser)
       dependencies:

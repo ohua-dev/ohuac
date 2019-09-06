@@ -8,6 +8,8 @@ license: OtherLicense
 github: ohua-dev/ohuac
 extra-source-files:
 - README.md
+data-files:
+- templates/noria/*/*.rs
 default-extensions:
 - OverloadedStrings
 - OverloadedLists
@@ -48,6 +50,7 @@ dependencies:
 - unordered-containers
 - lens
 - monad-control
+- prettyprinter
 library:
   source-dirs: src/hs
   dependencies:
@@ -59,7 +62,6 @@ library:
   - containers
   - casing
   - language-java
-  - prettyprinter
   - attoparsec
   - temporary
   when:

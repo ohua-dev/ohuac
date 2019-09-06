@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell, CPP #-}
+{-# LANGUAGE TemplateHaskell, CPP, ImplicitParams #-}
 
 module Main where
 
@@ -8,17 +8,20 @@ import Control.Lens (Index, IxValue, Ixed, (^?), ix, view)
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
-import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HS (HashSet, fromList, member)
+import qualified Data.HashMap.Strict as HM
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
-import Data.Time (getCurrentTime)
+import qualified Data.Time as Time
 import Language.Haskell.TH
 import Options.Applicative as O
 import Options.Applicative.Help.Pretty as O
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
 import Ohua.ALang.Lang (Expr(Lambda))
+import qualified Data.Text.Prettyprint.Doc as PP
+import Data.Traversable (for)
+import Control.Category ((>>>))
 
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
@@ -27,13 +30,12 @@ import qualified Ohua.CodeGen.SimpleJavaClass as JavaGen
 import Ohua.Compile
 import Ohua.Compile.Configuration
 import Ohua.Frontend.NS
-import qualified Ohua.Helpers.Template as TemplateHelper
 import Ohua.Stage (knownStages)
 import Ohua.Standalone
 import Ohua.Stdlib (stdlib)
 import Ohua.Unit
+import Ohua.ALang.PPrint ()
 
-import Paths_ohuac
 
 newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
@@ -141,7 +143,14 @@ main = do
             putStrLn ("ohuac v" <> CURRENT_PACKAGE_VERSION :: Text)
             putStrLn
                 ("Compiled at " <>
-                 $(LitE . StringL . show <$> liftIO getCurrentTime) :: Text)
+                 $(do t <- liftIO Time.getCurrentTime
+                      tz <- liftIO Time.getCurrentTimeZone
+                      pure $
+                          LitE $
+                          StringL $
+                          show t <> " (" <>
+                          show (Time.localTimeOfDay $ Time.utcToLocalTime tz t) <>
+                          " local)") :: Text)
         DumpType common@CommonCmdOpts {..} (DumpOpts format) ->
             withCommonSetup common $ \_ mainAnns _ getMain ->
                 case mainAnns of
@@ -175,9 +184,26 @@ main = do
                                                   } ->
             withCommonSetup common $ \modTracker mainAnns rawMainMod getMain -> do
                 when useStdlib $ void $ insertDirectly modTracker stdlib
+                let present =
+                        map
+                            (\(ns, i) ->
+                                 show $
+                                 PP.pretty ns <> PP.tupled (map PP.pretty i))
+                 in do logDebugN $
+                           unlines $
+                           "Algos:" : present (rawMainMod ^. algoImports)
+                       logDebugN $
+                           unlines $ "Sfs:" : present (rawMainMod ^. sfImports)
                 mainMod <-
-                    registerAnd modTracker (rawMainMod ^. name) $
-                    loadDepsAndResolve modTracker rawMainMod
+                    let ?env = ResolutionEnv
+                            { modTracker = modTracker
+                            , preResolveHook =
+                                  case outputFormat of
+                                      NoriaUDF -> NoriaUDFGen.resolveHook
+                                      _ -> pure
+                            }
+                     in registerAnd (rawMainMod ^. name) $
+                        loadDepsAndResolve rawMainMod
                 expr' <- getMain $ mainMod ^. decls
                 let expr =
                         case expr'
@@ -189,6 +215,26 @@ main = do
                 let (mainArity, completeExpr) = mainToEnv expr
                 udfs <- newIORef []
                 let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
+                noriaPass <-
+                    case outputFormat of
+                        NoriaUDF -> do
+                            fields <-
+                                HM.fromList . concat <$> do
+                                    modMap <- readIORef modTracker
+                                    for (HM.elems modMap) $
+                                        fmap
+                                            (view pragmas >>>
+                                             mapMaybe
+                                                 (\case
+                                                      Other "declare-field" f ->
+                                                          traceShow f $
+                                                          Just $
+                                                          NoriaUDFGen.parseFieldPragma
+                                                              f
+                                                      _ -> Nothing)) .
+                                        readMVar
+                            pure $ NoriaUDFGen.generateNoriaUDFs fields addUdf
+                        _ -> pure pure
                 gr <-
                     compile
                         (def & stageHandling .~ stageHandlingOpt &
@@ -196,11 +242,7 @@ main = do
                          ("tail-recursion" `elem` extraFeatures))
                         (def
                              { passAfterDFLowering = cleanUnits
-                             , passAfterNormalize =
-                                   case outputFormat of
-                                       NoriaUDF ->
-                                           NoriaUDFGen.generateNoriaUDFs addUdf
-                                       _ -> pure
+                             , passAfterNormalize = noriaPass
                              })
                         completeExpr
                 (nameSuggest, code) <-

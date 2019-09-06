@@ -2,27 +2,15 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use super::att3::Typed;
+use super::super::att3::Typed;
 use nom_sql::SqlType;
 
 use crate::ops::grouped::get_group_values;
-use crate::state::click_ana::{iseq, ClickAnaState, Computer};
+use crate::state::cstate::SpecialStateWrapper;
+use state::click_ana::Computer;
+
 //use crate::state::cstate::{MemoElem};
 use prelude::*;
-
-#[derive(Debug)]
-pub enum FreeGroup<A> {
-    One(A),
-    And(Box<FreeGroup<A>>, Box<FreeGroup<A>>),
-    Not(Box<FreeGroup<A>>),
-    Empty,
-}
-
-// Defined replacements
-//   udf-name, map, reduce, node-properties
-
-type Timestamp = i32;
-type Category = i32;
 
 #[derive(Serialize, Deserialize,Clone)]
 pub struct
@@ -36,6 +24,8 @@ pub struct
 
     // cat_index: usize,
     // ts_index: usize,
+
+    // <insert(udf-args-sigs)>
 
     // <insert(node-properties)>
 
@@ -55,46 +45,39 @@ pub struct
     colfix: Vec<usize>,
 }
 
-impl Typed for ClickAna {
+impl Typed for
+    // <begin(udf-name)>
+    ClickAna
+    // <end(udf-name)>
+{
     type Type = SqlType;
     fn typ(&self) -> Self::Type {
         // <insert(sql-type)>
     }
 }
 
-impl ClickAna {
-    fn run(&self, row: &[DataType]) -> iseq::Action<i32> {
-        use self::iseq::Action;
-        let cat = &row[self.cat_index];
-        let ts = row[self.ts_index].clone().into();
-
-        if cat == &self.start_cat {
-            Action::Open(ts)
-        } else if cat == &self.end_cat {
-            Action::Close(ts)
-        } else {
-            Action::Insert(ts)
-        }
-    }
-
+impl
+    // <begin(udf-name)>
+    ClickAna
+    // <end(udf-name)>
+{
     pub fn new(
         src: NodeIndex,
-        start_cat: Category,
-        end_cat: Category,
-        cat_index: usize,
-        ts_index: usize,
+        // <insert(udf-args-sigs)>
+        // <insert(node-properties)>
         mut group_by: Vec<usize>,
-    ) -> ClickAna {
+    ) -> Self {
         group_by.sort();
         let out_key = (0..group_by.len()).collect();
-        ClickAna {
+        // <begin(udf-name)>
+        Self
+        // <end(udf-name)>
+            {
             src: src.into(),
 
-            start_cat: start_cat.into(),
-            end_cat: end_cat.into(),
+            // <insert(udf-args)>
 
-            cat_index,
-            ts_index,
+            // <insert(node-property-args)>
 
             local_index: None,
             cols: 0, // Actually initialized in `on_connected`
@@ -142,7 +125,9 @@ impl ClickAna {
         let db = &mut state
             .get_mut(*us)
             .expect("grouped operators must have their own state materialized")
+            // <begin(special-state-coerce-call)>
             .as_click_ana_state()
+            // <end(special-state-coerce-call)>
             .expect("This operator need a special state type")
             .0;
 
@@ -194,9 +179,11 @@ impl ClickAna {
                             computer.apply(ac, pos);
                         }
                         //let v = computer.compute_new_value().into();
-                        // <insert(reduce)>
+                        let v = {
+                            // <insert(reduce)>
+                        };
                         println!("{} Computed {}", idx, v);
-                        v
+                        v.into()
                     };
 
                     let old = rs.value_may();
@@ -232,18 +219,23 @@ impl ClickAna {
                     handle_group(group_rs.drain(..), diffs.drain(..));
                 }
 
-                {
+                let moved_row = {
+                    let r_is_positive = r.is_positive();
                     let
                         // <begin(row-name)>
                         r0
                         // <end(row-name)>
                         = r;
 
-                    // <insert(map)>
-                }
+                    let _ = {
+                        // <insert(map)>
+                    };
+                    // <insert(row-name)>
+
+                };
 
                 //diffs.push((self.run(&r[..]), r.is_positive()));
-                group_rs.push(r);
+                group_rs.push(moved_row);
             }
             assert!(!diffs.is_empty());
             handle_group(group_rs.drain(..), diffs.drain(..));
@@ -259,7 +251,11 @@ impl ClickAna {
     }
 }
 
-impl Ingredient for ClickAna {
+impl Ingredient for
+    // <begin(udf-name)>
+    ClickAna
+    // <end(udf-name)>
+{
     fn take(&mut self) -> NodeOperator {
         Clone::clone(self).into()
     }
@@ -352,155 +348,7 @@ impl Ingredient for ClickAna {
 
     fn make_special_state(&self) -> Option<Box<dyn State>> {
         Option::Some(Box::new(
-            // <insert(make-special-state)>
+            SpecialStateWrapper(MemoryState::default())
         ))
     }
 }
-
-// pub mod itree {
-//     enum Direction {
-//         Left,
-//         Right,
-//     }
-//     enum Span<T> {
-//         Closed {
-//             span: (T, T),
-//         },
-//         HalfOpen {
-//             direction: Direction,
-//             bound: T,
-//         },
-//         Open,
-//     }
-//     pub struct Tree<T,E>(Box<Node<T,E>>);
-//     struct Node<T,E>
-//         {
-//             span: Span<T,E>,
-//             elems: Vec<(T,E)>,
-//             left: Tree<T,E>,
-//             right: Tree<T,E>,
-//         }
-//     pub enum Action<T,E> {
-//         Open(T),
-//         Close(T),
-//         Record(T,E),
-//     }
-
-//     impl <T,E> Node {
-//         fn new(span: Span<T,E>) -> Node<T,E> {
-//             Node::new_with_elems(span, Vec::empty())
-//         }
-//         fn new_with_elems(span: Span<T,E>, elems: Vec<(T,E)>) -> Node<T,E> {
-//             Node { span: span, elems: elems }
-//         }
-//         fn empty() -> Node<T,E> {
-//             Node::Empty
-//         }
-//         fn new_open(elems: Vec<(T,E)>) {
-//             Node::Node{ span: Open, elems: elems }
-//         }
-//     }
-
-//     use std::cmp::Ordering;
-
-//     impl <T> Span {
-
-//         fn contains(&self, e: &T) -> bool {
-//             match *self {
-//                 Open => true,
-//                 HalfOpen { direction: Left, bound } => e <= bound,
-//                 HalfOpen { direction: Right, bound} => bound < e,
-//                 Closed { span: (lower, upper) } => lower <= e && e < upper,
-//             }
-//         }
-
-//         fn is_open(&self) {
-//             match *self {
-//                 Closed{} => false,
-//                 _ => true,
-//             }
-//         }
-//     }
-
-//     fn split_vec<F: Fn(T) -> bool, T>(predicate: F, v: Vec<T>) -> (Vec<T>, Vec<T>) {
-//         let v1 = Vec::new();
-//         let v2 = Vec::new();
-
-//         for i in v.drain(..) {
-//             if predicate(i) {
-//                 v1.push(i)
-//             } else {
-//                 v2.push(i)
-//             }
-//         }
-//         (v1, v2)
-//     }
-
-//     impl <T : std::cmp::Ord,E> Tree {
-//         fn new_node(node: Node<T,E>) -> Tree<T,E> {
-//             Tree(Box::new(node))
-//         }
-//         fn new_half_open(direction: Direction, bound: T) -> Tree<T,E> {
-//             Tree::new_node(
-//                 Node::new(HalfOpen { direction: direction,
-//                                      bound: bound,
-//                                      child: Tree::empty(),
-//                 }))
-//         }
-//         fn empty() -> Tree<T,E> {
-//             Tree::new_node(Node { span: Open, elems: Vec::new()})
-//         }
-//         fn new_open(elems: Vec<(T,E)>) -> Tree<T,E> {
-//             Tree::new_node(Node::new_open(elems))
-//         }
-//         pub fn open_interval(&mut self, bound: T) {
-//             let ref mut elem = self;
-//             loop {
-//                 let node@Node{span, ..} = *elem.0;
-//                 match span {
-
-//                     Option::None => {
-//                         let new_node = match span {
-//                             HalfOpen{ direction: Left, bound: bound0, child } => {
-//                                 let (smaller, larger) = split_vec(|a| a.0 < bound, elems);
-//                                 Tree:new_node(
-//                                     Node::new_with_elems(
-//                                         Span::Closed {
-//                                             span: (bound, bound0),
-//                                             right: child,
-//                                             left: Tree::new_open(smaller),
-//                                         },
-//                                         larger,
-//                                     )
-//                                 );
-//                             },
-//                             HalfOpen { direction: Right, ..} => {
-//                                 let (smaller, larger) = split_vec(|a| a.0 < bound, elems);
-
-//                             },
-//                             Open => {
-//                                 let (smaller, larger) = split_vec(|a| a.0 < bound, elems);
-//                                 Tree::new_node(
-//                                     Node::new_with_elems(
-//                                         HalfOpen {
-//                                             direction: Right,
-//                                             bound: bound,
-//                                             child: Tree::new_open(smaller),
-//                                         },
-//                                         larger,
-//                                     )
-//                                 )
-//                             }
-//                             elem.0 = new_node;
-//                             return;
-//                         },
-//                         Option::Some(child) => {
-//                             elem = child;
-//                         }
-//                     }
-//                 }
-//             }
-
-//         }
-//     }
-// }

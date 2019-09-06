@@ -1,26 +1,16 @@
 resolver: lts-12.10
 packages:
 - .
-- location:
-    # git: https://github.com/ohua-dev/ohua-core
-    # commit: d499652f022be7dc5e1fc58df70949313cacebda
-    ../core
+extra-deps:
+- git: https://github.com/ohua-dev/alang-clike-parser
+  commit: 8d46028ce8c697f7fd8bb2b7bfc9259c961effd7
+- git: https://github.com/ohua-dev/alang-sexpr-parser
+  commit: fdc81f8c8c2fef63e7a306c2a323e3919b0d88ca
+- git: https://github.com/ohua-dev/alang-ml-parser
+  commit: ffb856ac7f60e83689324f8d6b8334bb8f898159
+- git: https://github.com/ohua-dev/ohua-core
+  commit: 19512acf081d80ebdc685867677d8c621c801137
   subdirs: [core]
-  extra-dep: true
-- location:
-    # git: https://github.com/ohua-dev/alang-clike-parser
-    # commit: 6d4c3d2433c3686928f608b0c84a8ad130884f08
-    ../alang-clike-parser
-  extra-dep: true
-- location:
-    git: https://github.com/ohua-dev/alang-sexpr-parser
-    commit: fdc81f8c8c2fef63e7a306c2a323e3919b0d88ca
-  extra-dep: true
-- location:
-    git: https://github.com/ohua-dev/alang-ml-parser
-    commit: ffb856ac7f60e83689324f8d6b8334bb8f898159
-  extra-dep: true
-extra-deps: []
 flags:
   ohuac:
     with-clike-parser: yes

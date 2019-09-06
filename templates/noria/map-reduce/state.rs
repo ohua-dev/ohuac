@@ -1,5 +1,12 @@
+use state::cstate::SpecialStateWrapper;
 
-impl State for super::click_ana::ClickAnaState {
+impl State for
+    SpecialStateWrapper<
+    // <begin(udf-state-type)>
+    super::click_ana::ClickAnaState
+    // <end(udf-state-type)>
+    >
+{
 
     fn add_key(&mut self, columns: &[usize], partial: Option<Vec<Tag>>) {
         self.0.add_key(columns, partial)

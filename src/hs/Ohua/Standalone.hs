@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, ConstraintKinds #-}
+{-# LANGUAGE CPP, ConstraintKinds, ImplicitParams #-}
 module Ohua.Standalone where
 
 import Ohua.Prelude
@@ -84,9 +84,14 @@ type ModMap = HashMap NSRef (MVar ResolvedNamespace)
 type ModTracker = IORef ModMap
 type RawNamespace = Namespace (Fr.Expr)
 type ResolvedNamespace = Namespace Expression
+type PreResolveHook = forall m. CompM m => RawNamespace -> m RawNamespace
 type CompM m
-     = (MonadIO m, MonadBaseControl IO m, MonadError Error m, MonadLogger m)
+     = (MonadIO m, MonadBaseControl IO m, MonadError Error m, MonadLogger m, ?env :: ResolutionEnv)
 type TyAnnMap = HM.HashMap Binding (FunAnn (TyExpr SomeBinding))
+data ResolutionEnv = ResolutionEnv
+    { preResolveHook :: PreResolveHook
+    , modTracker :: ModTracker
+    }
 
 stdNamespace :: (NSRef, [Binding])
 stdNamespace =
@@ -196,9 +201,9 @@ readAndParse filename = do
     pure (anns, ns)
 
 
-gatherDeps :: CompM m => IORef ModMap -> [NSRef] -> m IFaceDefs
-gatherDeps tracker namespaces = do
-    mods <- mapConcurrently (registerAndLoad tracker) namespaces
+gatherDeps :: CompM m => [NSRef] -> m IFaceDefs
+gatherDeps namespaces = do
+    mods <- mapConcurrently registerAndLoad namespaces
     pure $ HM.fromList
         [ (QualifiedBinding (depNamespace ^. NS.name) depName, algo)
         | depNamespace <- mods
@@ -223,27 +228,28 @@ findSourceFile modname = do
     extensions = map (^. _1) definedLangs
 
 
-loadModule :: CompM m => ModTracker -> NSRef -> m ResolvedNamespace
-loadModule tracker modname = do
+loadModule :: CompM m => NSRef -> m ResolvedNamespace
+loadModule modname = do
     filename <- findSourceFile modname
     (_anns, rawMod) <- readAndParse filename
     unless (rawMod ^. name == modname) $
         throwError $
         "Expected module with name " <> show modname <> " but got " <>
         show (rawMod ^. name)
-    loadDepsAndResolve tracker rawMod
+    loadDepsAndResolve rawMod
 
 
 loadDepsAndResolve ::
-       CompM m => ModTracker -> RawNamespace -> m ResolvedNamespace
-loadDepsAndResolve tracker rawMod =
-    join $
-    resolveNS <$> gatherDeps tracker (map fst $ rawMod ^. algoImports) <*>
-    runGenBndT mempty ((decls . traverse) Fr.toAlang rawMod)
+       CompM m => RawNamespace -> m ResolvedNamespace
+loadDepsAndResolve =
+    preResolveHook ?env >=> \rawMod ->
+        join $
+        resolveNS <$> gatherDeps (map fst $ rawMod ^. algoImports) <*>
+        runGenBndT mempty ((decls . traverse) Fr.toAlang rawMod)
 
-registerAndLoad :: CompM m => ModTracker -> NSRef -> m ResolvedNamespace
-registerAndLoad tracker reference =
-    registerAnd tracker reference (loadModule tracker reference)
+registerAndLoad :: CompM m => NSRef -> m ResolvedNamespace
+registerAndLoad reference =
+    registerAnd reference (loadModule reference)
 
 
 insertDirectly ::
@@ -257,16 +263,15 @@ insertDirectly tracker ns = do
     pure nsRef
 
 registerAnd ::
-       (Eq ref, Hashable ref, MonadIO m)
-    => IORef (HashMap ref (MVar load))
-    -> ref
-    -> m load
-    -> m load
-registerAnd tracker reference ac = do
+       (MonadIO m, ?env :: ResolutionEnv)
+    => NSRef
+    -> m ResolvedNamespace
+    -> m ResolvedNamespace
+registerAnd reference ac = do
     newModRef <- liftIO newEmptyMVar
     actualRef <-
         liftIO $
-        atomicModifyIORef' tracker $ \trackerMap ->
+        atomicModifyIORef' (modTracker ?env) $ \trackerMap ->
             case trackerMap ^? ix reference of
                 Just mvar -> (trackerMap, Left mvar)
                 Nothing ->

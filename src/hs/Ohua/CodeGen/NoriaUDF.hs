@@ -13,34 +13,35 @@ module Ohua.CodeGen.NoriaUDF
     , resolveHook
     ) where
 
+import Ohua.Prelude hiding (First)
+
 import Control.Monad.Writer (runWriterT, tell)
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
-import qualified Data.Text as T
 import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
 import qualified System.IO.Temp as Temp
-import Control.Lens (Lens, ix)
+import Control.Lens (ix, (<>=))
 import qualified Data.Text as T
-import qualified Data.Char as C
 import Control.Arrow ((***))
 import Control.Category ((>>>))
 import Ohua.Standalone (PreResolveHook)
+import Control.Monad.RWS (runRWST)
+import Control.Comonad (extract)
 
 import qualified Ohua.Frontend.NS as NS
 import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
-import Ohua.ALang.Util (findFreeVariables, mkLambda)
+import Ohua.ALang.Util (findFreeVariables)
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONObject
 import qualified Ohua.DFGraph as DFGraph
 import Ohua.Helpers.Template (Substitutions, Template)
 import qualified Ohua.Helpers.Template as TemplateHelper
-import Ohua.Prelude
 
 import Paths_ohuac
 
@@ -165,12 +166,10 @@ mkMapFn fields program' stateV coll = do
             fromMaybe (error $ "Use of undeclared field " <> unwrap fi) $
             HashMap.lookup fi fields
         function = "let _ = " <> ppBlock inLoop <> ";"
-        loop =
-            "for" <+> pretty rowName <+> "in" <+> pretty coll <+> ppBlock inLoop
         toRust = Ohua.CodeGen.NoriaUDF.toRust resolveFieldVar isTheState mkAc
         mkAc func' args =
             "diffs.push" <> "((Action::" <> pretty (T.toTitle (unwrap func')) <>
-            (if null args
+            (if null args || args == [Lit UnitLit]
                  then mempty
                  else PP.tupled (map (toRust False) args)) <>
             ", r_is_positive))"
@@ -180,18 +179,27 @@ mkMapFn fields program' stateV coll = do
     isTheState = (== Var stateV)
     (program, rowName) =
         case program' of
-            Lambda rowName program -> (program, rowName)
+            Lambda a b -> (b, a)
             _ ->
                 error $
                 "Expected lambda as input to smap, got " <> quickRender program'
     loopAcessedFields = extractAcessedFields program
 
+refBelongsToState :: a -> Bool
 refBelongsToState = const True
 
+ppBlock :: PP.Doc ann -> PP.Doc ann
 ppBlock e = PP.braces (PP.line <> PP.indent 4 e <> PP.line)
 
 -- I am not sure about this one yet. Potentially the function being called on the state should always be fully qualified
 
+toRust ::
+       ((Binding, Binding) -> Binding)
+    -> (Expr -> Bool)
+    -> (Binding -> [Expr] -> PP.Doc ann)
+    -> Bool
+    -> Expr
+    -> PP.Doc ann
 toRust resolveFieldVar isTheState mkAc isInBlock =
     \case
         Var v -> pretty v
@@ -340,10 +348,12 @@ processUdf ::
     => Fields
     -> QualifiedBinding
     -> Expression
+    -> Binding
+    -> Expression
     -> m FData
-processUdf fields udfName program =
+processUdf fields udfName program state initState =
     case program of
-        Let state initState (Let unit (Smap _ mapF (Var coll)) reduceF)
+        Let unit (Smap _ mapF (Var coll)) reduceF
             | isIgnoredBinding unit -> do
                 (mapFn, rowName) <- mkMapFn fields mapF state coll
                 reduceFn <- mkReduceFn fields state reduceF
@@ -561,22 +571,67 @@ type Fields = HashMap.HashMap Binding Text
 
 generateNoriaUDFs :: Fields -> AddUDF -> Expression -> OhuaM env Expression
 generateNoriaUDFs fields addUdf program = do
+    logInfoN $ "Complete expression for compilation\n" <> quickRender program
     (program', udfs) <-
-        let f =
-                sequence >=> \case
-                    e@(LetF v _ _)
-                        | v `HashSet.member` stateVals -> do
-                            let e' = RS.embed e
-                            fname <- generateBindingWith "udf"
-                            let name = QualifiedBinding GenFuncsNamespace fname
-                            tell [ (e', fname, name) ]
-                            --mkLambda freeVars <$>
-                            newFunctionCall name
-                    e -> pure $ RS.embed e
-         in runWriterT $ RS.cata f program
-    for_ @[_] udfs $ \(e, fname, name) -> do
-        liftIO .
-            addUdf =<< processUdf fields name e
+        let mempty' = mempty @(Dual (Endo Expr), HashSet.HashSet Binding)
+            tellRet var = tell $ mempty' & _2 .~ HashSet.singleton var
+            tellUdfE f = tell $ mempty' & _1 .~ Dual (Endo f)
+            getDeps = map expectVarE . findFreeVariables
+            go st (LetF v (oldExpr, expr) (extract -> body))
+                | v == st =
+                    error $
+                    "Invariant broken, state init happened in scope for " <>
+                    show st
+                | otherwise = do
+                    body' <- body
+                    let contNormal e = _2 <>= eDeps >> pure (Let v e body')
+                    (udfDeps, exprDeps) <- get
+                    if exprUsesState || v `HashSet.member` udfDeps
+                        then do
+                            tellUdfE (Let v oldExpr)
+                            _1 <>= eDeps
+                            if v `HashSet.member` exprDeps
+                                then if exprUsesState
+                                         then tellRet v >> pure body'
+                                         else contNormal oldExpr
+                                else pure body'
+                        else contNormal =<< expr
+              where
+                exprUsesState =
+                    or [s == Var st | BindState s _ <- universe oldExpr]
+                eDeps = HashSet.fromList $ getDeps oldExpr
+            go _ e'' = RS.embed <$> traverse extract e''
+         in runWriterT $
+            transformM
+                (\case
+                     Let st initExpr body
+                         | st `HashSet.member` stateVals -> do
+                             (e', _, (Dual (Endo mut), rets)) <-
+                                 runRWST (RS.para (go st) body) () mempty
+                             bnd <- generateBindingWith ("udf_" <> st)
+                             let udfName =
+                                     QualifiedBinding GenFuncsNamespace bnd
+                                 v'
+                                     | [i] <- rets = i
+                                     | otherwise =
+                                         error $
+                                         "Too many returns from udf " <>
+                                         show rets
+                                 udf = mut $ Var v'
+                                 freeVars =
+                                     filter (/= Var st) $ findFreeVariables udf
+                             logInfoN $
+                                 "Found udf function " <> quickRender udfName <>
+                                 "\n" <>
+                                 quickRender (Let st initExpr udf)
+                             tell [(bnd, udfName, udf, st, initExpr)]
+                             expr' <- newFunctionCall udfName
+                             pure $ Let v' (foldl Apply expr' freeVars) e'
+                     e -> pure e)
+                program
+    logInfoN $ "Remaining program\n" <> quickRender program'
+    for_ @[_] udfs $ \(_, udfName, e, st, initExpr) ->
+        liftIO . addUdf =<< processUdf fields udfName e st initExpr
     pure program'
   where
     globalVals = HashSet.fromList $ RS.cata f program

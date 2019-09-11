@@ -51,6 +51,7 @@ dependencies:
 - lens
 - monad-control
 - prettyprinter
+- comonad
 library:
   source-dirs: src/hs
   dependencies:

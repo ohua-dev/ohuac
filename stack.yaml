@@ -2,15 +2,17 @@ resolver: lts-12.10
 packages:
 - .
 extra-deps:
-- git: https://github.com/ohua-dev/alang-clike-parser
+- github: ohua-dev/alang-clike-parser
   commit: 8d46028ce8c697f7fd8bb2b7bfc9259c961effd7
-- git: https://github.com/ohua-dev/alang-sexpr-parser
+- github: ohua-dev/alang-sexpr-parser
   commit: fdc81f8c8c2fef63e7a306c2a323e3919b0d88ca
-- git: https://github.com/ohua-dev/alang-ml-parser
+- github: ohua-dev/alang-ml-parser
   commit: ffb856ac7f60e83689324f8d6b8334bb8f898159
-- git: https://github.com/ohua-dev/ohua-core
+- github: ohua-dev/ohua-core
   commit: 19512acf081d80ebdc685867677d8c621c801137
   subdirs: [core]
+- github: JustusAdam/fgl
+  commit: 9e0c7e6c5ef86642b463a5942c822cab2c0c0475
 flags:
   ohuac:
     with-clike-parser: yes

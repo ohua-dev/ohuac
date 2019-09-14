@@ -9,7 +9,7 @@ github: ohua-dev/ohuac
 extra-source-files:
 - README.md
 data-files:
-- templates/noria/*/*.rs
+- templates/noria/**/*.rs
 default-extensions:
 - OverloadedStrings
 - OverloadedLists
@@ -51,7 +51,6 @@ dependencies:
 - lens
 - monad-control
 - prettyprinter
-- comonad
 library:
   source-dirs: src/hs
   dependencies:
@@ -65,6 +64,8 @@ library:
   - language-java
   - attoparsec
   - temporary
+  - fgl
+  - comonad
   when:
     - condition: flag(with-clike-parser)
       dependencies:

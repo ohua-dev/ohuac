@@ -227,7 +227,6 @@ main = do
                                              mapMaybe
                                                  (\case
                                                       Other "declare-field" f ->
-                                                          traceShow f $
                                                           Just $
                                                           NoriaUDFGen.parseFieldPragma
                                                               f

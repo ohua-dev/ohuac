@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeApplications, MultiWayIf #-}
 module Ohua.CodeGen.NoriaUDF
     ( generate
     , generateNoriaUDFs
@@ -13,8 +13,9 @@ module Ohua.CodeGen.NoriaUDF
     , resolveHook
     ) where
 
-import Ohua.Prelude hiding (First)
+import Ohua.Prelude hiding (First, Identity)
 
+import Prelude ((!!))
 import Control.Monad.Writer (runWriterT, tell)
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HashMap
@@ -25,14 +26,21 @@ import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
 import qualified System.IO.Temp as Temp
-import Control.Lens (ix, (<>=))
+import Control.Lens (ix, (<>=), to, (^..), (%=), (^?!))
 import qualified Data.Text as T
+import qualified Data.Text.Lazy.Encoding as LT
+import qualified Data.Text.Lazy as LT
 import Control.Arrow ((***))
 import Control.Category ((>>>))
 import Ohua.Standalone (PreResolveHook)
 import Control.Monad.RWS (runRWST)
 import Control.Comonad (extract)
+import qualified Data.Foldable
+import qualified Data.IntMap as IM
+import qualified Data.IntSet as IS
+import Data.Maybe (fromJust)
 
+import qualified Ohua.Helpers.Graph as GR
 import qualified Ohua.Frontend.NS as NS
 import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
@@ -298,6 +306,7 @@ toRust resolveFieldVar isTheState mkAc isInBlock =
                     "Multiple states and renaming aren't supported yet " <>
                     show st
             _ -> error $ "Unexpected function expression " <> quickRender func
+
 class ToRust t where
     asRust :: t -> PP.Doc ann
 
@@ -305,7 +314,10 @@ instance ToRust NSRef where
     asRust = PP.hcat . intersperse "::" . map (pretty . unwrap ) . unwrap
 
 instance ToRust QualifiedBinding where
-    asRust b = asRust (b ^. namespace) <> "::" <> pretty (unwrap $ b ^. name)
+    asRust b = asRust (b ^. namespace) <> "::" <> asRust (b ^. name)
+
+instance ToRust Binding where
+    asRust = pretty . unwrap
 
 asRustT :: ToRust a => a -> Text
 asRustT = renderDoc . asRust
@@ -457,9 +469,247 @@ udfFileToPathThing pt qname finalPart =
             FilePath -> "/"
             ModPath -> "::"
 
+
+type Column = (Int, Int)
+
+data Context
+    = GroupBy [Column]
+    | SmapC
+
+data Operator
+    = CustomOp QualifiedBinding
+    | Join { joinOn :: [Context] }
+    | Projection [Column]
+    | Identity
+
+isJoin :: Operator -> Bool
+isJoin Join{} = True
+isJoin _ = False
+
+groupOnInt :: [(a, Int)] -> [([a], Int)]
+groupOnInt = fmap swap . IM.toList . IM.fromListWith (++) . fmap (second pure) . fmap swap
+
+-- TODO
+-- - Annotate completely with fields
+-- - Rewrite multi-input to join, if not same source operator
+-- - Rewrite nth to field index
+-- - Handle group_by, smap and such
+-- - Rewrite literals to projection
+-- - Do final projection
+annotateAndRewriteQuery :: DFGraph.OutGraph -> GR.Gr QualifiedBinding (Int, Int)
+annotateAndRewriteQuery graph =
+    iGr & removeSuperfluousOperators & collapseNth & dropMkTuple &
+    collapseMultiArcs &
+    retype & \gr ->
+        let g = mkContextMap gr
+         in multiArcToJoin g gr
+    -- TODO Actually, its better to put the indices as edge labels. Means I have
+    -- to group when inserting the joins, but I don't have to keep adjusting the
+    -- operator Id's for the Target's
+  where
+    iGr :: GR.Gr QualifiedBinding (Int, Int)
+    iGr =
+        GR.mkGraph
+            (map (first unwrap) $
+             (sourceId, "intrinsic/source") :
+             (sinkId, "intrinsic/sink") :
+             map
+                 (\DFGraph.Operator {..} -> (operatorId, operatorType))
+                 operators)
+            [ ( unwrap $ DFGraph.operator s
+              , unwrap $ DFGraph.operator t
+              , (DFGraph.index s, DFGraph.index t))
+            | DFGraph.Arc t (DFGraph.LocalSource s) <- arcs
+            ]
+    sourceId = -1
+    sinkId = -2
+    sinkArc = DFGraph.Arc (DFGraph.Target sinkId 0) (DFGraph.returnArc graph)
+    envInputs = mkLitMap arcs
+    operators = DFGraph.operators graph
+    arcs = DFGraph.direct $ DFGraph.arcs graph
+
+type LitMap = IntMap [(Int, Lit )]
+
+mkLitMap :: [DFGraph.DirectArc Lit] -> LitMap
+mkLitMap arcs =
+    IM.fromListWith
+        (++)
+        [ (unwrap $ DFGraph.operator t, [(DFGraph.index t, l)])
+        | DFGraph.Arc t (DFGraph.EnvSource l) <- arcs
+        ]
+
+type Rewrite a = a -> a
+type RewriteS gr = State (gr, GR.Node)
+
+stateful :: (gr ~ NoriaGraph vertexLabels edgeLabels) =>  RewriteS gr a -> Rewrite gr
+stateful f gr = fst $ execState f (gr, succ $ snd $ GR.nodeRange gr)
+
+getNodesOfType :: (opLabel -> Bool) -> RewriteS (NoriaGraph opLabel a) [GR.Node]
+getNodesOfType f = gets (map fst . filter (f . snd) . GR.labNodes . fst)
+
+sDelNode :: GR.Node -> RewriteS (NoriaGraph vertexLabel edgeLabel) ()
+sDelNode node = modify (first $ GR.delNode node)
+
+sGetContext :: GR.Node -> RewriteS (NoriaGraph opLabel edgeLabel) (GR.Context opLabel edgeLabel)
+sGetContext node = gets (flip GR.context node . fst)
+
+sInsEdge :: GR.LEdge edgeLabel -> RewriteS (NoriaGraph vertexLabel edgeLabel) ()
+sInsEdge edge = modify (first $ GR.insEdge edge)
+
+collapseMultiArcs :: NoriaGraph opLabel edgeLabel -> NoriaGraph opLabel [edgeLabel]
+collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
+
+collapseNth :: LitMap -> Rewrite (NoriaGraph QualifiedBinding Column)
+collapseNth envInputs =
+    stateful $ do
+        nthNodes <- getNodesOfType (== "ohua.lang/nth")
+        for_ nthNodes $ \node -> do
+            ([((0, 0), inOp)], _, _, outs) <- sGetContext node
+            let [(0, NumericLit (fromIntegral -> idx))] = envInputs IM.! node
+            sDelNode node
+            for_ outs $ \((0, inIdx), tOp) -> do
+                sInsEdge (inOp, tOp, (idx, inIdx))
+
+dropMkTuple :: Rewrite ( NoriaGraph QualifiedBinding Column  )
+dropMkTuple =
+    stateful $ do
+        mkTupNodes <- getNodesOfType (== "ohua.lang/(,)")
+        for_ mkTupNodes $ \node -> do
+            (ins, _, _, outs) <- sGetContext node
+            let inMap' =
+                    sortOn fst $
+                    [ (inIdx, (outIdx, source))
+                    | ((outIdx, inIdx), source) <- ins
+                    ]
+            assertM $ and [i == i' | (i, (i', _)) <- zip [0 ..] inMap']
+            let inMap = map snd inMap'
+            sDelNode node
+            for_ outs $ \((outIdx, inIdx), target) ->
+                let (sIdx, sOp) = inMap !! outIdx
+                 in sInsEdge (sOp, target, (sIdx, inIdx))
+
+mkContextMap :: MirGraph -> ContextMap
+mkContextMap gr = m
+  where
+    m =
+        IM.fromList
+            [ ( n
+              , ownCtx $
+                maximumBy (compare `on` length) $ map (m IM.!) $ map snd pre)
+            | n <- GR.nodes gr
+            , let (pre, _, label, _) = GR.context gr n
+                  ownCtx =
+                      case label of
+                          "ohua.sql/group_by" ->
+                              let (_:cols) = reverse $ sortOn snd $ pre >>= fst
+                               in (GroupBy (reverse cols) :)
+                          "ohua.lang/smap" -> (SmapC :)
+                          _ -> id
+            ]
+
+retype :: NoriaGraph QualifiedBinding b -> NoriaGraph Operator b
+retype g =
+    GR.lnmap
+        (\(i, l) ->
+             case l ^. _1 of
+                 a -> l & _1 .~ CustomOp a)
+        g
+
+type ContextMap = IntMap [Context]
+type NoriaGraph opLabel edgeLabel = GR.Gr opLabel edgeLabel
+type MirGraph = NoriaGraph Operator [Column]
+
+multiArcToJoin :: IntMap [Context] -> Rewrite MirGraph
+multiArcToJoin ctxMap =
+    stateful $
+    gets fst >>= \gr ->
+        for_ (GR.nodes gr) $ \node -> do
+            (preds, _, lab, _) <- gets (flip GR.context node)
+            unless (isJoin (lab ^. _1) || null preds) $ do
+                npid <- handle preds
+                (in_, n, lab, out) <-
+                    state
+                        (\(s, i) ->
+                             let (Just ctx, g') = GR.match node s
+                              in (ctx, (g', i)))
+                let changeSource =
+                        \case
+                            DFGraph.LocalSource l ->
+                                DFGraph.LocalSource
+                                    l {DFGraph.operator = makeThrow npid}
+                            o -> o
+                _1 %=
+                    (( [((0, 0), npid)]
+                     , n
+                     , lab & _2 %~ fmap (second changeSource)
+                     , out) GR.&)
+  where
+    getCtx = pure . fromJust . flip IM.lookup ctxMap
+    getLabel n = gets (\(g, _) -> fromJust $ GR.lab g n)
+    mkNode lab = state (\(gr, i) -> (i, (GR.insNode (i, lab) gr, succ i)))
+    handle [x] = pure x
+    handle ((p1, p1Cols):ps) = do
+        p2 <- handle ps
+        ctx1 <- getCtx p1
+        ctx2 <- getCtx p2
+        (_, cols, ctx2) <- getLabel p2
+        let (lowerCtx, upperCtx) =
+                if length ctx1 > length ctx2
+                    then (ctx2, ctx1)
+                    else (ctx1, ctx2)
+        id <- mkNode (Join lowerCtx)
+        modify (first $ GR.insEdges [(p1, id, p1Cols), (p2, id, p2Cols)])
+        pure id
+
 generate :: CodeGen
-generate = JSONObject.generate
-    -- Assumes, for the time being, that state scope does not overlap
+generate CodeGenData {..} = do
+    tpl <- loadNoriaTemplate "udf_graph.rs"
+    tpl' <-
+        TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
+    patchFile
+        Nothing
+        (noriaDataflowSourceDir <> "/udfs/mod.rs")
+        [ "graph-mods" ~> ["mod " <> unwrap entryPointName <> "_graph;"]
+        , "graph-dispatch" ~>
+          [ "\"" <> unwrap entryPointName <> "\" => " <> unwrap entryPointName <>
+            "_graph::graph,"
+          ]
+        ]
+    pure (sugg, LT.encodeUtf8 $ LT.fromStrict tpl')
+  where
+    iGr = annotateAndRewriteQuery graph
+    sugg =
+        noriaDataflowSourceDir <> "/udfs/" <> unwrap entryPointName <>
+        "_graph.rs"
+    subs = ["operators" ~> [rustOps]]
+    rustOps =
+        renderDoc $
+        "vec!" <>
+        PP.list
+            [ PP.tupled
+                [ PP.dquotes $ asRust $ opTy ^. namespace
+                , PP.dquotes $ asRust $ opTy ^. name
+                , listLinks snd in_
+                , listLinks fst out
+                ]
+            | (in_, _, opTy, out) <-
+                  map (GR.context iGr) $
+                  drop 2 $
+                  GR.listTopo iGr
+            ]
+      where
+        listLinks f = asVec . map idxToRust . sortOn (f . fst)
+          where
+            idxToRust (indices, op) =
+                "(Index::" <> sourceType <> "," <> pretty (f indices) <> ")"
+              where
+                sourceType =
+                    case op of
+                        -1 -> "Source"
+                        -2 -> "Sink"
+                        n -> "Local"
+        asVec v = "vec!" <> PP.list v
+
 
 mkStateTraitCoercionFunc :: QualifiedBinding -> QualifiedBinding -> Text -> [ Text ]
 mkStateTraitCoercionFunc udfName stateName impl =
@@ -478,23 +728,26 @@ mkOpStructName udfName = T.toTitle (unwrap $ udfName ^. name)
 mkNodePath udfName =
     udfFileToPathThing ModPath udfName [mkOpStructName udfName]
 
+noriaDataflowSourceDir :: IsString s => s
 noriaDataflowSourceDir = "noria-server/dataflow/src"
+
+patchFile :: ( MonadIO m, MonadLogger m) => Maybe FilePath -> FilePath -> Substitutions -> m ()
+patchFile mOutDir file subs = do
+    tmpl <- TemplateHelper.parseTemplate <$> readFile file
+    writeF file =<<
+        TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tmpl subs
+  where
+    writeF =
+        flip (maybe writeFile) mOutDir $ \dir filename content ->
+            liftIO $ outputFile (dir FP.</> filename) content
+
 
 
 -- TODO create the state impls in map-reduce/state.rs needs sub key "state-trait-coerce-impls"
 patchFiles :: (MonadIO m, MonadLogger m) => Maybe FilePath -> [FData] -> m ()
 patchFiles mOutDir udfs =
-    for_ (HashMap.toList fileMap) $ \(file, subs) -> do
-        tmpl <- TemplateHelper.parseTemplate <$> readFile file
-        writeF file =<<
-            TemplateHelper.sub
-                TemplateHelper.Opts {preserveSpace = True}
-                tmpl
-                subs
+    mapM_ (uncurry $ patchFile mOutDir) (HashMap.toList fileMap)
   where
-    writeF =
-        flip (maybe writeFile) mOutDir $ \dir filename content ->
-            liftIO $ outputFile (dir FP.</> filename) content
     toMap = HashMap.fromListWith (HashMap.unionWith (<>))
     fileMap =
         toMap $ flip concatMap udfs $ \FData {..} ->
@@ -608,7 +861,7 @@ generateNoriaUDFs fields addUdf program = do
                          | st `HashSet.member` stateVals -> do
                              (e', _, (Dual (Endo mut), rets)) <-
                                  runRWST (RS.para (go st) body) () mempty
-                             bnd <- generateBindingWith ("udf_" <> st)
+                             bnd <- generateBindingWith ("op_" <> st)
                              let udfName =
                                      QualifiedBinding GenFuncsNamespace bnd
                                  v'
@@ -621,7 +874,7 @@ generateNoriaUDFs fields addUdf program = do
                                  freeVars =
                                      filter (/= Var st) $ findFreeVariables udf
                              logInfoN $
-                                 "Found udf function " <> quickRender udfName <>
+                                 "Found operator function " <> quickRender udfName <>
                                  "\n" <>
                                  quickRender (Let st initExpr udf)
                              tell [(bnd, udfName, udf, st, initExpr)]
@@ -657,20 +910,37 @@ outputFile path content =
         createDirectoryIfMissing True (FP.takeDirectory path)
         writeFile path content
 
-noriaUdfExtraProcessing ::
-       (MonadError Error m, MonadIO m, MonadLogger m) => Bool -> [FData] -> m ()
-noriaUdfExtraProcessing useSandbox udfs = do
+doTheGenerating :: (MonadIO m, MonadLogger m, Foldable f) => (FilePath -> FilePath) -> f GenerationType -> m ()
+doTheGenerating scopePath toGen = do
     templates <-
         HashMap.fromList <$>
         sequence
-            [ (t, ) <$> loadTemplate t
-            | udf <- udfs
-            , TemplateSubstitution t _ _ <- generations udf
+            [ (t, ) <$> loadNoriaTemplate t
+            | TemplateSubstitution t _ _ <- Data.Foldable.toList toGen
             ]
     let getTemplate t =
             fromMaybe
                 (error $ "Invariant broken, template not found " <> toText t) $
             HashMap.lookup t templates
+    Data.Foldable.for_ toGen $ \case
+            TemplateSubstitution t (scopePath -> path) subs ->
+                outputFile path =<<
+                TemplateHelper.sub
+                    TemplateHelper.Opts {preserveSpace = True}
+                    (getTemplate t)
+                    subs
+            GenerateFile (scopePath -> path) content ->
+                liftIO $ writeFile path content
+
+loadNoriaTemplate :: MonadIO m => FilePath -> m [TemplateHelper.Rep]
+loadNoriaTemplate t =
+    liftIO $ do
+        path <- getDataFileName $ "templates/noria" FP.</> t
+        TemplateHelper.parseTemplate <$> readFile path
+
+noriaUdfExtraProcessing ::
+       (MonadError Error m, MonadIO m, MonadLogger m) => Bool -> [FData] -> m ()
+noriaUdfExtraProcessing useSandbox udfs = do
     outDir <-
         if useSandbox
             then do
@@ -680,16 +950,7 @@ noriaUdfExtraProcessing useSandbox udfs = do
                 pure $ Just fp
             else pure Nothing
     let scopePath = maybe id (FP.</>) outDir
-    for_ udfs $ \FData {..} ->
-        for_ generations $ \case
-            TemplateSubstitution t (scopePath -> path) subs ->
-                outputFile path =<<
-                TemplateHelper.sub
-                    TemplateHelper.Opts {preserveSpace = True}
-                    (getTemplate t)
-                    subs
-            GenerateFile (scopePath -> path) content ->
-                liftIO $ writeFile path content
+    doTheGenerating scopePath (udfs >>= generations)
     for_ (["ops", "state"] :: [FilePath]) $ \d ->
         outputFile
             (scopePath $
@@ -699,10 +960,6 @@ noriaUdfExtraProcessing useSandbox udfs = do
         map (\u -> "pub mod " <> unwrap (udfName u ^. name) <> ";") udfs
     patchFiles outDir udfs
   where
-    loadTemplate t =
-        liftIO $ do
-            path <- getDataFileName $ "templates/noria" FP.</> t
-            TemplateHelper.parseTemplate <$> readFile path
     createSysTempDir pat =
         Temp.getCanonicalTemporaryDirectory >>= \sysd ->
             Temp.createTempDirectory sysd pat

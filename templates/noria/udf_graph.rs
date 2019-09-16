@@ -1,9 +1,10 @@
+use crate::node::MirNodeType;
 
-
-const graph : super::UDFGraph = super::UDFGraph {
-    nodes:
-    // <begin(operators)>
-    vec![]
-    // <end(operators)>
-        ,
-};
+pub fn mk_graph() -> super::UDFGraph {
+    // <begin(graph)>
+    super::UDFGraph {
+        adjacency_list: vec![],
+        sink: (0, vec![]),
+    }
+    // <end(graph)>
+}

@@ -1,11 +1,12 @@
-use state::cstate::SpecialStateWrapper;
+use prelude::*;
+use state::cstate::{ SpecialStateWrapper, MemoElem };
 
 impl State for
-    SpecialStateWrapper<
+    SpecialStateWrapper<MemoElem<
     // <begin(udf-state-type)>
     super::click_ana::ClickAnaState
     // <end(udf-state-type)>
-    >
+    >>
 {
 
     fn add_key(&mut self, columns: &[usize], partial: Option<Vec<Tag>>) {

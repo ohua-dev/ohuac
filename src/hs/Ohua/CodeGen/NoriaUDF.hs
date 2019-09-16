@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeApplications, MultiWayIf #-}
+{-# LANGUAGE TypeApplications, MultiWayIf, ConstraintKinds #-}
 
 module Ohua.CodeGen.NoriaUDF
     ( generate
@@ -19,7 +19,7 @@ import Ohua.Prelude hiding (First, Identity)
 import Control.Arrow ((***))
 import Control.Category ((>>>))
 import Control.Comonad (extract)
-import Control.Lens ((%=), (<>=), (^..), (^?!), ix, to)
+import Control.Lens (Simple, (%=), (<>=), (^..), (^?!), ix, to, use)
 import Control.Monad.RWS (runRWST)
 import Control.Monad.Writer (runWriterT, tell)
 import qualified Data.Foldable
@@ -378,7 +378,7 @@ processUdf fields udfName program state initState =
                             [ "udf-name" ~>
                               [T.toTitle $ unwrap $ udfName ^. name]
                             , "map" ~>
-                              ["use " <> stateTypeStr <> "::Action;", mapFn]
+                              ["use " <> stateNSStr <> "::Action;", mapFn]
                             , "reduce" ~> [reduceFn]
                             , "row-name" ~> [unwrap rowName]
                             , "special-state-coerce-call" ~>
@@ -397,15 +397,8 @@ processUdf fields udfName program state initState =
                             , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
                             ]
                     stateType = getStateType initState
-                    stateTypeStr =
-                        asRustT $ (getStateType initState ^. namespace) &
-                        unwrapped @NSRef .
-                        asNonEmpty %~
-                        init &
-                        unwrapped @NSRef .
-                        ix 0 %~ \case
-                            "dataflow" -> "crate"
-                            i -> i
+                    stateTypeStr = asRustT $ stateType ^.namespace
+                    stateNSStr = asRustT $ unwrapped @NSRef . asNonEmpty %~ init $ stateType ^. namespace
                     stateSub =
                         TemplateSubstitution
                             "map-reduce/state.rs"
@@ -419,9 +412,10 @@ processUdf fields udfName program state initState =
                                   "Option::Some(self)"
                             , "udf-state-type" ~> [stateTypeStr]
                             ]
-                logDebugN $ unlines $ "Acessed fields:" :
-                    map show accessedFields
-                logInfoN $ "UDF " <> show udfName <> " callable with " <>
+                logDebugN $
+                    unlines $ "Acessed fields:" : map show accessedFields
+                logInfoN $
+                    "UDF " <> show udfName <> " callable with " <>
                     renderDoc
                         (pretty (udfName ^. name) <>
                          PP.tupled (map (pretty . snd) accessedFields))
@@ -473,54 +467,77 @@ udfFileToPathThing pt qname finalPart =
 type Column = (Int, Int)
 
 data Context =
-    GroupBy [Column]
+    GroupBy [Word]
     -- | SmapC   -- Add this eventually
+    deriving (Show)
 
 data Operator
     = CustomOp QualifiedBinding
     | Join { joinOn :: [Context] }
     | Projection [Column]
     | Identity
+    | Zip
+    | Sink
+    | Source
+    deriving (Show)
 
 isJoin :: Operator -> Bool
 isJoin Join {} = True
 isJoin _ = False
+
+isSink :: Operator -> Bool
+isSink Sink = True
+isSink _ = False
 
 groupOnInt :: [(a, Int)] -> [([a], Int)]
 groupOnInt =
     fmap swap . IM.toList . IM.fromListWith (++) . fmap (second pure) .
     fmap swap
 
+traceGr :: (Show a, Show b) => String -> GR.Gr a b -> GR.Gr a b
+traceGr msg gr = gr `seq` trace (msg <> "\n" <> GR.prettify gr) gr
+
 -- TODO
--- - Annotate completely with fields
--- - Rewrite multi-input to join, if not same source operator
--- - Rewrite nth to field index
--- - Handle group_by, smap and such
 -- - Rewrite literals to projection
 -- - Do final projection
-annotateAndRewriteQuery :: DFGraph.OutGraph -> MirGraph
-annotateAndRewriteQuery graph =
-    iGr & collapseNth envInputs & dropMkTuple & \gr ->
-        let g = mkContextMap gr
-         in gr & retype & removeSuperfluousOperators & collapseMultiArcs &
-            multiArcToJoin g
+annotateAndRewriteQuery ::
+       MonadLogger m => DFGraph.OutGraph -> m (ContextMap, MirGraph)
+annotateAndRewriteQuery graph = do
+    let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
+    s1 <- flip execStateT s0 $ collapseNth envInputs
+    let g = mkContextMap envInputs (fst s1)
+    logInfoN $ "Context Map\n" <> show g
+    (gr2, i2) <- execStateT removeSuperfluousOperators (first retype s1)
+    (gr1, _, g2) <-
+        flip execStateT (collapseMultiArcs gr2, i2, g) $ multiArcToJoin g
+    pure (g2, gr1)
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
   where
     iGr :: GR.Gr QualifiedBinding (Int, Int)
     iGr =
+        traceGr "Initial Graph" $
         GR.mkGraph
             (map (first unwrap) $ (sourceId, "intrinsic/source") :
              (sinkId, "intrinsic/sink") :
              map
                  (\DFGraph.Operator {..} -> (operatorId, operatorType))
-                 operators)
-            [ ( unwrap $ DFGraph.operator s
-              , unwrap $ DFGraph.operator t
-              , (DFGraph.index s, DFGraph.index t))
-            | DFGraph.Arc t (DFGraph.LocalSource s) <- arcs
-            ]
+                 operators) $
+        ( unwrap $ DFGraph.operator $ DFGraph.returnArc graph
+        , unwrap sinkId
+        , (DFGraph.index $ DFGraph.returnArc graph, 0)) :
+        [ ( unwrap $ DFGraph.operator s
+          , unwrap $ DFGraph.operator t
+          , (DFGraph.index s, DFGraph.index t))
+        | DFGraph.Arc t (DFGraph.LocalSource s) <- arcs
+        ] ++
+        mainArgs
+    mainArgs =
+        [ (unwrap sourceId, unwrap operator, (unwrap i, index))
+        | DFGraph.Arc DFGraph.Target {..} (DFGraph.EnvSource (EnvRefLit i)) <-
+              arcs
+        ]
     sourceId = -1
     sinkId = -2
     sinkArc = DFGraph.Arc (DFGraph.Target sinkId 0) (DFGraph.returnArc graph)
@@ -535,97 +552,134 @@ mkLitMap arcs =
     IM.fromListWith
         (++)
         [ (unwrap $ DFGraph.operator t, [(DFGraph.index t, l)])
-        | DFGraph.Arc t (DFGraph.EnvSource l) <- arcs
+        | DFGraph.Arc t (DFGraph.EnvSource l') <- arcs
+        , l <-
+              case l' of
+                  EnvRefLit {} -> []
+                  l'' -> [l'']
         ]
 
 type Rewrite a = (a -> a)
 
-type RewriteS gr = State (gr, GR.Node)
+type Field1' a b = Simple Field1 a b
 
-stateful :: (gr ~ NoriaGraph opLabel edgeLabel) => RewriteS gr a -> Rewrite gr
-stateful f gr = fst $ execState f (gr, succ $ snd $ GR.nodeRange gr)
+type Field2' a b = Simple Field2 a b
 
-getNodesOfType :: (opLabel -> Bool) -> RewriteS (NoriaGraph opLabel a) [GR.Node]
-getNodesOfType f = gets (map fst . filter (f . snd) . GR.labNodes . fst)
+type Field3' a b = Simple Field3 a b
 
-sDelNode :: GR.Node -> RewriteS (NoriaGraph vertexLabel edgeLabel) ()
-sDelNode node = modify (first $ GR.delNode node)
+type Field4' a b = Simple Field4 a b
+
+type GetGraph g a b s m
+     = (MonadState s m, Field1 s s (g a b) (g a b), GR.DynGraph g)
+
+getNodesOfType :: GetGraph g opLabel a s m => (opLabel -> Bool) -> m [GR.Node]
+getNodesOfType f = use $ _1 . to (map fst . filter (f . snd) . GR.labNodes)
+
+sDelNode :: GetGraph g vertexLabel edgeLabel s m => GR.Node -> m ()
+sDelNode node = _1 %= (GR.delNode node)
 
 sGetContext ::
-       GR.Node
-    -> RewriteS (NoriaGraph opLabel edgeLabel) (GR.Context opLabel edgeLabel)
-sGetContext node = gets (flip GR.context node . fst)
+       GetGraph g opLabel edgeLabel s m
+    => GR.Node
+    -> m (GR.Context opLabel edgeLabel)
+sGetContext node = use $ _1 . to (flip GR.context node)
 
-sInsEdge :: GR.LEdge edgeLabel -> RewriteS (NoriaGraph vertexLabel edgeLabel) ()
-sInsEdge edge = modify (first $ GR.insEdge edge)
+sInsEdge :: GetGraph g a b s m => GR.LEdge b -> m ()
+sInsEdge edge = _1 %= GR.insEdge edge
 
 collapseMultiArcs ::
        NoriaGraph opLabel edgeLabel -> NoriaGraph opLabel [edgeLabel]
 collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
 
-collapseNth :: LitMap -> Rewrite (NoriaGraph QualifiedBinding Column)
-collapseNth envInputs =
-    stateful $ do
-        nthNodes <- getNodesOfType (== "ohua.lang/nth")
-        for_ nthNodes $ \node -> do
-            ([((0, 0), inOp)], _, _, outs) <- sGetContext node
-            let [(0, NumericLit (fromIntegral -> idx))] = envInputs IM.! node
-            sDelNode node
-            for_ outs $ \((0, inIdx), tOp) -> sInsEdge (inOp, tOp, (idx, inIdx))
+collapseNth :: GetGraph g QualifiedBinding Column s m => LitMap -> m ()
+collapseNth envInputs = do
+    nthNodes <- getNodesOfType (== "ohua.lang/nth")
+    for_ nthNodes $ \node -> do
+        ([((0, 0), inOp)], _, _, outs) <- sGetContext node
+        let [(0, NumericLit (fromIntegral -> idx))] = envInputs IM.! node
+        sDelNode node
+        for_ outs $ \((0, inIdx), tOp) -> sInsEdge (inOp, tOp, (idx, inIdx))
 
-dropMkTuple :: Rewrite (NoriaGraph QualifiedBinding Column)
-dropMkTuple = dropNodes (== "ohua.lang/(,)")
+dropNodes :: GetGraph g a Column s m => (a -> Bool) -> m ()
+dropNodes f =
+    dropNodesProjecting
+        (\n ->
+             if f n
+                 then Just id
+                 else Nothing)
 
-dropNodes :: (opLabel -> Bool) -> Rewrite (NoriaGraph opLabel Column)
-dropNodes pred =
-    stateful $ do
-        mkTupNodes <- getNodesOfType pred
-        for_ mkTupNodes $ \node -> do
-            (ins, _, _, outs) <- sGetContext node
-            let inMap' =
-                    sortOn
-                        fst
-                        [ (inIdx, (outIdx, source))
-                        | ((outIdx, inIdx), source) <- ins
-                        ]
-            assertM $ and [i == i' | (i, (i', _)) <- zip [0 ..] inMap']
-            let inMap = map snd inMap'
-            sDelNode node
-            for_ outs $ \((outIdx, inIdx), target) ->
-                let (sIdx, sOp) = inMap !! outIdx
-                 in sInsEdge (sOp, target, (sIdx, inIdx))
+dropNodesProjecting ::
+       GetGraph g a Column s m => (a -> Maybe (Int -> Int)) -> m ()
+dropNodesProjecting pred = do
+    mkTupNodes <- getNodesOfType (isJust . pred)
+    for_ mkTupNodes $ \node -> do
+        (ins, _, lab, outs) <- sGetContext node
+        let inMap' =
+                sortOn
+                    fst
+                    [ (inIdx, (outIdx, source))
+                    | ((outIdx, inIdx), source) <- ins
+                    ]
+        assertM $ and [i == i' | (i, (i', _)) <- zip [0 ..] inMap']
+        let inMap = map snd inMap'
+        sDelNode node
+        let Just project = pred lab
+        for_ outs $ \((outIdx, inIdx), target) ->
+            let (sIdx, sOp) = inMap !! project outIdx
+             in sInsEdge (sOp, target, (sIdx, inIdx))
 
-removeSuperfluousOperators :: Rewrite (NoriaGraph Operator Column)
+removeSuperfluousOperators :: GetGraph g Operator Column s m => m ()
 removeSuperfluousOperators =
-    dropNodes $ \case
-        CustomOp o
-            | o `elem`
-                  (["ohua.lang/smap", "ohua.lang/collect", "ohua.sql/group_by"] :: [QualifiedBinding]) ->
-                True
-        _ -> False
+    dropNodesProjecting $ \case
+        CustomOp o ->
+            case o of
+                "ohua.lang/smapFun" -> Just $ const 0
+                "ohua.lang/collect" -> Just $ const 1
+                "ohua.sql.query/group_by" -> Just toFirstInput
+                _ -> Nothing
+        _ -> Nothing
+  where
+    toFirstInput _ = 0
 
-mkContextMap :: NoriaGraph QualifiedBinding Column -> ContextMap
-mkContextMap gr = m
+mkContextMap :: LitMap -> NoriaGraph QualifiedBinding Column -> ContextMap
+mkContextMap lm gr = m
   where
     m =
         IM.fromList
             [ ( n
-              , ownCtx $ maximumBy (compare `on` length) $ map (m IM.!) $
-                map snd pre)
+              , ownCtx $
+                case pre of
+                    [] -> []
+                    _ ->
+                        maximumBy (compare `on` length) $ map (m IM.!) $
+                        map snd pre)
             | n <- GR.nodes gr
             , let (pre, _, label, _) = GR.context gr n
                   ownCtx =
                       case label of
-                          "ohua.sql/group_by" ->
-                              let (_:cols) = reverse $ sortOn snd $ map fst pre
-                               in (GroupBy (reverse cols) :)
+                          "ohua.sql.query/group_by" ->
+                              let cols =
+                                      map
+                                          (\case
+                                               NumericLit n -> fromIntegral n
+                                               _ -> error "NO!") $
+                                      map snd $
+                                      sortOn fst $
+                                      lm IM.!
+                                      n
+                               in (GroupBy cols :)
                           -- "ohua.lang/smap" -> (SmapC :)
                           "ohua.lang/collect" -> \(_:xs) -> xs
                           _ -> id
             ]
 
 retype :: NoriaGraph QualifiedBinding b -> NoriaGraph Operator b
-retype = GR.nmap CustomOp
+retype =
+    GR.nmap $ \case
+        "intrinsic/sink" -> Sink
+        "intrinsic/source" -> Source
+        "ohua.lang/(,)" -> Identity -- Needs to become a project instead
+        other -> CustomOp other
 
 type ContextMap = IntMap [Context]
 
@@ -633,78 +687,176 @@ type NoriaGraph opLabel edgeLabel = GR.Gr opLabel edgeLabel
 
 type MirGraph = NoriaGraph Operator [Column]
 
-multiArcToJoin :: IntMap [Context] -> Rewrite MirGraph
-multiArcToJoin ctxMap =
-    stateful $ gets fst >>= \gr ->
-        for_ (GR.nodes gr) $ \node -> do
-            (preds, _, lab, _) <- sGetContext node
-            unless (isJoin lab || null preds) $ do
-                (ncols, npid) <- handle preds
-                modify
-                    (first $ GR.insEdge (npid, node, ncols) .
-                     GR.delEdges [(p, node) | (_, p) <- preds])
+-- TODO Update contexts
+multiArcToJoin ::
+       ( a ~ Operator
+       , b ~ [Column]
+       , GetGraph g a b s m
+       , Field2' s GR.Node
+       , Field3' s ContextMap
+       )
+    => IntMap [Context]
+    -> m ()
+multiArcToJoin ctxMap = do
+    gr <- use _1
+    for_ (GR.nodes gr) $ \node -> do
+        (preds, _, lab, _) <- sGetContext node
+        unless (isJoin lab || null preds) $ do
+            (ncols, npid) <- handle preds
+            _1 %= GR.insEdge (npid, node, ncols) .
+                GR.delEdges [(p, node) | (_, p) <- preds]
   where
     getCtx = pure . fromJust . flip IM.lookup ctxMap
     getLabel n = gets (\(g, _) -> fromJust $ GR.lab g n)
-    mkNode lab = state (\(gr, i) -> (i, (GR.insNode (i, lab) gr, succ i)))
+    mkNode lab =
+        state
+            (\s ->
+                 let i = s ^. _2
+                  in (i, s & _1 %~ GR.insNode (i, lab) & _2 %~ succ))
     handle [x] = pure x
     handle ((p1Cols, p1):ps) = do
         (p2Cols, p2) <- handle ps
         ctx1 <- getCtx p1
         ctx2 <- getCtx p2
-        let (lowerCtx, upperCtx) =
-                if length ctx1 > length ctx2
-                    then (ctx2, ctx1)
-                    else (ctx1, ctx2)
-        id <- mkNode (Join lowerCtx)
-        modify (first $ GR.insEdges [(p1, id, p1Cols), (p2, id, p2Cols)])
+        let (lowerCtx, upperCtx, isSame) =
+                let l1 = length ctx1
+                    l2 = length ctx2
+                 in if | l1 == l2 -> (ctx1, ctx2, True)
+                       | length ctx1 > length ctx2 -> (ctx2, ctx1, False)
+                       | otherwise -> (ctx1, ctx2, False)
+        id <-
+            mkNode $
+            if isSame
+                then Zip
+                else Join undefined
+        _3 %= IM.insert id lowerCtx
+        -- TODO update contexts
+        _1 %= GR.insEdges [(p1, id, p1Cols), (p2, id, p2Cols)]
         pure (p1Cols ++ p2Cols, id)
+
+type AdjList a = [(a, [Word])]
+
+-- | (isFromMain, Index)
+type MirIndex = Word
+
+data MirNode
+    = Regular { nodeFunction :: QualifiedBinding
+              , indices :: [MirIndex] }
+    | MirZip { zipOn :: [MirIndex]
+             , left :: [MirIndex]
+             , right :: [MirIndex] }
+    | MirIdentity
+    -- | MirJoin
+    -- | MirProjection
+
+data SerializableGraph = SerializableGraph
+    { adjacencyList :: AdjList MirNode
+    , sink :: (Word, [Word])
+    }
+    -- UDF {
+    --     function_name: String,
+    --     //Do I need this?
+    --     input: Vec<Column>,
+    --     group_by: Vec<Column>,
+    -- },
+
+instance ToRust SerializableGraph where
+    asRust graph =
+        "super::UDFGraph" <>
+        recordSyn
+            [ "adjacency_list" ~> "vec!" <>
+              PP.list (map toAListElem $ adjacencyList graph)
+            , "sink" ~> let (n, idxs) = (sink graph) in PP.tupled [pretty n, "vec!" <> PP.list (map pretty idxs)]
+            ]
+      where
+        toAListElem (node, preds) =
+            PP.tupled [mirNodeToRust node, "vec!" <> PP.list (map pretty preds)]
+        mirNodeToRust =
+            ("MirNodeType::" <>) . \case
+                MirIdentity -> "Identity"
+                Regular {..} ->
+                    "UDFBasic" <+>
+                    recordSyn
+                        [ ("function_name", PP.dquotes ( pretty nodeFunction ) <> ".to_string()")
+                        , ("indices", ppVec (map pretty indices))
+                        ]
+                MirZip {..} ->
+                    "Zip" <+>
+                    recordSyn
+                        [ ("left", ppVec $ map pretty left)
+                        , ("right", ppVec $ map pretty right)
+                        ]
+        recordSyn =
+            PP.encloseSep PP.lbrace PP.rbrace PP.comma .
+            map (uncurry $ PP.surround ": ")
+        ppVec l = "vec!" <> PP.list l
+
+toSerializableGraph :: ContextMap -> MirGraph -> SerializableGraph
+toSerializableGraph cm mg =
+    SerializableGraph
+        [ ( case op of
+                CustomOp o -> Regular {nodeFunction = o, indices = indices}
+                Join _ -> unimplemented
+                Projection _ -> unimplemented
+                Zip ->
+                    let [p1, p2] = ins
+                     in MirZip
+                            { zipOn = contextToIndices ctx
+                            , left = map (+ contextSize ctx) $ adjToIdx p1
+                            , right = map (+ contextSize ctx) $ adjToIdx p2
+                            }
+                Identity -> MirIdentity
+                Sink -> error "impossible"
+                Source -> error "impossible"
+          , map predecessorToIdx ins)
+        | (_, n) <- drop 2 indexMapping
+        , let (ins, _, op, _) = GR.context mg n
+              ctx = cm IM.! n
+              indices =
+                  case ins of
+                      [] -> []
+                      [p] -> map (+ contextSize ctx) $ adjToIdx p
+                      _ -> error $ "Too many ancestors for " <> show op
+        ]
+        (let [sink] = filter (isSink . snd) (GR.labNodes mg)
+             [(s, _, l)] = GR.inn mg $ fst sink
+          in (toNIdx s, map (fromIntegral . fst) l))
+  where
+    adjToIdx = map (fromIntegral . fst) . sortOn snd . fst
+    indexMapping = zip [0 ..] (-1 : -2 : filter (\n -> n >= 0) (GR.nodes mg))
+    toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
+    predecessorToIdx = fromIntegral . toNIdx . snd
+    contextSize = fromIntegral . length . flattenCtx
+    contextToIndices c = [0 .. pred $ contextSize c]
+    flattenCtx = (>>= \(GroupBy l) -> l)
+
+unimplemented :: HasCallStack => a
+unimplemented = error "Function or branch not yet implemented"
+
+noriaMirSourceDir :: IsString s => s
+noriaMirSourceDir = "noria-server/mir/src"
 
 generate :: CodeGen
 generate CodeGenData {..} = do
+    (ctxMap, iGr) <- annotateAndRewriteQuery graph
+    logDebugN $ "Annotated graph:\n" <> toText (GR.prettify iGr)
     tpl <- loadNoriaTemplate "udf_graph.rs"
+    let subs =
+            ["graph" ~> [renderDoc $ asRust $ toSerializableGraph ctxMap iGr]]
     tpl' <-
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
     patchFile
         Nothing
-        (noriaDataflowSourceDir <> "/udfs/mod.rs")
+        (noriaMirSourceDir <> "/udfs/mod.rs")
         [ "graph-mods" ~> ["mod " <> unwrap entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
-          [ "\"" <> unwrap entryPointName <> "\" => " <> unwrap entryPointName <>
-            "_graph::graph,"
+          [ "\"" <> unwrap entryPointName <> "\" => Some(" <> unwrap entryPointName <>
+            "_graph::mk_graph()),"
           ]
         ]
     pure (sugg, LT.encodeUtf8 $ LT.fromStrict tpl')
   where
-    iGr = annotateAndRewriteQuery graph
-    sugg =
-        noriaDataflowSourceDir <> "/udfs/" <> unwrap entryPointName <>
-        "_graph.rs"
-    subs = ["operators" ~> [rustOps]]
-    rustOps =
-        renderDoc $ "vec!" <>
-        PP.list
-            [ PP.tupled
-                [ PP.dquotes $ asRust $ opTy ^. namespace
-                , PP.dquotes $ asRust $ opTy ^. name
-                , listLinks snd in_
-                , listLinks fst out
-                ]
-            | (in_, _, opTy, out) <-
-                  map (GR.context iGr) $ drop 2 $ GR.listTopo iGr
-            ]
-      where
-        listLinks f = asVec . map idxToRust . sortOn (f . fst)
-          where
-            idxToRust (indices, op) =
-                "(Index::" <> sourceType <> "," <> pretty (f indices) <> ")"
-              where
-                sourceType =
-                    case op of
-                        -1 -> "Source"
-                        -2 -> "Sink"
-                        n -> "Local"
-        asVec v = "vec!" <> PP.list v
+    sugg = noriaMirSourceDir <> "/udfs/" <> unwrap entryPointName <> "_graph.rs"
 
 mkStateTraitCoercionFunc ::
        QualifiedBinding -> QualifiedBinding -> Text -> [Text]

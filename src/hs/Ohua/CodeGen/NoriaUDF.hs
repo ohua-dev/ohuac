@@ -377,6 +377,7 @@ processUdf fields udfName program state initState =
                              ".rs")
                             [ "udf-name" ~>
                               [T.toTitle $ unwrap $ udfName ^. name]
+                            , "udf-name-str" ~> [ "\"" <> unwrap (udfName ^. name) <> "\"" ]
                             , "map" ~>
                               ["use " <> stateNSStr <> "::Action;", mapFn]
                             , "reduce" ~> [reduceFn]
@@ -395,6 +396,7 @@ processUdf fields udfName program state initState =
                                   accessedFields
                             , "udf-args" ~> ["udf_arg_placeholder,"]
                             , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
+                            , "udf-state-type" ~> [stateTypeStr]
                             ]
                     stateType = getStateType initState
                     stateTypeStr = asRustT $ stateType ^.namespace
@@ -467,7 +469,7 @@ udfFileToPathThing pt qname finalPart =
 type Column = (Int, Int)
 
 data Context =
-    GroupBy [Word]
+    GroupBy [DFGraph.Target]
     -- | SmapC   -- Add this eventually
     deriving (Show)
 
@@ -476,7 +478,6 @@ data Operator
     | Join { joinOn :: [Context] }
     | Projection [Column]
     | Identity
-    | Zip
     | Sink
     | Source
     deriving (Show)
@@ -488,6 +489,10 @@ isJoin _ = False
 isSink :: Operator -> Bool
 isSink Sink = True
 isSink _ = False
+
+isSource :: Operator -> Bool
+isSource Source = True
+isSource _ = False
 
 groupOnInt :: [(a, Int)] -> [([a], Int)]
 groupOnInt =
@@ -651,8 +656,8 @@ mkContextMap lm gr = m
                 case pre of
                     [] -> []
                     _ ->
-                        maximumBy (compare `on` length) $ map (m IM.!) $
-                        map snd pre)
+                        maximumBy (compare `on` length) $
+                        map (m IM.!) $ map snd pre)
             | n <- GR.nodes gr
             , let (pre, _, label, _) = GR.context gr n
                   ownCtx =
@@ -661,12 +666,13 @@ mkContextMap lm gr = m
                               let cols =
                                       map
                                           (\case
-                                               NumericLit n -> fromIntegral n
+                                               NumericLit n ->
+                                                   DFGraph.Target
+                                                       (unsafeMake $ snd pre') $
+                                                   fromIntegral n
+                                                where [pre'] = pre
                                                _ -> error "NO!") $
-                                      map snd $
-                                      sortOn fst $
-                                      lm IM.!
-                                      n
+                                      map snd $ sortOn fst $ lm IM.! n
                                in (GroupBy cols :)
                           -- "ohua.lang/smap" -> (SmapC :)
                           "ohua.lang/collect" -> \(_:xs) -> xs
@@ -724,34 +730,43 @@ multiArcToJoin ctxMap = do
                  in if | l1 == l2 -> (ctx1, ctx2, True)
                        | length ctx1 > length ctx2 -> (ctx2, ctx1, False)
                        | otherwise -> (ctx1, ctx2, False)
-        id <-
-            mkNode $
-            if isSame
-                then Zip
-                else Join undefined
+        id <- mkNode $ Join lowerCtx
         _3 %= IM.insert id lowerCtx
         -- TODO update contexts
         _1 %= GR.insEdges [(p1, id, p1Cols), (p2, id, p2Cols)]
         pure (p1Cols ++ p2Cols, id)
 
-type AdjList a = [(a, [Word])]
+type AdjList a = [(a, [MirColumn], [Word])]
 
 -- | (isFromMain, Index)
+type MirColumn = DFGraph.Target
 type MirIndex = Word
+
+data ExecutionType = Reduction { groupBy :: [MirColumn] }
 
 data MirNode
     = Regular { nodeFunction :: QualifiedBinding
-              , indices :: [MirIndex] }
-    | MirZip { zipOn :: [MirIndex]
-             , left :: [MirIndex]
-             , right :: [MirIndex] }
-    | MirIdentity
+              , indices :: [MirColumn]
+              , executionType :: ExecutionType }
+    | MirJoin { mirJoinProject :: [MirColumn]
+              , left :: [MirColumn]
+              , right :: [MirColumn] }
+    | MirIdentity [MirColumn]
     -- | MirJoin
     -- | MirProjection
 
+colsFromOp :: [Context] -> MirNode -> [MirColumn]
+colsFromOp context = \case
+    Regular {indices} -> fromCtx <> indices
+    MirJoin { .. } -> fromCtx <> left <> right
+    MirIdentity idxs -> fromCtx <> idxs
+  where
+    fromCtx = flattenCtx context
+
 data SerializableGraph = SerializableGraph
     { adjacencyList :: AdjList MirNode
-    , sink :: (Word, [Word])
+    , sink :: (Word, [MirColumn])
+    , source :: [MirColumn]
     }
     -- UDF {
     --     function_name: String,
@@ -762,73 +777,123 @@ data SerializableGraph = SerializableGraph
 
 instance ToRust SerializableGraph where
     asRust graph =
-        "super::UDFGraph" <>
+        "UDFGraph" <>
         recordSyn
             [ "adjacency_list" ~> "vec!" <>
               PP.list (map toAListElem $ adjacencyList graph)
-            , "sink" ~> let (n, idxs) = (sink graph) in PP.tupled [pretty n, "vec!" <> PP.list (map pretty idxs)]
+            , "sink" ~>
+              let (n, idxs) = sink graph
+               in PP.tupled [pretty n, "vec!" <> PP.list (encodeCols idxs)]
+            , "source" ~>
+              "vec!" <> PP.list (encodeCols $ source graph)
             ]
       where
-        toAListElem (node, preds) =
-            PP.tupled [mirNodeToRust node, "vec!" <> PP.list (map pretty preds)]
+        toAListElem (node, cols, preds) =
+            PP.tupled
+                [ mirNodeToRust node
+                , "vec!" <> PP.list (encodeCols cols)
+                , "vec!" <> PP.list (map pretty preds)
+                ]
         mirNodeToRust =
             ("MirNodeType::" <>) . \case
-                MirIdentity -> "Identity"
+                MirIdentity _ -> "Identity"
                 Regular {..} ->
                     "UDFBasic" <+>
                     recordSyn
-                        [ ("function_name", PP.dquotes ( pretty nodeFunction ) <> ".to_string()")
-                        , ("indices", ppVec (map pretty indices))
+                        [ ( "function_name"
+                          , PP.dquotes (pretty nodeFunction) <> ".to_string()")
+                        , ("indices", ppVec (encodeCols indices))
+                        , ( "execution_type"
+                          , "ExecutionType::" <>
+                            case executionType of
+                                Reduction {..} ->
+                                    "Reduction" <>
+                                    recordSyn
+                                        [ ( "group_by"
+                                          , "vec!" <>
+                                            PP.list (encodeCols groupBy))
+                                        ])
                         ]
-                MirZip {..} ->
-                    "Zip" <+>
+                MirJoin {..} ->
+                    "Join" <+>
                     recordSyn
-                        [ ("left", ppVec $ map pretty left)
-                        , ("right", ppVec $ map pretty right)
+                        [ ("on_left", ppVec $ encodeCols left)
+                        , ("on_right", ppVec $ encodeCols right)
+                        , ("project", ppVec $ encodeCols mirJoinProject)
                         ]
         recordSyn =
             PP.encloseSep PP.lbrace PP.rbrace PP.comma .
             map (uncurry $ PP.surround ": ")
         ppVec l = "vec!" <> PP.list l
+        encodeCol DFGraph.Target{..} =
+            "Column::new" <>
+            PP.tupled
+                [ "Option::None"
+                , PP.dquotes $
+                  "o" <> pretty (unwrap operator) <> "_i" <> pretty index
+                ]
+        encodeCols = map encodeCol
 
 toSerializableGraph :: ContextMap -> MirGraph -> SerializableGraph
 toSerializableGraph cm mg =
     SerializableGraph
-        [ ( case op of
-                CustomOp o -> Regular {nodeFunction = o, indices = indices}
-                Join _ -> unimplemented
-                Projection _ -> unimplemented
-                Zip ->
-                    let [p1, p2] = ins
-                     in MirZip
-                            { zipOn = contextToIndices ctx
-                            , left = map (+ contextSize ctx) $ adjToIdx p1
-                            , right = map (+ contextSize ctx) $ adjToIdx p2
-                            }
-                Identity -> MirIdentity
-                Sink -> error "impossible"
-                Source -> error "impossible"
-          , map predecessorToIdx ins)
-        | (_, n) <- drop 2 indexMapping
-        , let (ins, _, op, _) = GR.context mg n
-              ctx = cm IM.! n
-              indices =
-                  case ins of
-                      [] -> []
-                      [p] -> map (+ contextSize ctx) $ adjToIdx p
-                      _ -> error $ "Too many ancestors for " <> show op
-        ]
-        (let [sink] = filter (isSink . snd) (GR.labNodes mg)
-             [(s, _, l)] = GR.inn mg $ fst sink
-          in (toNIdx s, map (fromIntegral . fst) l))
+        { adjacencyList =
+              [ (newOp, cols, map toNIdx ins)
+              | (_, n) <- drop 2 indexMapping
+              , let (newOp, cols) = opMap IM.! n
+                    ins = GR.pre mg n
+              ]
+        , sink =
+              let [sink] = filter (isSink . snd) (GR.labNodes mg)
+                  [(s, _, l)] = GR.inn mg $ fst sink
+               in (toNIdx s, GR.suc mg (fst sink) >>= snd . (opMap IM.!))
+        , source =
+              let [src] = filter (isSource . snd) (GR.labNodes mg)
+                  labels = concatMap (^. _3) $ GR.out mg (fst src)
+               in map (colFrom 0) [0..pred $ maximum (map fst labels)]
+        }
   where
-    adjToIdx = map (fromIntegral . fst) . sortOn snd . fst
+    opMap =
+        IM.fromList
+            [ (n, (newOp, colsFromOp ctx newOp))
+            | (_, n) <- drop 2 indexMapping
+            , let (ins, _, op, _) = GR.context mg n
+                  ctx = cm IM.! n
+                  indices =
+                      case ins of
+                          [] -> []
+                          [(edges, n)] -> map ( colFrom n . fst ) $ sortOn snd edges
+                          _ -> error $ "Too many ancestors for " <> show op
+                  newOp =
+                      case op of
+                          CustomOp o ->
+                              Regular
+                                  { nodeFunction = o
+                                  , indices = indices
+                                  , executionType = Reduction $ flattenCtx ctx
+                                  }
+                          Join _ ->
+                              let [p1, p2] = ins
+                               in MirJoin
+                                      { mirJoinProject =
+                                            flattenCtx ctx <> adjToProduced p1 <>
+                                            adjToProduced p2
+                                      , left = flattenCtx ctx
+                                      , right = flattenCtx ctx
+                                      }
+                          Projection _ -> unimplemented
+                          Identity -> MirIdentity $ opMap ^?! ix p . _2
+                              where [(_, p)] = ins
+                          Sink -> error "impossible"
+                          Source -> error "impossible"
+            ]
+    adjToProduced (edges, opid) = map (\(out, _) -> colFrom opid out) edges
+    colFrom op idx = DFGraph.Target (unsafeMake op) idx
     indexMapping = zip [0 ..] (-1 : -2 : filter (\n -> n >= 0) (GR.nodes mg))
     toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
-    predecessorToIdx = fromIntegral . toNIdx . snd
     contextSize = fromIntegral . length . flattenCtx
-    contextToIndices c = [0 .. pred $ contextSize c]
-    flattenCtx = (>>= \(GroupBy l) -> l)
+
+flattenCtx = (>>= \(GroupBy l) -> l)
 
 unimplemented :: HasCallStack => a
 unimplemented = error "Function or branch not yet implemented"

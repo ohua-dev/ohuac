@@ -6,8 +6,7 @@ use super::super::att3::Typed;
 use nom_sql::SqlType;
 
 use crate::ops::grouped::get_group_values;
-use crate::state::cstate::SpecialStateWrapper;
-use state::click_ana::Computer;
+use crate::state::cstate::{ SpecialStateWrapper, MemoElem };
 
 //use crate::state::cstate::{MemoElem};
 use prelude::*;
@@ -332,7 +331,8 @@ impl Ingredient for
     }
 
     fn description(&self, detailed: bool) -> String {
-        "click-ana".to_string()
+        // <insert(udf-name-str)>
+          .to_string()
     }
 
     fn parent_columns(&self, column: usize) -> Vec<(NodeIndex, Option<usize>)> {
@@ -348,7 +348,9 @@ impl Ingredient for
 
     fn make_special_state(&self) -> Option<Box<dyn State>> {
         Option::Some(Box::new(
-            SpecialStateWrapper(MemoryState::default())
+            SpecialStateWrapper(MemoryState::<MemoElem<
+                    // <insert(udf-state-type)>
+                    >>::default())
         ))
     }
 }

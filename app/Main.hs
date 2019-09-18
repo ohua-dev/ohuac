@@ -4,25 +4,29 @@ module Main where
 
 import Ohua.Prelude
 
-import Control.Lens (Index, IxValue, Ixed, (^?), ix, view)
+import Control.Category ((>>>))
+import Control.Lens (Index, IxValue, Ixed, (^?), (^?!), _Just, ix, view)
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
-import qualified Data.HashSet as HS (HashSet, fromList, member)
+import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS (HashSet, fromList, member)
+import qualified Data.IntMap as IM
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
+import qualified Data.Text.Prettyprint.Doc as PP
 import qualified Data.Time as Time
+import Data.Traversable (for)
 import Language.Haskell.TH
+import Ohua.ALang.Lang (Expr(Lambda))
 import Options.Applicative as O
 import Options.Applicative.Help.Pretty as O
+import qualified Prelude
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
-import Ohua.ALang.Lang (Expr(Lambda))
-import qualified Data.Text.Prettyprint.Doc as PP
-import Data.Traversable (for)
-import Control.Category ((>>>))
 
+import Ohua.ALang.PPrint ()
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.NoriaUDF as NoriaUDFGen
@@ -34,8 +38,6 @@ import Ohua.Stage (knownStages)
 import Ohua.Standalone
 import Ohua.Stdlib (stdlib)
 import Ohua.Unit
-import Ohua.ALang.PPrint ()
-
 
 newtype DumpOpts = DumpOpts
     { dumpLang :: LangFormatter
@@ -50,8 +52,10 @@ data BuildOpts = BuildOpts
     }
 
 data Command
-    = Build CommonCmdOpts BuildOpts
-    | DumpType CommonCmdOpts DumpOpts
+    = Build CommonCmdOpts
+            BuildOpts
+    | DumpType CommonCmdOpts
+               DumpOpts
     | ShowVersion
 
 data CommonCmdOpts = CommonCmdOpts
@@ -61,17 +65,11 @@ data CommonCmdOpts = CommonCmdOpts
     , logLevel :: LogLevel
     }
 
-
 data CodeGenSelection
     = JsonGraph
     | SimpleJavaClass
     | NoriaUDF
     deriving (Read, Show, Bounded, Enum, Eq)
-
-selectionToGen :: CodeGenSelection -> CodeGen
-selectionToGen SimpleJavaClass = JavaGen.generate
-selectionToGen JsonGraph = JSONGen.generate
-selectionToGen NoriaUDF = NoriaUDFGen.generate
 
 -- The following splice generates the following two conversions from the
 -- 'codeGenStrings' list
@@ -102,15 +100,16 @@ $(let codeGenStrings =
       strVarIsString = varIsStr strVar
       errVar = mkName "err"
    in pure
-          [ SigD showN $
-            ForallT [PlainTV strVar] [strVarIsString] $
-            ArrowT `AppT` ConT ''CodeGenSelection `AppT` VarT strVar
+          [ SigD showN $ ForallT [PlainTV strVar] [strVarIsString] $ ArrowT `AppT`
+            ConT ''CodeGenSelection `AppT`
+            VarT strVar
           , FunD showN showClauses
           , SigD readN $
             ForallT
                 [PlainTV strVar, PlainTV errVar]
                 [strVarIsString, ConT ''Eq `AppT` VarT strVar, varIsStr errVar] $
-            ArrowT `AppT` VarT strVar `AppT`
+            ArrowT `AppT`
+            VarT strVar `AppT`
             (ConT ''Either `AppT` VarT errVar `AppT` ConT ''CodeGenSelection)
           , FunD
                 readN
@@ -127,9 +126,9 @@ p1 -<.> p2 = toText $ toString p1 FP.-<.> toString p2
 
 runCompM :: LogLevel -> ExceptT Text (LoggingT IO) a -> IO a
 runCompM targetLevel c =
-    runStderrLoggingT $
-    filterLogger (\_ level -> level >= targetLevel) $
-    runExceptT c >>= either exitError pure
+    runStderrLoggingT $ filterLogger (\_ level -> level >= targetLevel) $
+    runExceptT c >>=
+    either exitError pure
   where
     exitError message = do
         logErrorN message
@@ -145,10 +144,7 @@ main = do
                 ("Compiled at " <>
                  $(do t <- liftIO Time.getCurrentTime
                       tz <- liftIO Time.getCurrentTimeZone
-                      pure $
-                          LitE $
-                          StringL $
-                          show t <> " (" <>
+                      pure $ LitE $ StringL $ show t <> " (" <>
                           show (Time.localTimeOfDay $ Time.utcToLocalTime tz t) <>
                           " local)") :: Text)
         DumpType common@CommonCmdOpts {..} (DumpOpts format) ->
@@ -162,15 +158,12 @@ main = do
                                 fromMaybe
                                     (inputModuleFile -<.> "type-dump")
                                     outputPath
-                        liftIO $
-                            L.writeFile (toString outPath) $
-                            encode $
+                        liftIO $ L.writeFile (toString outPath) $ encode $
                             object
                                 [ "arguments" A..= map format args
                                 , "return" A..= format ret
                                 ]
-                        logInfoN $
-                            "Wrote a type dump of '" <> unwrap entrypoint <>
+                        logInfoN $ "Wrote a type dump of '" <> unwrap entrypoint <>
                             "' from '" <>
                             inputModuleFile <>
                             "' to '" <>
@@ -187,21 +180,15 @@ main = do
                 let present =
                         map
                             (\(ns, i) ->
-                                 show $
-                                 PP.pretty ns <> PP.tupled (map PP.pretty i))
-                 in do logDebugN $
-                           unlines $
-                           "Algos:" : present (rawMainMod ^. algoImports)
-                       logDebugN $
-                           unlines $ "Sfs:" : present (rawMainMod ^. sfImports)
+                                 show $ PP.pretty ns <>
+                                 PP.tupled (map PP.pretty i))
+                 in do logDebugN $ unlines $ "Algos:" :
+                           present (rawMainMod ^. algoImports)
+                       logDebugN $ unlines $ "Sfs:" :
+                           present (rawMainMod ^. sfImports)
                 mainMod <-
                     let ?env = ResolutionEnv
-                            { modTracker = modTracker
-                            , preResolveHook =
-                                  case outputFormat of
-                                      NoriaUDF -> NoriaUDFGen.resolveHook
-                                      _ -> pure
-                            }
+                            {modTracker = modTracker, preResolveHook = pure}
                      in registerAnd (rawMainMod ^. name) $
                         loadDepsAndResolve rawMainMod
                 expr' <- getMain $ mainMod ^. decls
@@ -218,20 +205,20 @@ main = do
                 noriaPass <-
                     case outputFormat of
                         NoriaUDF -> do
-                            fields <-
-                                HM.fromList . concat <$> do
-                                    modMap <- readIORef modTracker
-                                    for (HM.elems modMap) $
-                                        fmap
-                                            (view pragmas >>>
-                                             mapMaybe
-                                                 (\case
-                                                      Other "declare-field" f ->
-                                                          Just $
-                                                          NoriaUDFGen.parseFieldPragma
-                                                              f
-                                                      _ -> Nothing)) .
-                                        readMVar
+                            let (streamAnn:_) =
+                                    argTypes $ mainAnns ^?! _Just .
+                                    ix entrypoint
+                                (ftys, constr) =
+                                    RS.para
+                                        (\case
+                                             TyAppF (_, (tys, f)) (ty, _) ->
+                                                 (ty : tys, f)
+                                             TyRefF r -> ([], r))
+                                        streamAnn
+                                Just formatter = Prelude.lookup "rust" langs
+                                fields =
+                                    IM.fromList $
+                                    zip [0 ..] (map formatter $ reverse ftys)
                             pure $ NoriaUDFGen.generateNoriaUDFs fields addUdf
                         _ -> pure pure
                 gr <-
@@ -244,10 +231,17 @@ main = do
                              , passAfterNormalize = noriaPass
                              })
                         completeExpr
+                gen <-
+                    case outputFormat of
+                        JsonGraph -> pure JSONGen.generate
+                        SimpleJavaClass -> pure JavaGen.generate
+                        NoriaUDF -> do
+                            udfs' <- readIORef udfs
+                            NoriaUDFGen.noriaUdfExtraProcessing sandbox udfs'
+                            pure $ NoriaUDFGen.generate udfs'
                 (nameSuggest, code) <-
                     flip runReaderT CodeGenOpts $
-                    selectionToGen
-                        outputFormat
+                    gen
                         CodeGenData
                             { graph = gr
                             , entryPointArity = mainArity
@@ -261,12 +255,8 @@ main = do
                     createDirectoryIfMissing
                         True
                         (FP.takeDirectory $ toString outputPath0)
-                when (outputFormat == NoriaUDF) $
-                    NoriaUDFGen.noriaUdfExtraProcessing sandbox =<<
-                    readIORef udfs
                 liftIO $ L.writeFile (toString outputPath0) code
-                logInfoN $
-                    "Compiled '" <> unwrap entrypoint <> "' from '" <>
+                logInfoN $ "Compiled '" <> unwrap entrypoint <> "' from '" <>
                     inputModuleFile <>
                     "' to " <>
                     showCodeGen outputFormat
@@ -320,8 +310,7 @@ main = do
             (eitherReader readCodeGen)
             (O.value JsonGraph <>
              helpDoc
-                 (Just $
-                  softStr "Format to emit the generated code in." <//>
+                 (Just $ softStr "Format to emit the generated code in." <//>
                   "Accepted choices:" <+>
                   fillSep
                       (punctuate
@@ -341,8 +330,8 @@ main = do
                     else Don'tDump
               , stopOn == Just sname)) <$>
          optional
-             (O.strOption $
-              long "stop-on" <> help "Stop execution after this stage." <>
+             (O.strOption $ long "stop-on" <>
+              help "Stop execution after this stage." <>
               metavar "STAGE") <*>
          many
              (O.strOption
@@ -366,9 +355,7 @@ main = do
                  "build"
                  (info
                       (Build <$> commonOptsParser <*> buildOpts)
-                      (progDescDoc $
-                       Just $
-                       "Build the ohua graph. " <$$> "" <$$>
+                      (progDescDoc $ Just $ "Build the ohua graph. " <$$> "" <$$>
                        softStr
                            "The options --dump-stage and --stop-on pertain to stages. See https://ohua.rtfd.io/en/latest/debugging.html#stages." <$$>
                        fillSep
@@ -393,8 +380,7 @@ main = do
             (metavar "MAIN" <> help "Algorithm that serves as entry point" <>
              O.value "main") <*>
         optional
-            (strOption $
-             long "output" <> metavar "PATH" <> short 'o' <>
+            (strOption $ long "output" <> metavar "PATH" <> short 'o' <>
              help
                  "Path to write the output to (default: input filename with '.ohuao' extension for 'build' with the JSON format and '.java' with the java format and '.type-dump' for 'dump-main-type')") <*>
         ((\verbose debug ->

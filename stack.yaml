@@ -9,7 +9,7 @@ extra-deps:
 - github: ohua-dev/alang-ml-parser
   commit: ffb856ac7f60e83689324f8d6b8334bb8f898159
 - github: ohua-dev/ohua-core
-  commit: 19512acf081d80ebdc685867677d8c621c801137
+  commit: 1f7c4e6f10a6aed7756443457f8b0eb3266ce58e
   subdirs: [core]
 - github: JustusAdam/fgl
   commit: 9e0c7e6c5ef86642b463a5942c822cab2c0c0475

@@ -35,6 +35,7 @@ import qualified Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
+import Data.Traversable (for)
 import Ohua.Standalone (PreResolveHook)
 import Prelude ((!!))
 import System.Directory (createDirectoryIfMissing)
@@ -66,7 +67,8 @@ data FData = FData
     , udfName :: QualifiedBinding
     , inputBindings :: [Binding]
     , udfState :: QualifiedBinding
-    , referencedFields :: [Binding]
+    , referencedFields :: [Int]
+    , invokeExpr :: Expression
     }
 
 type AddUDF = FData -> IO ()
@@ -107,8 +109,8 @@ pattern If cond then_ else_ <-
            Lambda _ then_)
           `Apply` Lambda _ else_
 
-idxPropFromName :: (Binding, Binding) -> Binding
-idxPropFromName (st, f) = pwu st <> pwu f <> "index"
+idxPropFromName :: (Binding, Int) -> Binding
+idxPropFromName (st, f) = pwu st <> makeThrow (show f) <> "__index"
   where
     pwu bnd = bnd <> "__"
 
@@ -131,7 +133,7 @@ mkMapFn ::
     -> Expression
     -> Binding
     -> Binding
-    -> m (Text, Binding)
+    -> m (Text, Binding, [Int])
 mkMapFn fields program' stateV coll = do
     logInfoN $ "Compiling udf-map function on state " <> unwrap stateV <>
         " and collection " <>
@@ -146,34 +148,27 @@ mkMapFn fields program' stateV coll = do
         show freeVars <>
         " in\n" <>
         quickRender program
-    inLoopFieldVars <- traverse (generateBindingWith . snd) loopAcessedFields
+    inLoopFieldVars <-
+        traverse
+            (generateBindingWith . ("ilv__" <>) . show . fst)
+            loopAcessedFields
     let inLoop =
             PP.vsep $
-            [ if exp == rowName
-                then "let" <+> pretty fieldVar <+> ": &" <>
-                     pretty (resolveFieldType field) <+>
-                     "= &" <>
-                     pretty rowName <>
-                     "[self." <>
-                     pretty (idxPropFromName a) <>
-                     "].clone().into();"
-                else error $
-                     "Access to fields from outside the row is not implemented yet (got: " <>
-                     quickRender exp <>
-                     ")\n" <>
-                     quickRender program
-            | (a@(exp, field), fieldVar) <-
-                  zip loopAcessedFields inLoopFieldVars
+            [ "let" <+> pretty fieldVar <+> ": &" <>
+            pretty (resolveFieldType idx) <+>
+            "= &" <>
+            pretty rowName <>
+            "[self." <>
+            pretty (idxPropFromName (stateV, idx)) <>
+            "].clone().into();"
+            | (idx, fieldVar) <- zip fieldIndices inLoopFieldVars
             ] ++
             [toRust True program]
-        resolveFieldVar v =
-            fromMaybe (error $ "Field var not found for " <> show v) $
-            HashMap.lookup
-                v
-                (HashMap.fromList $ zip loopAcessedFields inLoopFieldVars)
-        resolveFieldType fi =
-            fromMaybe (error $ "Use of undeclared field " <> unwrap fi) $
-            HashMap.lookup fi fields
+        inLoopFieldVarMap = IM.fromList $ zip fieldIndices inLoopFieldVars
+        resolveFieldVar (from, idx)
+            | from == rowName = inLoopFieldVarMap IM.! idx
+            | otherwise = unsafeMake $ unwrap from <> "." <> show idx
+        resolveFieldType = (fields IM.!)
         function = "let _ = " <> ppBlock inLoop <> ";"
         toRust = Ohua.CodeGen.NoriaUDF.toRust resolveFieldVar isTheState mkAc
         mkAc func' args =
@@ -182,7 +177,7 @@ mkMapFn fields program' stateV coll = do
                  then mempty
                  else PP.tupled (map (toRust False) args)) <>
             ", r_is_positive))"
-    pure (renderDoc function, rowName)
+    pure (renderDoc function, rowName, fieldIndices)
   where
     predefVars = HashSet.fromList [stateV, coll, rowName]
     isTheState = (== Var stateV)
@@ -192,7 +187,18 @@ mkMapFn fields program' stateV coll = do
             _ ->
                 error $ "Expected lambda as input to smap, got " <>
                 quickRender program'
-    loopAcessedFields = extractAcessedFields program
+    fieldIndices = map fst loopAcessedFields
+    loopAcessedFields = extractIndexingInto (== rowName) program
+
+extractIndexingInto :: (Binding -> Bool) -> Expression -> [(Int, Binding)]
+extractIndexingInto f program =
+    hashNub
+        [ (fromIntegral n, st)
+        | PureFunction fun _ `Apply` Lit (NumericLit n) `Apply` _ `Apply` (expectVarE -> st) <-
+              universe program
+        , fun == "ohua.lang/nth"
+        , f st
+        ]
 
 refBelongsToState :: a -> Bool
 refBelongsToState = const True
@@ -200,9 +206,17 @@ refBelongsToState = const True
 ppBlock :: PP.Doc ann -> PP.Doc ann
 ppBlock e = PP.braces (PP.line <> PP.indent 4 e <> PP.line)
 
--- I am not sure about this one yet. Potentially the function being called on the state should always be fully qualified
+expectNumLit :: Expr -> Integer
+expectNumLit (Lit (NumericLit n)) = n
+expectNumLit e = error $ "Expected a numeric literal, found " <> show e
+
+-- There are some big cheats going on here in the interest of time. All
+-- `ohua.lang/nth` invocations are rewritten to field access, which is true for
+-- our examples, but may not always be. What i needed is actually check if the
+-- thing we're calling it on is actually the row and otherwise compile to rust
+-- tuple access.
 toRust ::
-       ((Binding, Binding) -> Binding)
+       ((Binding, Int) -> Binding)
     -> (Expr -> Bool)
     -> (Binding -> [Expr] -> PP.Doc ann)
     -> Bool
@@ -225,43 +239,50 @@ toRust resolveFieldVar isTheState mkAc isInBlock =
             case f of
                 Var v -> mkFunctionCall (pretty v) args
                 BindState st func -> handleBindState st func args
-                Lit (FunRefLit (FunRef ref _)) ->
-                    case ref ^. namespace of
-                        OhuaFieldNS
-                            | [h] <- args ->
+                Lit (FunRefLit (FunRef ref _))
+                    | ref == "ohua.lang/nth" ->
+                        case args of
+                            [l, _, h] ->
                                 pretty $
-                                resolveFieldVar (expectVarE h, ref ^. name)
-                            | otherwise ->
+                                resolveFieldVar
+                                    ( expectVarE h
+                                    , fromIntegral $ expectNumLit l)
+                            _ ->
                                 error $
                                 "Expected only one argument for field access, got " <>
                                 quickRender e
-                        ["primitives"] ->
-                            case ref ^. name of
-                                "eq" -> binop "=="
-                                "deref"
-                                    | [expr] <- args ->
-                                        "*" <> recurse False expr
-                                    | otherwise -> wrongNumArgsErr "&" 1
-                                "divide" -> binop "/"
-                                other ->
-                                    error $ "Unknown primitive function " <>
-                                    unwrap other
-                            where wrongNumArgsErr func num =
-                                      error $ "Wrong number of arguments to " <>
-                                      func <>
-                                      " expected " <>
-                                      show num <>
-                                      " got " <>
-                                      show (length args)
-                                  binop op
-                                      | [e1, e2] <- args =
-                                          recurse False e1 <+> pretty op <+>
-                                          recurse False e2
-                                      | otherwise = wrongNumArgsErr op 2
-                        _ -> mkFunctionCall (asRust ref) args
+                    | otherwise ->
+                        case ref ^. namespace of
+                            ["primitives"] ->
+                                case ref ^. name of
+                                    "eq" -> binop "=="
+                                    "deref"
+                                        | [expr] <- args ->
+                                            "*" <> recurse False expr
+                                        | otherwise -> wrongNumArgsErr "*" 1
+                                    "divide" -> binop "/"
+                                    other ->
+                                        error $ "Unknown primitive function " <>
+                                        unwrap other
+                                where wrongNumArgsErr func num =
+                                          error $
+                                          "Wrong number of arguments to " <>
+                                          func <>
+                                          " expected " <>
+                                          show num <>
+                                          " got " <>
+                                          show (length args)
+                                      binop op
+                                          | [e1, e2] <- args =
+                                              recurse False e1 <+> pretty op <+>
+                                              recurse False e2
+                                          | otherwise = wrongNumArgsErr op 2
+                            _ -> mkFunctionCall (asRust ref) args
                 _ -> error $ "Unexpected type of function expression " <> show f
             where (f, args) = disassembleCall e
         l@(Lambda _ _) -> error $ "Unexpected lambda " <> quickRender l
+        Let b Var {} body
+            | isIgnoredBinding b -> recurse isInBlock body
         Let b e1 body ->
             (if isInBlock
                  then id
@@ -367,7 +388,7 @@ processUdf fields udfName program state initState =
     case program of
         Let unit (Smap _ mapF (Var coll)) reduceF
             | isIgnoredBinding unit -> do
-                (mapFn, rowName) <- mkMapFn fields mapF state coll
+                (mapFn, rowName, fieldIndices) <- mkMapFn fields mapF state coll
                 reduceFn <- mkReduceFn fields state reduceF
                 let nodeSub =
                         TemplateSubstitution
@@ -377,7 +398,8 @@ processUdf fields udfName program state initState =
                              ".rs")
                             [ "udf-name" ~>
                               [T.toTitle $ unwrap $ udfName ^. name]
-                            , "udf-name-str" ~> [ "\"" <> unwrap (udfName ^. name) <> "\"" ]
+                            , "udf-name-str" ~>
+                              ["\"" <> unwrap (udfName ^. name) <> "\""]
                             , "map" ~>
                               ["use " <> stateNSStr <> "::Action;", mapFn]
                             , "reduce" ~> [reduceFn]
@@ -398,9 +420,13 @@ processUdf fields udfName program state initState =
                             , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
                             , "udf-state-type" ~> [stateTypeStr]
                             ]
+                    accessedFields = map (state,) fieldIndices
                     stateType = getStateType initState
-                    stateTypeStr = asRustT $ stateType ^.namespace
-                    stateNSStr = asRustT $ unwrapped @NSRef . asNonEmpty %~ init $ stateType ^. namespace
+                    stateTypeStr = asRustT $ stateType ^. namespace
+                    stateNSStr =
+                        asRustT $ unwrapped @NSRef . asNonEmpty %~ init $
+                        stateType ^.
+                        namespace
                     stateSub =
                         TemplateSubstitution
                             "map-reduce/state.rs"
@@ -414,24 +440,44 @@ processUdf fields udfName program state initState =
                                   "Option::Some(self)"
                             , "udf-state-type" ~> [stateTypeStr]
                             ]
-                logDebugN $
-                    unlines $ "Acessed fields:" : map show accessedFields
-                logInfoN $
-                    "UDF " <> show udfName <> " callable with " <>
+                logDebugN $ unlines $ "Acessed fields:" :
+                    map show fieldIndices
+                logInfoN $ "UDF " <> show udfName <> " callable with " <>
                     renderDoc
                         (pretty (udfName ^. name) <>
-                         PP.tupled (map (pretty . snd) accessedFields))
+                         PP.tupled (map pretty fieldIndices))
+                mkInvokeExpr <-
+                    if null fieldIndices
+                        then pure (`Apply` Var coll)
+                        else do
+                            let flen = maximum fieldIndices
+                            (Endo mkFieldDestrExpr, newBnds) <-
+                                fmap mconcat . for fieldIndices $ \idx -> do
+                                    b <-
+                                        generateBindingWith =<<
+                                        make ("findex_" <> show idx)
+                                    pure
+                                        ( Endo $
+                                          Let
+                                              b
+                                              ("ohua.lang/nth" `Apply`
+                                               embedE idx `Apply`
+                                               embedE flen `Apply`
+                                               Var coll)
+                                        , pure @[] b)
+                            pure $ \udf ->
+                                mkFieldDestrExpr
+                                    (foldl' Apply udf $ map Var newBnds)
                 pure
                     FData
                         { generations = [nodeSub, stateSub]
                         , udfName = udfName
                         , inputBindings = []
                         , udfState = stateType
-                        , referencedFields = map idxPropFromName accessedFields
+                        , referencedFields = fieldIndices
+                        , invokeExpr = mkInvokeExpr $ embedE udfName
                         }
         _ -> error $ "Expected map-reduce pattern, got " <> quickRender program
-  where
-    accessedFields = extractAcessedFields program
 
 -- HACK A dirty, dirty hack
 getStateType initState =
@@ -439,12 +485,13 @@ getStateType initState =
         [f] -> f
         o -> error $ "Too many qualified applications in state init " <> show o
 
-extractAcessedFields :: Expr -> [(Binding, Binding)]
+extractAcessedFields :: Expr -> [(Binding, Int)]
 extractAcessedFields program =
     hashNub
-        [ (expectVarE st, fun ^. name)
-        | PureFunction fun _ `Apply` st <- universe program
-        , fun ^. namespace == OhuaFieldNS
+        [ (expectVarE st, fromIntegral n)
+        | PureFunction fun _ `Apply` Lit (NumericLit n) `Apply` _ `Apply` st <-
+              universe program
+        , fun == "ohua.lang/nth"
         ]
 
 pattern OhuaFieldNS :: NSRef
@@ -502,12 +549,18 @@ groupOnInt =
 traceGr :: (Show a, Show b) => String -> GR.Gr a b -> GR.Gr a b
 traceGr msg gr = gr `seq` trace (msg <> "\n" <> GR.prettify gr) gr
 
+forNodes_ ::
+       GetGraph g a b s m => (a -> Maybe c) -> (GR.Node -> c -> m x) -> m ()
+forNodes_ pred ac = do
+    nodes <- use $ _1 . to GR.labNodes
+    for_ nodes $ \(n, lab) -> maybe (pure ()) (void . ac n) $ pred lab
+
 -- TODO
 -- - Rewrite literals to projection
--- - Do final projection
+-- - Incorporate indices from previously compiled udfs
 annotateAndRewriteQuery ::
-       MonadLogger m => DFGraph.OutGraph -> m (ContextMap, MirGraph)
-annotateAndRewriteQuery graph = do
+       MonadLogger m => [FData] -> DFGraph.OutGraph -> m (ContextMap, MirGraph)
+annotateAndRewriteQuery compiledNodes graph = do
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
     s1 <- flip execStateT s0 $ collapseNth envInputs
     let g = mkContextMap envInputs (fst s1)
@@ -656,8 +709,8 @@ mkContextMap lm gr = m
                 case pre of
                     [] -> []
                     _ ->
-                        maximumBy (compare `on` length) $
-                        map (m IM.!) $ map snd pre)
+                        maximumBy (compare `on` length) $ map (m IM.!) $
+                        map snd pre)
             | n <- GR.nodes gr
             , let (pre, _, label, _) = GR.context gr n
                   ownCtx =
@@ -670,9 +723,12 @@ mkContextMap lm gr = m
                                                    DFGraph.Target
                                                        (unsafeMake $ snd pre') $
                                                    fromIntegral n
-                                                where [pre'] = pre
+                                                   where [pre'] = pre
                                                _ -> error "NO!") $
-                                      map snd $ sortOn fst $ lm IM.! n
+                                      map snd $
+                                      sortOn fst $
+                                      lm IM.!
+                                      n
                                in (GroupBy cols :)
                           -- "ohua.lang/smap" -> (SmapC :)
                           "ohua.lang/collect" -> \(_:xs) -> xs
@@ -740,9 +796,12 @@ type AdjList a = [(a, [MirColumn], [Word])]
 
 -- | (isFromMain, Index)
 type MirColumn = DFGraph.Target
+
 type MirIndex = Word
 
-data ExecutionType = Reduction { groupBy :: [MirColumn] }
+data ExecutionType = Reduction
+    { groupBy :: [MirColumn]
+    }
 
 data MirNode
     = Regular { nodeFunction :: QualifiedBinding
@@ -755,13 +814,12 @@ data MirNode
     -- | MirJoin
     -- | MirProjection
 
-colsFromOp :: [Context] -> MirNode -> [MirColumn]
-colsFromOp context = \case
-    Regular {indices} -> fromCtx <> indices
-    MirJoin { .. } -> fromCtx <> left <> right
-    MirIdentity idxs -> fromCtx <> idxs
-  where
-    fromCtx = flattenCtx context
+colsFromOp :: MirNode -> [MirColumn]
+colsFromOp =
+    \case
+        Regular {indices} -> indices
+        MirJoin {..} -> left <> right
+        MirIdentity idxs -> idxs
 
 data SerializableGraph = SerializableGraph
     { adjacencyList :: AdjList MirNode
@@ -784,8 +842,7 @@ instance ToRust SerializableGraph where
             , "sink" ~>
               let (n, idxs) = sink graph
                in PP.tupled [pretty n, "vec!" <> PP.list (encodeCols idxs)]
-            , "source" ~>
-              "vec!" <> PP.list (encodeCols $ source graph)
+            , "source" ~> "vec!" <> PP.list (encodeCols $ source graph)
             ]
       where
         toAListElem (node, cols, preds) =
@@ -825,12 +882,12 @@ instance ToRust SerializableGraph where
             PP.encloseSep PP.lbrace PP.rbrace PP.comma .
             map (uncurry $ PP.surround ": ")
         ppVec l = "vec!" <> PP.list l
-        encodeCol DFGraph.Target{..} =
+        encodeCol DFGraph.Target {..} =
             "Column::new" <>
             PP.tupled
                 [ "Option::None"
-                , PP.dquotes $
-                  "o" <> pretty (unwrap operator) <> "_i" <> pretty index
+                , PP.dquotes $ "o" <> pretty (unwrap operator) <> "_i" <>
+                  pretty index
                 ]
         encodeCols = map encodeCol
 
@@ -838,31 +895,32 @@ toSerializableGraph :: ContextMap -> MirGraph -> SerializableGraph
 toSerializableGraph cm mg =
     SerializableGraph
         { adjacencyList =
-              [ (newOp, cols, map toNIdx ins)
+              [ (newOp, ctxCols <> cols, map toNIdx ins)
               | (_, n) <- drop 2 indexMapping
-              , let (newOp, cols) = opMap IM.! n
+              , let (newOp, (ctxCols, cols)) = opMap IM.! n
                     ins = GR.pre mg n
               ]
         , sink =
               let [sink] = filter (isSink . snd) (GR.labNodes mg)
                   [(s, _, l)] = GR.inn mg $ fst sink
-               in (toNIdx s, GR.suc mg (fst sink) >>= snd . (opMap IM.!))
+               in (toNIdx s, snd $ snd (opMap IM.! s))
         , source =
               let [src] = filter (isSource . snd) (GR.labNodes mg)
                   labels = concatMap (^. _3) $ GR.out mg (fst src)
-               in map (colFrom 0) [0..pred $ maximum (map fst labels)]
+               in map (colFrom (-1)) [0 .. maximum (map fst labels)]
         }
   where
     opMap =
         IM.fromList
-            [ (n, (newOp, colsFromOp ctx newOp))
+            [ (n, (newOp, (flattenCtx ctx, colsFromOp newOp)))
             | (_, n) <- drop 2 indexMapping
             , let (ins, _, op, _) = GR.context mg n
                   ctx = cm IM.! n
                   indices =
                       case ins of
                           [] -> []
-                          [(edges, n)] -> map ( colFrom n . fst ) $ sortOn snd edges
+                          [(edges, n)] ->
+                              map (colFrom n . fst) $ sortOn snd edges
                           _ -> error $ "Too many ancestors for " <> show op
                   newOp =
                       case op of
@@ -882,7 +940,7 @@ toSerializableGraph cm mg =
                                       , right = flattenCtx ctx
                                       }
                           Projection _ -> unimplemented
-                          Identity -> MirIdentity $ opMap ^?! ix p . _2
+                          Identity -> MirIdentity $ opMap ^?! ix p . _2 . _2
                               where [(_, p)] = ins
                           Sink -> error "impossible"
                           Source -> error "impossible"
@@ -901,9 +959,9 @@ unimplemented = error "Function or branch not yet implemented"
 noriaMirSourceDir :: IsString s => s
 noriaMirSourceDir = "noria-server/mir/src"
 
-generate :: CodeGen
-generate CodeGenData {..} = do
-    (ctxMap, iGr) <- annotateAndRewriteQuery graph
+generate :: [FData] -> CodeGen
+generate compiledNodes CodeGenData {..} = do
+    (ctxMap, iGr) <- annotateAndRewriteQuery compiledNodes graph
     logDebugN $ "Annotated graph:\n" <> toText (GR.prettify iGr)
     tpl <- loadNoriaTemplate "udf_graph.rs"
     let subs =
@@ -915,7 +973,8 @@ generate CodeGenData {..} = do
         (noriaMirSourceDir <> "/udfs/mod.rs")
         [ "graph-mods" ~> ["mod " <> unwrap entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
-          [ "\"" <> unwrap entryPointName <> "\" => Some(" <> unwrap entryPointName <>
+          [ "\"" <> unwrap entryPointName <> "\" => Some(" <>
+            unwrap entryPointName <>
             "_graph::mk_graph()),"
           ]
         ]
@@ -1000,10 +1059,7 @@ patchFiles mOutDir udfs =
                 , noriaDataflowSourceDir <> "/ops/ohua/att3.rs" ~>
                   [ "generated-udf-inits" ~>
                     pure
-                        (renderDoc $
-                         PP.dquotes
-                             (pretty $ T.toTitle $ unwrap $ udfName ^. name) <+>
-                         "=>" <>
+                        (renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
                          ppBlock
                              (PP.vsep
                                   [ "assert_eq!(over_cols.len(), " <>
@@ -1037,12 +1093,12 @@ pattern GenFuncsNamespace :: NSRef
 pattern GenFuncsNamespace <- ["ohua", "generated"]
   where GenFuncsNamespace = ["ohua", "generated"]
 
-type Fields = HashMap.HashMap Binding Text
+type Fields = IM.IntMap Text
 
 generateNoriaUDFs :: Fields -> AddUDF -> Expression -> OhuaM env Expression
 generateNoriaUDFs fields addUdf program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
-    (program', udfs) <-
+    program' <-
         let mempty' = mempty @(Dual (Endo Expr), HashSet.HashSet Binding)
             tellRet var = tell $ mempty' & _2 .~ HashSet.singleton var
             tellUdfE f = tell $ mempty' & _1 .~ Dual (Endo f)
@@ -1071,8 +1127,7 @@ generateNoriaUDFs fields addUdf program = do
                     or [s == Var st | BindState s _ <- universe oldExpr]
                 eDeps = HashSet.fromList $ getDeps oldExpr
             go _ e'' = RS.embed <$> traverse extract e''
-         in runWriterT $
-            transformM
+         in transformM
                 (\case
                      Let st initExpr body
                          | st `HashSet.member` stateVals -> do
@@ -1084,7 +1139,7 @@ generateNoriaUDFs fields addUdf program = do
                                  v'
                                      | [i] <- rets = i
                                      | otherwise =
-                                         error $ "Too many returns from udf " <>
+                                         error $ "Expected only one return from udf " <> quickRender e' <> ", found " <>
                                          show rets
                                  udf = mut $ Var v'
                                  freeVars =
@@ -1093,14 +1148,12 @@ generateNoriaUDFs fields addUdf program = do
                                  quickRender udfName <>
                                  "\n" <>
                                  quickRender (Let st initExpr udf)
-                             tell [(bnd, udfName, udf, st, initExpr)]
-                             expr' <- newFunctionCall udfName
-                             pure $ Let v' (foldl Apply expr' freeVars) e'
+                             fdata <- processUdf fields udfName udf st initExpr
+                             liftIO $ addUdf fdata
+                             pure $ invokeExpr fdata
                      e -> pure e)
                 program
     logInfoN $ "Remaining program\n" <> quickRender program'
-    for_ @[_] udfs $ \(_, udfName, e, st, initExpr) ->
-        liftIO . addUdf =<< processUdf fields udfName e st initExpr
     pure program'
   where
     globalVals = HashSet.fromList $ RS.cata f program

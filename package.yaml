@@ -51,15 +51,15 @@ dependencies:
 - lens
 - monad-control
 - prettyprinter
+- recursion-schemes
+- containers
 library:
   source-dirs: src/hs
   dependencies:
   - async
   - mtl
   - text
-  - recursion-schemes
   - lifted-async
-  - containers
   - casing
   - language-java
   - attoparsec

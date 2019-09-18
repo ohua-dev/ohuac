@@ -44,6 +44,8 @@ import qualified System.IO.Temp as Temp
 
 import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
+import qualified Ohua.ALang.Passes as ALang (normalize)
+import qualified Ohua.ALang.Refs as ALang
 import Ohua.ALang.Util (findFreeVariables)
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONObject
@@ -347,6 +349,10 @@ asRustT = renderDoc . asRust
 isIgnoredBinding :: Binding -> Bool
 isIgnoredBinding b = b == "()" || "_" `T.isPrefixOf` unwrap b
 
+mkNthExpr :: Int -> Int -> Expr -> Expr
+mkNthExpr idx len tup =
+    "ohua.lang/nth" `Apply` embedE idx `Apply` embedE len `Apply` tup
+
 renderDoc :: PP.Doc a -> Text
 renderDoc = PP.renderStrict . PP.layoutSmart ohuaDefaultLayoutOpts
 
@@ -377,7 +383,7 @@ asNonEmpty _ [] = pure []
 asNonEmpty f (x:xs) = f (x :| xs)
 
 processUdf ::
-       (MonadGenBnd m, MonadError Error m, MonadLogger m)
+       (MonadOhua m)
     => Fields
     -> QualifiedBinding
     -> Expression
@@ -420,7 +426,7 @@ processUdf fields udfName program state initState =
                             , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
                             , "udf-state-type" ~> [stateTypeStr]
                             ]
-                    accessedFields = map (state,) fieldIndices
+                    accessedFields = map (state, ) fieldIndices
                     stateType = getStateType initState
                     stateTypeStr = asRustT $ stateType ^. namespace
                     stateNSStr =
@@ -440,8 +446,7 @@ processUdf fields udfName program state initState =
                                   "Option::Some(self)"
                             , "udf-state-type" ~> [stateTypeStr]
                             ]
-                logDebugN $ unlines $ "Acessed fields:" :
-                    map show fieldIndices
+                logDebugN $ unlines $ "Acessed fields:" : map show fieldIndices
                 logInfoN $ "UDF " <> show udfName <> " callable with " <>
                     renderDoc
                         (pretty (udfName ^. name) <>
@@ -450,7 +455,7 @@ processUdf fields udfName program state initState =
                     if null fieldIndices
                         then pure (`Apply` Var coll)
                         else do
-                            let flen = maximum fieldIndices
+                            let flen = succ $ maximum fieldIndices
                             (Endo mkFieldDestrExpr, newBnds) <-
                                 fmap mconcat . for fieldIndices $ \idx -> do
                                     b <-
@@ -458,16 +463,12 @@ processUdf fields udfName program state initState =
                                         make ("findex_" <> show idx)
                                     pure
                                         ( Endo $
-                                          Let
-                                              b
-                                              ("ohua.lang/nth" `Apply`
-                                               embedE idx `Apply`
-                                               embedE flen `Apply`
-                                               Var coll)
+                                          Let b (mkNthExpr idx flen (Var coll))
                                         , pure @[] b)
                             pure $ \udf ->
                                 mkFieldDestrExpr
                                     (foldl' Apply udf $ map Var newBnds)
+                ie <- ALang.normalize $ mkInvokeExpr $ embedE udfName
                 pure
                     FData
                         { generations = [nodeSub, stateSub]
@@ -475,7 +476,7 @@ processUdf fields udfName program state initState =
                         , inputBindings = []
                         , udfState = stateType
                         , referencedFields = fieldIndices
-                        , invokeExpr = mkInvokeExpr $ embedE udfName
+                        , invokeExpr = ie
                         }
         _ -> error $ "Expected map-reduce pattern, got " <> quickRender program
 
@@ -546,8 +547,8 @@ groupOnInt =
     fmap swap . IM.toList . IM.fromListWith (++) . fmap (second pure) .
     fmap swap
 
-traceGr :: (Show a, Show b) => String -> GR.Gr a b -> GR.Gr a b
-traceGr msg gr = gr `seq` trace (msg <> "\n" <> GR.prettify gr) gr
+debugLogGR :: (Show a, Show b, MonadLogger m) => Text -> GR.Gr a b -> m ()
+debugLogGR msg gr = logDebugN (msg <> "\n" <> toText (GR.prettify gr))
 
 forNodes_ ::
        GetGraph g a b s m => (a -> Maybe c) -> (GR.Node -> c -> m x) -> m ()
@@ -561,6 +562,7 @@ forNodes_ pred ac = do
 annotateAndRewriteQuery ::
        MonadLogger m => [FData] -> DFGraph.OutGraph -> m (ContextMap, MirGraph)
 annotateAndRewriteQuery compiledNodes graph = do
+    debugLogGR "Initial Graph" iGr
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
     s1 <- flip execStateT s0 $ collapseNth envInputs
     let g = mkContextMap envInputs (fst s1)
@@ -575,7 +577,6 @@ annotateAndRewriteQuery compiledNodes graph = do
   where
     iGr :: GR.Gr QualifiedBinding (Int, Int)
     iGr =
-        traceGr "Initial Graph" $
         GR.mkGraph
             (map (first unwrap) $ (sourceId, "intrinsic/source") :
              (sinkId, "intrinsic/sink") :
@@ -650,10 +651,12 @@ collapseMultiArcs ::
 collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
 
 collapseNth :: GetGraph g QualifiedBinding Column s m => LitMap -> m ()
-collapseNth envInputs = do
-    nthNodes <- getNodesOfType (== "ohua.lang/nth")
-    for_ nthNodes $ \node -> do
-        ([((0, 0), inOp)], _, _, outs) <- sGetContext node
+collapseNth envInputs =
+    forNodes_
+        (\case
+             "ohua.lang/nth" -> Just ()
+             _ -> Nothing) $ \node _ -> do
+        ([((0, 2), inOp)], _, _, outs) <- sGetContext node
         let [(0, NumericLit (fromIntegral -> idx))] = envInputs IM.! node
         sDelNode node
         for_ outs $ \((0, inIdx), tOp) -> sInsEdge (inOp, tOp, (idx, inIdx))
@@ -962,7 +965,7 @@ noriaMirSourceDir = "noria-server/mir/src"
 generate :: [FData] -> CodeGen
 generate compiledNodes CodeGenData {..} = do
     (ctxMap, iGr) <- annotateAndRewriteQuery compiledNodes graph
-    logDebugN $ "Annotated graph:\n" <> toText (GR.prettify iGr)
+    debugLogGR "Annotated graph:" iGr
     tpl <- loadNoriaTemplate "udf_graph.rs"
     let subs =
             ["graph" ~> [renderDoc $ asRust $ toSerializableGraph ctxMap iGr]]
@@ -1023,70 +1026,64 @@ patchFiles :: (MonadIO m, MonadLogger m) => Maybe FilePath -> [FData] -> m ()
 patchFiles mOutDir udfs =
     mapM_ (uncurry $ patchFile mOutDir) (HashMap.toList fileMap)
   where
-    toMap = HashMap.fromListWith (HashMap.unionWith (<>))
-    fileMap =
-        toMap $ flip concatMap udfs $ \FData {..} ->
-            let opStructName = mkOpStructName udfName
-                nodeOpConstr = T.toTitle $ opStructName <> "UDF"
-                nodePath = mkNodePath udfName
-             in [ noriaDataflowSourceDir <> "/ops/mod.rs" ~>
-                  [ "node-operator-enum" ~>
-                    [nodeOpConstr <> "(" <> nodePath <> "),"]
-                  , "nodeop-from-impl-macro-call" ~>
-                    [ "nodeop_from_impl!(NodeOperator::" <> nodeOpConstr <> ", " <>
-                      nodePath <>
-                      ");"
-                    ]
+    toMap =
+        ([ noriaDataflowSourceDir <> "/ops/ohua/mod.rs" ~>
+           ["link-generated-modules" ~> ["pub mod generated;"]]
+         ] <>) .
+        HashMap.fromListWith (HashMap.unionWith (<>))
+    fileMap = toMap $ udfs >>= mkPatchesFor
+
+mkPatchesFor :: FData -> [(FilePath, HashMap Text [Text])]
+mkPatchesFor FData {..} =
+    [ noriaDataflowSourceDir <> "/ops/mod.rs" ~>
+      [ "node-operator-enum" ~> [nodeOpConstr <> "(" <> nodePath <> "),"]
+      , "nodeop-from-impl-macro-call" ~>
+        [ "nodeop_from_impl!(NodeOperator::" <> nodeOpConstr <> ", " <> nodePath <>
+          ");"
+        ]
                -- nodeop_from_impl!(NodeOperator::ClickAnaUDF, ohua::click_ana::ClickAna);
-                  , "impl-ingredient-mut-macro" ~>
-                    [ "NodeOperator::" <> nodeOpConstr <>
-                      "(ref mut i) => i.$fn($($arg),*),"
-                    ]
+      , "impl-ingredient-mut-macro" ~>
+        ["NodeOperator::" <> nodeOpConstr <> "(ref mut i) => i.$fn($($arg),*),"]
                 -- NodeOperator::ClickAnaUDF(ref mut i) => i.$fn($($arg),*),
-                  , "impl-ingredient-ref-macro" ~>
-                    [ "NodeOperator::" <> nodeOpConstr <>
-                      "(ref i) => i.$fn($($arg),*),"
-                    ]
+      , "impl-ingredient-ref-macro" ~>
+        ["NodeOperator::" <> nodeOpConstr <> "(ref i) => i.$fn($($arg),*),"]
              -- NodeOperator::ClickAnaUDF(ref i) => i.$fn($($arg),*),
-                  ]
-                , "noria-server/dataflow/src/state/mod.rs" ~>
-                  [ ("state-trait-method-def" :: Text) ~>
-                    mkStateTraitCoercionFunc udfName udfState "Option::None"
+      ]
+    , "noria-server/dataflow/src/state/mod.rs" ~>
+      [ ("state-trait-method-def" :: Text) ~>
+        mkStateTraitCoercionFunc udfName udfState "Option::None"
             -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
             --     Option::None
             -- }
-                  ]
-                , noriaDataflowSourceDir <> "/ops/ohua/att3.rs" ~>
-                  [ "generated-udf-inits" ~>
-                    pure
-                        (renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
-                         ppBlock
-                             (PP.vsep
-                                  [ "assert_eq!(over_cols.len(), " <>
-                                    pretty (length referencedFields) <>
-                                    ");"
-                                  , pretty
-                                        (mkNodePath $ udfName & namespace .
-                                         unwrapped .
-                                         ix 0 .~
-                                         "super") <>
-                                    "::new" <>
-                                    PP.tupled
-                                        ("parent" : "0" :
-                                         map
-                                             (\n ->
-                                                  "over_cols" <>
-                                                  PP.brackets (pretty n))
-                                             [0 .. pred $
-                                                   length referencedFields] <>
-                                         ["group"])
-                                  ] <>
-                              ".into()") <>
-                         ",")
-                  ]
-                , noriaDataflowSourceDir <> "/ops/ohua/mod.rs" ~>
-                  ["link-generated-modules" ~> ["pub mod generated;"]]
-                ] :: [(FilePath, HashMap Text [Text])]
+      ]
+    , noriaDataflowSourceDir <> "/ops/ohua/att3.rs" ~>
+      [ "generated-udf-inits" ~>
+        [ renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
+          ppBlock
+              (PP.vsep
+                   [ "assert_eq!(over_cols.len(), " <>
+                     pretty (1 `max` length referencedFields) <>
+                     ");"
+                   , pretty
+                         (mkNodePath $ udfName & namespace . unwrapped . ix 0 .~
+                          "super") <>
+                     "::new" <>
+                     PP.tupled
+                         ("parent" : "0" :
+                          map
+                              (\n -> "over_cols" <> PP.brackets (pretty n))
+                              [0 .. pred $ length referencedFields] <>
+                          ["group"])
+                   ] <>
+               ".into()") <>
+          ","
+        ]
+      ]
+    ]
+  where
+    opStructName = mkOpStructName udfName
+    nodeOpConstr = T.toTitle $ opStructName <> "UDF"
+    nodePath = mkNodePath udfName
 
 pattern GenFuncsNamespace :: NSRef
 
@@ -1131,29 +1128,29 @@ generateNoriaUDFs fields addUdf program = do
                 (\case
                      Let st initExpr body
                          | st `HashSet.member` stateVals -> do
+                             logDebugN $ "Considering the function:\n" <>
+                                 quickRender body
                              (e', _, (Dual (Endo mut), rets)) <-
                                  runRWST (RS.para (go st) body) () mempty
                              bnd <- generateBindingWith ("op_" <> st)
                              let udfName =
                                      QualifiedBinding GenFuncsNamespace bnd
-                                 v'
-                                     | [i] <- rets = i
-                                     | otherwise =
-                                         error $ "Expected only one return from udf " <> quickRender e' <> ", found " <>
-                                         show rets
-                                 udf = mut $ Var v'
+                                 -- TODO This also necessitates changing the invoke expression to destructure this output!!
+                             (v', handleReturn) <-
+                                 setupReturnRecieve $ HashSet.toList rets
+                             let udf = mut v'
                                  freeVars =
                                      filter (/= Var st) $ findFreeVariables udf
-                             logInfoN $ "Found operator function " <>
+                             logDebugN $ "Found operator function " <>
                                  quickRender udfName <>
                                  "\n" <>
                                  quickRender (Let st initExpr udf)
                              fdata <- processUdf fields udfName udf st initExpr
                              liftIO $ addUdf fdata
-                             pure $ invokeExpr fdata
+                             pure $ handleReturn (invokeExpr fdata) e'
                      e -> pure e)
                 program
-    logInfoN $ "Remaining program\n" <> quickRender program'
+    logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
     globalVals = HashSet.fromList $ RS.cata f program
@@ -1172,6 +1169,27 @@ generateNoriaUDFs fields addUdf program = do
                       e -> error (show e)
             ] `HashSet.difference`
         globalVals
+
+setupReturnRecieve ::
+       (Monad m, MonadGenBnd m) => [Binding] -> m (Expr, Expr -> Expr -> Expr)
+setupReturnRecieve returns = do
+    case returns of
+        [] -> (Lit UnitLit, ) . Let <$> generateBindingWith "_"
+        [i] -> pure (Var i, Let i)
+        other -> do
+            retBnd <- generateBindingWith "find_good_name"
+            pure (mkTup, \call -> Let retBnd call . destrTup retBnd)
+  where
+    mkTup =
+        foldl'
+            Apply
+            (embedE ("ohua.lang/(,)" :: QualifiedBinding))
+            (map embedE returns)
+    destrTup bnd =
+        appEndo $
+        foldMap
+            (\(i, x) -> Endo $ Let x (mkNthExpr i (length returns) (Var bnd)))
+            (zip [0 ..] returns)
 
 outputFile :: MonadIO m => FilePath -> Text -> m ()
 outputFile path content =

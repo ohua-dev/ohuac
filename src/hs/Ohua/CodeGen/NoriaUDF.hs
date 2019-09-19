@@ -817,13 +817,6 @@ data MirNode
     -- | MirJoin
     -- | MirProjection
 
-colsFromOp :: MirNode -> [MirColumn]
-colsFromOp =
-    \case
-        Regular {indices} -> indices
-        MirJoin {..} -> left <> right
-        MirIdentity idxs -> idxs
-
 data SerializableGraph = SerializableGraph
     { adjacencyList :: AdjList MirNode
     , sink :: (Word, [MirColumn])
@@ -900,24 +893,25 @@ toSerializableGraph cm mg =
         { adjacencyList =
               [ (newOp, ctxCols <> cols, map toNIdx ins)
               | (_, n) <- drop 2 indexMapping
-              , let (newOp, (ctxCols, cols)) = opMap IM.! n
+              , let (newOp, ctxCols, cols) = opMap IM.! n
                     ins = GR.pre mg n
               ]
         , sink =
               let [sink] = filter (isSink . snd) (GR.labNodes mg)
                   [(s, _, l)] = GR.inn mg $ fst sink
-               in (toNIdx s, snd $ snd (opMap IM.! s))
+               in (toNIdx s, opMap ^?! ix s . _3)
         , source =
               let [src] = filter (isSource . snd) (GR.labNodes mg)
                   labels = concatMap (^. _3) $ GR.out mg (fst src)
                in map (colFrom (-1)) [0 .. maximum (map fst labels)]
         }
   where
+    opMap :: IntMap (MirNode, [MirColumn], [MirColumn])
     opMap =
         IM.fromList
-            [ (n, (newOp, (flattenCtx ctx, colsFromOp newOp)))
+            [ (n, (newOp, flattenCtx ctx, cols))
             | (_, n) <- drop 2 indexMapping
-            , let (ins, _, op, _) = GR.context mg n
+            , let (ins, _, op, outs) = GR.context mg n
                   ctx = cm IM.! n
                   indices =
                       case ins of
@@ -925,6 +919,16 @@ toSerializableGraph cm mg =
                           [(edges, n)] ->
                               map (colFrom n . fst) $ sortOn snd edges
                           _ -> error $ "Too many ancestors for " <> show op
+                  cols
+                      | null outs = []
+                      | otherwise =
+                          map
+                              (colFrom n)
+                              [0 .. maximum
+                                        [ outIdx
+                                        | out <- outs
+                                        , (outIdx, _) <- fst out
+                                        ]]
                   newOp =
                       case op of
                           CustomOp o ->
@@ -934,26 +938,29 @@ toSerializableGraph cm mg =
                                   , executionType = Reduction $ flattenCtx ctx
                                   }
                           Join _ ->
-                              let [p1, p2] = ins
-                               in MirJoin
-                                      { mirJoinProject =
-                                            flattenCtx ctx <> adjToProduced p1 <>
-                                            adjToProduced p2
-                                      , left = flattenCtx ctx
-                                      , right = flattenCtx ctx
-                                      }
+                              MirJoin
+                                  { mirJoinProject =
+                                        flattenCtx ctx <> adjToProduced p1 <>
+                                        adjToProduced p2
+                                  , left = flattenCtx ctx
+                                  , right = flattenCtx ctx
+                                  }
+                              where [p1, p2] = ins
                           Projection _ -> unimplemented
-                          Identity -> MirIdentity $ opMap ^?! ix p . _2 . _2
+                          Identity -> MirIdentity $ opMap ^?! ix p . _3
                               where [(_, p)] = ins
                           Sink -> error "impossible"
                           Source -> error "impossible"
             ]
     adjToProduced (edges, opid) = map (\(out, _) -> colFrom opid out) edges
-    colFrom op idx = DFGraph.Target (unsafeMake op) idx
-    indexMapping = zip [0 ..] (-1 : -2 : filter (\n -> n >= 0) (GR.nodes mg))
+    colFrom op = DFGraph.Target (unsafeMake op)
+    indexMapping :: [(Word, Int)]
+    indexMapping = zip [0 ..] (-1 : -2 : filter (>= 0) (GR.nodes mg))
+    toNIdx :: Int -> Word
     toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
     contextSize = fromIntegral . length . flattenCtx
 
+flattenCtx :: [Context] -> [MirColumn]
 flattenCtx = (>>= \(GroupBy l) -> l)
 
 unimplemented :: HasCallStack => a

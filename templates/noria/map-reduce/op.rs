@@ -50,8 +50,9 @@ impl Typed for
     // <end(udf-name)>
 {
     type Type = SqlType;
-    fn typ(&self) -> Self::Type {
-        // <insert(sql-type)>
+    fn typ_static() -> Self::Type {
+        // <insert(udf-state-type)>
+            ::typ_static()
     }
 }
 

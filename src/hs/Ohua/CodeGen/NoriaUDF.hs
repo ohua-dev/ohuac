@@ -412,7 +412,6 @@ processUdf fields udfName program state initState =
                             , "row-name" ~> [unwrap rowName]
                             , "special-state-coerce-call" ~>
                               ["." <> mkSpecialStateCoerceName udfName <> "()"]
-                            , "sql-type" ~> ["SqlType::Double"] -- Do not hardcode this
                             , "node-properties" ~>
                               map
                                   (\e ->
@@ -516,14 +515,14 @@ udfFileToPathThing pt qname finalPart =
 
 type Column = (Int, Int)
 
-data Context =
+data Scope =
     GroupBy [DFGraph.Target]
     -- | SmapC   -- Add this eventually
     deriving (Show)
 
 data Operator
     = CustomOp QualifiedBinding
-    | Join { joinOn :: [Context] }
+    | Join { joinOn :: [Scope] }
     | Projection [Column]
     | Identity
     | Sink
@@ -560,17 +559,18 @@ forNodes_ pred ac = do
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
 annotateAndRewriteQuery ::
-       MonadLogger m => [FData] -> DFGraph.OutGraph -> m (ContextMap, MirGraph)
+       MonadLogger m => [FData] -> DFGraph.OutGraph -> m (ScopeMap, MirGraph)
 annotateAndRewriteQuery compiledNodes graph = do
     debugLogGR "Initial Graph" iGr
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
-    s1 <- flip execStateT s0 $ collapseNth envInputs
-    let g = mkContextMap envInputs (fst s1)
-    logInfoN $ "Context Map\n" <> show g
+    s1@(gr1, _) <- flip execStateT s0 $ collapseNth envInputs
+    let g = mkScopeMap envInputs gr1
+    logInfoN $ "Scope Map\n" <> show g
+    debugLogGR "Graph with nth collapsed" gr1
     (gr2, i2) <- execStateT removeSuperfluousOperators (first retype s1)
-    (gr1, _, g2) <-
+    (gr3, _, g2) <-
         flip execStateT (collapseMultiArcs gr2, i2, g) $ multiArcToJoin g
-    pure (g2, gr1)
+    pure (g2, gr3)
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
@@ -655,11 +655,13 @@ collapseNth envInputs =
     forNodes_
         (\case
              "ohua.lang/nth" -> Just ()
-             _ -> Nothing) $ \node _ -> do
-        ([((0, 2), inOp)], _, _, outs) <- sGetContext node
-        let [(0, NumericLit (fromIntegral -> idx))] = envInputs IM.! node
-        sDelNode node
-        for_ outs $ \((0, inIdx), tOp) -> sInsEdge (inOp, tOp, (idx, inIdx))
+             _ -> Nothing) $ \node _ -> 
+                sGetContext node >>= \case
+                    ([((0, 2), inOp)], _, _, outs) -> do
+                        let Just (0, NumericLit (fromIntegral -> idx)) = find ((==0) . view _1) $ envInputs IM.! node
+                        sDelNode node
+                        for_ outs $ \((0, inIdx), tOp) -> sInsEdge (inOp, tOp, (idx, inIdx))
+                    other -> error $ "scope has incorrect shape: " <> show other
 
 dropNodes :: GetGraph g a Column s m => (a -> Bool) -> m ()
 dropNodes f =
@@ -671,9 +673,8 @@ dropNodes f =
 
 dropNodesProjecting ::
        GetGraph g a Column s m => (a -> Maybe (Int -> Int)) -> m ()
-dropNodesProjecting pred = do
-    mkTupNodes <- getNodesOfType (isJust . pred)
-    for_ mkTupNodes $ \node -> do
+dropNodesProjecting pred =
+    forNodes_ pred $ \node project -> do
         (ins, _, lab, outs) <- sGetContext node
         let inMap' =
                 sortOn
@@ -681,13 +682,12 @@ dropNodesProjecting pred = do
                     [ (inIdx, (outIdx, source))
                     | ((outIdx, inIdx), source) <- ins
                     ]
-        assertM $ and [i == i' | (i, (i', _)) <- zip [0 ..] inMap']
+        assertM $ and [i == i' && outIdx == 0 | (i, (i', (outIdx, _))) <- zip [0 ..] inMap']
         let inMap = map snd inMap'
         sDelNode node
-        let Just project = pred lab
         for_ outs $ \((outIdx, inIdx), target) ->
             let (sIdx, sOp) = inMap !! project outIdx
-             in sInsEdge (sOp, target, (sIdx, inIdx))
+             in sInsEdge (sOp, target, (outIdx, inIdx))
 
 removeSuperfluousOperators :: GetGraph g Operator Column s m => m ()
 removeSuperfluousOperators =
@@ -702,8 +702,8 @@ removeSuperfluousOperators =
   where
     toFirstInput _ = 0
 
-mkContextMap :: LitMap -> NoriaGraph QualifiedBinding Column -> ContextMap
-mkContextMap lm gr = m
+mkScopeMap :: LitMap -> NoriaGraph QualifiedBinding Column -> ScopeMap
+mkScopeMap lm gr = m
   where
     m =
         IM.fromList
@@ -746,21 +746,21 @@ retype =
         "ohua.lang/(,)" -> Identity -- Needs to become a project instead
         other -> CustomOp other
 
-type ContextMap = IntMap [Context]
+type ScopeMap = IntMap [Scope]
 
 type NoriaGraph opLabel edgeLabel = GR.Gr opLabel edgeLabel
 
 type MirGraph = NoriaGraph Operator [Column]
 
--- TODO Update contexts
+-- TODO Update scopes
 multiArcToJoin ::
        ( a ~ Operator
        , b ~ [Column]
        , GetGraph g a b s m
        , Field2' s GR.Node
-       , Field3' s ContextMap
+       , Field3' s ScopeMap
        )
-    => IntMap [Context]
+    => ScopeMap
     -> m ()
 multiArcToJoin ctxMap = do
     gr <- use _1
@@ -791,7 +791,7 @@ multiArcToJoin ctxMap = do
                        | otherwise -> (ctx1, ctx2, False)
         id <- mkNode $ Join lowerCtx
         _3 %= IM.insert id lowerCtx
-        -- TODO update contexts
+        -- TODO update scopes
         _1 %= GR.insEdges [(p1, id, p1Cols), (p2, id, p2Cols)]
         pure (p1Cols ++ p2Cols, id)
 
@@ -887,26 +887,33 @@ instance ToRust SerializableGraph where
                 ]
         encodeCols = map encodeCol
 
-toSerializableGraph :: ContextMap -> MirGraph -> SerializableGraph
+type OpMap = IntMap OpMapEntry
+
+type OpMapEntry = (MirNode, [MirColumn], [MirColumn])
+
+completeOutputColsFor :: OpMapEntry -> [MirColumn]
+completeOutputColsFor i = i ^. _2 <> i ^. _3
+
+toSerializableGraph :: ScopeMap -> MirGraph -> SerializableGraph
 toSerializableGraph cm mg =
     SerializableGraph
         { adjacencyList =
-              [ (newOp, ctxCols <> cols, map toNIdx ins)
+              [ (entry ^. _1, completeOutputColsFor entry, map toNIdx ins)
               | (_, n) <- drop 2 indexMapping
-              , let (newOp, ctxCols, cols) = opMap IM.! n
+              , let entry = opMap IM.! n
                     ins = GR.pre mg n
               ]
         , sink =
               let [sink] = filter (isSink . snd) (GR.labNodes mg)
                   [(s, _, l)] = GR.inn mg $ fst sink
-               in (toNIdx s, opMap ^?! ix s . _3)
+               in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s )
         , source =
               let [src] = filter (isSource . snd) (GR.labNodes mg)
                   labels = concatMap (^. _3) $ GR.out mg (fst src)
                in map (colFrom (-1)) [0 .. maximum (map fst labels)]
         }
   where
-    opMap :: IntMap (MirNode, [MirColumn], [MirColumn])
+    opMap :: OpMap
     opMap =
         IM.fromList
             [ (n, (newOp, flattenCtx ctx, cols))
@@ -958,9 +965,9 @@ toSerializableGraph cm mg =
     indexMapping = zip [0 ..] (-1 : -2 : filter (>= 0) (GR.nodes mg))
     toNIdx :: Int -> Word
     toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
-    contextSize = fromIntegral . length . flattenCtx
+    scopeSize = fromIntegral . length . flattenCtx
 
-flattenCtx :: [Context] -> [MirColumn]
+flattenCtx :: [Scope] -> [MirColumn]
 flattenCtx = (>>= \(GroupBy l) -> l)
 
 unimplemented :: HasCallStack => a
@@ -1056,7 +1063,7 @@ mkPatchesFor FData {..} =
         ["NodeOperator::" <> nodeOpConstr <> "(ref i) => i.$fn($($arg),*),"]
              -- NodeOperator::ClickAnaUDF(ref i) => i.$fn($($arg),*),
       ]
-    , "noria-server/dataflow/src/state/mod.rs" ~>
+    , noriaDataflowSourceDir <> "/state/mod.rs" ~>
       [ ("state-trait-method-def" :: Text) ~>
         mkStateTraitCoercionFunc udfName udfState "Option::None"
             -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
@@ -1084,6 +1091,12 @@ mkPatchesFor FData {..} =
                    ] <>
                ".into()") <>
           ","
+        ]
+      ]
+      , "noria-server/src/controller/schema.rs" ~>
+      [ "type-resolution-for-generated-nodes" ~> 
+        [ renderDoc $
+            "ops::NodeOperator::" <> pretty nodeOpConstr <> PP.parens "ref n" <+> "=>" <+> "Some(n.typ()),"
         ]
       ]
     ]
@@ -1179,7 +1192,7 @@ generateNoriaUDFs fields addUdf program = do
 
 setupReturnRecieve ::
        (Monad m, MonadGenBnd m) => [Binding] -> m (Expr, Expr -> Expr -> Expr)
-setupReturnRecieve returns = do
+setupReturnRecieve returns =
     case returns of
         [] -> (Lit UnitLit, ) . Let <$> generateBindingWith "_"
         [i] -> pure (Var i, Let i)

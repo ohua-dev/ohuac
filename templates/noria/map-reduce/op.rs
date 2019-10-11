@@ -96,7 +96,7 @@ impl
         state: &mut StateMap,
     ) -> ProcessingResult {
         let idx = self.local_index.unwrap();
-        println!("{} Received input of size {}", idx, rs.len());
+        //eprintln!("{} Received input of size {}", idx, rs.len());
         debug_assert_eq!(from, *self.src);
 
         if rs.is_empty() {
@@ -131,7 +131,7 @@ impl
             .expect("This operator need a special state type")
             .0;
 
-        println!("{} Fetched database", idx);
+        //eprintln!("{} Fetched database", idx);
 
         let mut misses = Vec::new();
         let mut lookups = Vec::new();
@@ -144,7 +144,7 @@ impl
 
                     let group = get_group_values(group_by, group_rs.peek().unwrap());
 
-                    println!("{} Handling group {:?}", idx, &group);
+                    //eprintln!("{} Handling group {:?}", idx, &group);
 
                     let mut mrs = db.lookup_leaf_mut(&out_key[..], &KeyType::from(&group[..]));
                     let rs = match mrs {
@@ -175,14 +175,14 @@ impl
                     let new = {
                         let computer = rs.get_or_init_compute_mut();
                         for (ac, pos) in diffs {
-                            println!("Applying action {:?}", &ac);
+                            //eprintln!("Applying action {:?}", &ac);
                             computer.apply(ac, pos);
                         }
                         //let v = computer.compute_new_value().into();
                         let v = {
                             // <insert(reduce)>
                         };
-                        println!("{} Computed {}", idx, v);
+                        //eprintln!("{} Computed {}", idx, v);
                         v.into()
                     };
 
@@ -193,7 +193,7 @@ impl
 
                     match current {
                         Some(ref current) if new == **current => {
-                            println!("Value did not change");
+                            //eprintln!("Value did not change");
                             // no change
                         }
                         _ => {
@@ -241,7 +241,7 @@ impl
             handle_group(group_rs.drain(..), diffs.drain(..));
         }
 
-        println!("{} Finished processing", idx);
+        //eprintln!("{} Finished processing", idx);
 
         ProcessingResult {
             results: out.into(),
@@ -285,7 +285,7 @@ impl Ingredient for
 
     fn on_commit(&mut self, us: NodeIndex, remap: &HashMap<NodeIndex, IndexPair>) {
 
-        println!("Being added to graph");
+        //eprintln!("Being added to graph");
         // who's our parent really?
         self.src.remap(remap);
 

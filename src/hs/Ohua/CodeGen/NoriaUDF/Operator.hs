@@ -48,7 +48,7 @@ import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
 import qualified Ohua.ALang.Passes as ALang (normalize)
 import qualified Ohua.ALang.Refs as ALang
-import Ohua.ALang.Util (findFreeVariables)
+import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply)
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONObject
 import qualified Ohua.DFGraph as DFGraph
@@ -76,6 +76,7 @@ data FData = FData
     }
 
 type AddUDF = FData -> IO ()
+
 type Fields = IM.IntMap Text
 
 -- | Just a simple helper to make writing the HashMap literals nicer
@@ -180,7 +181,11 @@ mkMapFn fields program' stateV coll = do
             | otherwise = unsafeMake $ unwrap from <> "." <> show idx
         resolveFieldType = (fields IM.!)
         function = "let _ = " <> ppBlock inLoop <> ";"
-        toRust = Ohua.CodeGen.NoriaUDF.Operator.toRust resolveFieldVar isTheState mkAc
+        toRust =
+            Ohua.CodeGen.NoriaUDF.Operator.toRust
+                resolveFieldVar
+                isTheState
+                mkAc
         mkAc func' args =
             "diffs.push" <> "((Action::" <> pretty (T.toTitle (unwrap func')) <>
             (if null args || args == [Lit UnitLit]
@@ -414,6 +419,12 @@ baseUdfSubMap udfName rowName accessedFields =
     , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
     ]
 
+generatedOpSourcePath :: QualifiedBinding -> FilePath
+generatedOpSourcePath udfName =
+    noriaDataflowSourceDir <> "/state/ohua/generated/" <>
+    toString (unwrap $ udfName ^. name) <>
+    ".rs"
+
 processStatefulUdf ::
        (MonadOhua m)
     => Fields
@@ -431,9 +442,7 @@ processStatefulUdf fields udfName program state initState =
                 let nodeSub =
                         TemplateSubstitution
                             "map-reduce/op.rs"
-                            (noriaDataflowSourceDir <> "/ops/ohua/generated/" <>
-                             toString (unwrap $ udfName ^. name) <>
-                             ".rs") $
+                            (generatedOpSourcePath udfName) $
                         baseUdfSubMap udfName rowName accessedFields <>
                         [ "map" ~> ["use " <> stateNSStr <> "::Action;", mapFn]
                         , "reduce" ~> [reduceFn]
@@ -642,7 +651,6 @@ pattern GenFuncsNamespace :: NSRef
 pattern GenFuncsNamespace <- ["ohua", "generated"]
   where GenFuncsNamespace = ["ohua", "generated"]
 
-
 generateOperators :: Fields -> AddUDF -> Expression -> OhuaM env Expression
 generateOperators fields addUdf program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
@@ -683,7 +691,7 @@ generateOperators fields addUdf program = do
                                  quickRender body
                              (e', _, (Dual (Endo mut), rets)) <-
                                  runRWST (RS.para (go st) body) () mempty
-                             bnd <- generateBindingWith ("op_" <> st)
+                             bnd <- generateBindingWith ("op_s_" <> st)
                              let udfName =
                                      QualifiedBinding GenFuncsNamespace bnd
                                  -- TODO This also necessitates changing the invoke expression to destructure this output!!
@@ -706,7 +714,70 @@ generateOperators fields addUdf program = do
                              liftIO $ addUdf fdata
                              pure $ handleReturn (invokeExpr fdata) e'
                      e -> pure e)
-                program
+                program >>=
+            transformM
+                (\case
+                     Let bnd val@Apply {} body
+                         | not $ isKnownFunction function
+                        -- This relies heavily of having the expected `let x = f a b c`
+                        -- structure
+                          -> do
+                             opName <-
+                                 generateBindingWith
+                                     ("op_p_" <> function ^. name <> "_")
+                             let udfName =
+                                     QualifiedBinding GenFuncsNamespace opName
+                             argVars <- traverse expectVar args
+                             liftIO $
+                                 addUdf
+                                     FData
+                                         { udfName = udfName
+                                         , inputBindings = argVars
+                                         , invokeExpr =
+                                               error
+                                                   "This should not be necessary here"
+                                         , udfState =
+                                               error "It doesn't have one"
+                                         , referencedFields = fieldIndices
+                                         , generations =
+                                               [ TemplateSubstitution
+                                                     "pure/op.rs"
+                                                     (generatedOpSourcePath
+                                                          udfName) $
+                                                 baseUdfSubMap
+                                                     udfName
+                                                     "r"
+                                                     accessedFields <>
+                                                 [ "function" ~>
+                                                   [ renderDoc $ asRust function <>
+                                                     PP.tupled
+                                                         (map (\i ->
+                                                                   "&r[" <>
+                                                                   pretty
+                                                                       (idxPropFromName
+                                                                            i) <>
+                                                                   "].clone()")
+                                                              (if args ==
+                                                                  [Lit UnitLit]
+                                                                   then []
+                                                                   else accessedFields))
+                                                   ]
+                                                 , "udf-ret-type" ~>
+                                                   ["SqlType::Double"]
+                                                 ]
+                                               ]
+                                         }
+                             pure $
+                                 Let
+                                     bnd
+                                     (fromListToApply
+                                          (FunRef udfName Nothing)
+                                          args)
+                                     body
+                         where (FunRef function _, args) = fromApplyToList val
+                               fieldIndices = [0 .. length args - 1]
+                               accessedFields = map ("none", ) fieldIndices
+                     other -> pure other)
     logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
@@ -726,6 +797,11 @@ generateOperators fields addUdf program = do
                       e -> error (show e)
             ] `HashSet.difference`
         globalVals
+
+isKnownFunction :: QualifiedBinding -> Bool
+isKnownFunction f =
+    f ^. namespace == GenFuncsNamespace || f ^? namespace . unwrapped . ix 0 ==
+    Just "ohua"
 
 setupReturnRecieve ::
        (Monad m, MonadGenBnd m) => [Binding] -> m (Expr, Expr -> Expr -> Expr)

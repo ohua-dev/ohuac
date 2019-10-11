@@ -4,20 +4,17 @@ module Main where
 
 import Ohua.Prelude
 
-import Control.Category ((>>>))
 import Control.Lens (Index, IxValue, Ixed, (^?), (^?!), _Just, ix, view)
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
 import qualified Data.Functor.Foldable as RS
-import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as HS (HashSet, fromList, member)
 import qualified Data.IntMap as IM
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
 import qualified Data.Text.Prettyprint.Doc as PP
 import qualified Data.Time as Time
-import Data.Traversable (for)
 import Language.Haskell.TH
 import Ohua.ALang.Lang (Expr(Lambda))
 import Options.Applicative as O

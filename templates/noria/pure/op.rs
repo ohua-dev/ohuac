@@ -33,7 +33,8 @@ pub struct
     src: IndexPair,
 
     // the first `n` columns are moved to the output unchanged, to make sure scope is
-    // preserved. `n+1` is the computed result
+    // preserved. `n+1` is the computed result. Could in future be `n+m` when a tuple is
+    // returned
     carry: usize,
 }
 
@@ -44,7 +45,7 @@ impl Typed for
 {
     type Type = SqlType;
     fn typ_static() -> Self::Type {
-        // <insert(udf-state-type)>
+        // <insert(udf-ret-type)>
             ::typ_static()
     }
 }
@@ -58,6 +59,7 @@ impl
         src: NodeIndex,
         // <insert(udf-args-sigs)>
         // <insert(node-properties)>
+        carry: usize
     ) -> Self {
         // <begin(udf-name)>
         Self
@@ -69,9 +71,7 @@ impl
 
             // <insert(node-property-args)>
 
-            carry:
-                // <insert(carry)>
-                ,
+            carry: carry,
         }
     }
 }

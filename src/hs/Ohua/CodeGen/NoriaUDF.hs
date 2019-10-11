@@ -111,6 +111,11 @@ pattern If cond then_ else_ <-
            Lambda _ then_)
           `Apply` Lambda _ else_
 
+pattern Nth n len coll <-
+        ((PureFunction "ohua.lang/nth" _ `Apply` Lit (NumericLit n))
+           `Apply` Lit (NumericLit len))
+          `Apply` coll
+
 idxPropFromName :: (Binding, Int) -> Binding
 idxPropFromName (st, f) = pwu st <> makeThrow (show f) <> "__index"
   where
@@ -153,7 +158,7 @@ mkMapFn fields program' stateV coll = do
     inLoopFieldVars <-
         traverse
             (generateBindingWith . ("ilv__" <>) . show . fst)
-            loopAcessedFields
+            loopAccessedFields
     let inLoop =
             PP.vsep $
             [ "let" <+> pretty fieldVar <+> ": &" <>
@@ -185,20 +190,25 @@ mkMapFn fields program' stateV coll = do
     isTheState = (== Var stateV)
     (program, rowName) =
         case program' of
-            Lambda a b -> (b, a)
+            Lambda a b -> (dropUnusedFieldAccess b, a)
             _ ->
                 error $ "Expected lambda as input to smap, got " <>
                 quickRender program'
-    fieldIndices = map fst loopAcessedFields
-    loopAcessedFields = extractIndexingInto (== rowName) program
+    fieldIndices = map fst loopAccessedFields
+    loopAccessedFields = extractIndexingInto (== rowName) program
+
+dropUnusedFieldAccess :: Expression -> Expression
+dropUnusedFieldAccess =
+    rewrite $ \case
+        Let bnd (Nth _ _ _) body
+            | isIgnoredBinding bnd -> Just body
+        _ -> Nothing
 
 extractIndexingInto :: (Binding -> Bool) -> Expression -> [(Int, Binding)]
 extractIndexingInto f program =
     hashNub
         [ (fromIntegral n, st)
-        | PureFunction fun _ `Apply` Lit (NumericLit n) `Apply` _ `Apply` (expectVarE -> st) <-
-              universe program
-        , fun == "ohua.lang/nth"
+        | Nth n _ (expectVarE -> st) <- universe program
         , f st
         ]
 
@@ -217,6 +227,7 @@ expectNumLit e = error $ "Expected a numeric literal, found " <> show e
 -- our examples, but may not always be. What i needed is actually check if the
 -- thing we're calling it on is actually the row and otherwise compile to rust
 -- tuple access.
+-- UPDATE: I think I may have fixed that actually
 toRust ::
        ((Binding, Int) -> Binding)
     -> (Expr -> Bool)
@@ -382,7 +393,24 @@ asNonEmpty :: Traversal [a] [b] (NonEmpty a) [b]
 asNonEmpty _ [] = pure []
 asNonEmpty f (x:xs) = f (x :| xs)
 
-processUdf ::
+type UDFAccessedField = (Binding, Int)
+
+baseUdfSubMap :: QualifiedBinding -> Binding -> [UDFAccessedField] -> Substitutions
+baseUdfSubMap udfName rowName accessedFields =
+    [ "udf-name" ~> [T.toTitle $ unwrap $ udfName ^. name]
+    , "udf-name-str" ~> ["\"" <> unwrap (udfName ^. name) <> "\""]
+    , "row-name" ~> [unwrap rowName]
+    , "special-state-coerce-call" ~>
+      ["." <> mkSpecialStateCoerceName udfName <> "()"]
+    , "node-properties" ~>
+      map (\e -> unwrap (idxPropFromName e) <> ": usize,") accessedFields
+    , "node-property-args" ~>
+      map ((<> ",") . unwrap . idxPropFromName) accessedFields
+    , "udf-args" ~> ["udf_arg_placeholder,"]
+    , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
+    ]
+
+processStatefulUdf ::
        (MonadOhua m)
     => Fields
     -> QualifiedBinding
@@ -390,7 +418,7 @@ processUdf ::
     -> Binding
     -> Expression
     -> m FData
-processUdf fields udfName program state initState =
+processStatefulUdf fields udfName program state initState =
     case program of
         Let unit (Smap _ mapF (Var coll)) reduceF
             | isIgnoredBinding unit -> do
@@ -401,30 +429,14 @@ processUdf fields udfName program state initState =
                             "map-reduce/op.rs"
                             (noriaDataflowSourceDir <> "/ops/ohua/generated/" <>
                              toString (unwrap $ udfName ^. name) <>
-                             ".rs")
-                            [ "udf-name" ~>
-                              [T.toTitle $ unwrap $ udfName ^. name]
-                            , "udf-name-str" ~>
-                              ["\"" <> unwrap (udfName ^. name) <> "\""]
-                            , "map" ~>
-                              ["use " <> stateNSStr <> "::Action;", mapFn]
-                            , "reduce" ~> [reduceFn]
-                            , "row-name" ~> [unwrap rowName]
-                            , "special-state-coerce-call" ~>
-                              ["." <> mkSpecialStateCoerceName udfName <> "()"]
-                            , "node-properties" ~>
-                              map
-                                  (\e ->
-                                       unwrap (idxPropFromName e) <> ": usize,")
-                                  accessedFields
-                            , "node-property-args" ~>
-                              map
-                                  ((<> ",") . unwrap . idxPropFromName)
-                                  accessedFields
-                            , "udf-args" ~> ["udf_arg_placeholder,"]
-                            , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
-                            , "udf-state-type" ~> [stateTypeStr]
-                            ]
+                             ".rs") $
+                        baseUdfSubMap udfName rowName accessedFields <>
+                        [ "map" ~> ["use " <> stateNSStr <> "::Action;", mapFn]
+                        , "reduce" ~> [reduceFn]
+                        , "special-state-coerce-call" ~>
+                          ["." <> mkSpecialStateCoerceName udfName <> "()"]
+                        , "udf-state-type" ~> [stateTypeStr]
+                        ]
                     accessedFields = map (state, ) fieldIndices
                     stateType = getStateType initState
                     stateTypeStr = asRustT $ stateType ^. namespace
@@ -485,7 +497,7 @@ getStateType initState =
         [f] -> f
         o -> error $ "Too many qualified applications in state init " <> show o
 
-extractAcessedFields :: Expr -> [(Binding, Int)]
+extractAcessedFields :: Expr -> [UDFAccessedField]
 extractAcessedFields program =
     hashNub
         [ (expectVarE st, fromIntegral n)
@@ -655,13 +667,15 @@ collapseNth envInputs =
     forNodes_
         (\case
              "ohua.lang/nth" -> Just ()
-             _ -> Nothing) $ \node _ -> 
-                sGetContext node >>= \case
-                    ([((0, 2), inOp)], _, _, outs) -> do
-                        let Just (0, NumericLit (fromIntegral -> idx)) = find ((==0) . view _1) $ envInputs IM.! node
-                        sDelNode node
-                        for_ outs $ \((0, inIdx), tOp) -> sInsEdge (inOp, tOp, (idx, inIdx))
-                    other -> error $ "scope has incorrect shape: " <> show other
+             _ -> Nothing) $ \node _ ->
+        sGetContext node >>= \case
+            ([((0, 2), inOp)], _, _, outs) -> do
+                let Just (0, NumericLit (fromIntegral -> idx)) =
+                        find ((== 0) . view _1) $ envInputs IM.! node
+                sDelNode node
+                for_ outs $ \((0, inIdx), tOp) ->
+                    sInsEdge (inOp, tOp, (idx, inIdx))
+            other -> error $ "scope has incorrect shape: " <> show other
 
 dropNodes :: GetGraph g a Column s m => (a -> Bool) -> m ()
 dropNodes f =
@@ -682,7 +696,11 @@ dropNodesProjecting pred =
                     [ (inIdx, (outIdx, source))
                     | ((outIdx, inIdx), source) <- ins
                     ]
-        assertM $ and [i == i' && outIdx == 0 | (i, (i', (outIdx, _))) <- zip [0 ..] inMap']
+        assertM $
+            and
+                [ i == i' && outIdx == 0
+                | (i, (i', (outIdx, _))) <- zip [0 ..] inMap'
+                ]
         let inMap = map snd inMap'
         sDelNode node
         for_ outs $ \((outIdx, inIdx), target) ->
@@ -906,7 +924,7 @@ toSerializableGraph cm mg =
         , sink =
               let [sink] = filter (isSink . snd) (GR.labNodes mg)
                   [(s, _, l)] = GR.inn mg $ fst sink
-               in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s )
+               in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s)
         , source =
               let [src] = filter (isSource . snd) (GR.labNodes mg)
                   labels = concatMap (^. _3) $ GR.out mg (fst src)
@@ -1093,10 +1111,12 @@ mkPatchesFor FData {..} =
           ","
         ]
       ]
-      , "noria-server/src/controller/schema.rs" ~>
-      [ "type-resolution-for-generated-nodes" ~> 
-        [ renderDoc $
-            "ops::NodeOperator::" <> pretty nodeOpConstr <> PP.parens "ref n" <+> "=>" <+> "Some(n.typ()),"
+    , "noria-server/src/controller/schema.rs" ~>
+      [ "type-resolution-for-generated-nodes" ~>
+        [ renderDoc $ "ops::NodeOperator::" <> pretty nodeOpConstr <>
+          PP.parens "ref n" <+>
+          "=>" <+>
+          "Some(n.typ()),"
         ]
       ]
     ]
@@ -1165,7 +1185,13 @@ generateNoriaUDFs fields addUdf program = do
                                  quickRender udfName <>
                                  "\n" <>
                                  quickRender (Let st initExpr udf)
-                             fdata <- processUdf fields udfName udf st initExpr
+                             fdata <-
+                                 processStatefulUdf
+                                     fields
+                                     udfName
+                                     udf
+                                     st
+                                     initExpr
                              liftIO $ addUdf fdata
                              pure $ handleReturn (invokeExpr fdata) e'
                      e -> pure e)

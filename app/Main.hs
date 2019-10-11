@@ -219,7 +219,7 @@ main = do
                                 fields =
                                     IM.fromList $
                                     zip [0 ..] (map formatter $ reverse ftys)
-                            pure $ NoriaUDFGen.generateNoriaUDFs fields addUdf
+                            pure $ NoriaUDFGen.generateOperators fields addUdf
                         _ -> pure pure
                 gr <-
                     compile
@@ -237,7 +237,7 @@ main = do
                         SimpleJavaClass -> pure JavaGen.generate
                         NoriaUDF -> do
                             udfs' <- readIORef udfs
-                            NoriaUDFGen.noriaUdfExtraProcessing sandbox udfs'
+                            NoriaUDFGen.extraOperatorProcessing sandbox udfs'
                             pure $ NoriaUDFGen.generate udfs'
                 (nameSuggest, code) <-
                     flip runReaderT CodeGenOpts $

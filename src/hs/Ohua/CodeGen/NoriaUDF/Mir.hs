@@ -1,4 +1,5 @@
-{-# LANGUAGE TypeApplications, MultiWayIf, ConstraintKinds #-}
+{-# LANGUAGE MultiWayIf, ConstraintKinds #-}
+
 module Ohua.CodeGen.NoriaUDF.Mir
     ( generate
     ) where
@@ -38,12 +39,23 @@ import qualified Ohua.ALang.Refs as ALang
 import Ohua.ALang.Util (findFreeVariables)
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONObject
+import Ohua.CodeGen.NoriaUDF.Operator
+    ( ExecSemantic
+    , FData
+    , FData(FData, execSemantic, udfName)
+    , pattern ReductionSem
+    , pattern SimpleSem
+    , ToRust(..)
+    , (~>)
+    , loadNoriaTemplate
+    , patchFile
+    , renderDoc
+    )
 import qualified Ohua.DFGraph as DFGraph
 import qualified Ohua.Frontend.NS as NS
 import qualified Ohua.Helpers.Graph as GR
 import Ohua.Helpers.Template (Substitutions, Template)
 import qualified Ohua.Helpers.Template as TemplateHelper
-import Ohua.CodeGen.NoriaUDF.Operator (ToRust(..), FData, (~>), loadNoriaTemplate, renderDoc, patchFile)
 
 type Column = (Int, Int)
 
@@ -79,9 +91,9 @@ type MirColumn = DFGraph.Target
 
 type MirIndex = Word
 
-data ExecutionType = Reduction
-    { groupBy :: [MirColumn]
-    }
+data ExecutionType
+    = Reduction { groupBy :: [MirColumn] }
+    | Simple Word
 
 data MirNode
     = Regular { nodeFunction :: QualifiedBinding
@@ -156,8 +168,8 @@ mkLitMap arcs =
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
 annotateAndRewriteQuery ::
-       MonadLogger m => [FData] -> DFGraph.OutGraph -> m (ScopeMap, MirGraph)
-annotateAndRewriteQuery compiledNodes graph = do
+       MonadLogger m => DFGraph.OutGraph -> m (ScopeMap, MirGraph)
+annotateAndRewriteQuery graph = do
     debugLogGR "Initial Graph" iGr
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
     s1@(gr1, _) <- flip execStateT s0 $ collapseNth envInputs
@@ -407,7 +419,9 @@ instance ToRust SerializableGraph where
                                         [ ( "group_by"
                                           , "vec!" <>
                                             PP.list (encodeCols groupBy))
-                                        ])
+                                        ]
+                                Simple i ->
+                                    "Simple" <> recordSyn [("carry", pretty i)])
                         ]
                 MirJoin {..} ->
                     "Join" <+>
@@ -432,8 +446,8 @@ instance ToRust SerializableGraph where
 completeOutputColsFor :: OpMapEntry -> [MirColumn]
 completeOutputColsFor i = i ^. _2 <> i ^. _3
 
-toSerializableGraph :: ScopeMap -> MirGraph -> SerializableGraph
-toSerializableGraph cm mg =
+toSerializableGraph :: [FData] -> ScopeMap -> MirGraph -> SerializableGraph
+toSerializableGraph compiledNodes cm mg =
     SerializableGraph
         { adjacencyList =
               [ (entry ^. _1, completeOutputColsFor entry, map toNIdx ins)
@@ -451,6 +465,10 @@ toSerializableGraph cm mg =
                in map (colFrom (-1)) [0 .. maximum (map fst labels)]
         }
   where
+    execSemMap :: QualifiedBinding -> Maybe ExecSemantic
+    execSemMap =
+        flip HashMap.lookup $ HashMap.fromList $
+        map (\FData {..} -> (udfName, execSemantic)) compiledNodes
     opMap :: OpMap
     opMap =
         IM.fromList
@@ -480,8 +498,15 @@ toSerializableGraph cm mg =
                               Regular
                                   { nodeFunction = o
                                   , indices = indices
-                                  , executionType = Reduction $ flattenCtx ctx
+                                  , executionType =
+                                        case execSem of
+                                            ReductionSem ->
+                                                Reduction $ flattenCtx ctx
+                                            SimpleSem ->
+                                                Simple $ fromIntegral $
+                                                length (flattenCtx ctx)
                                   }
+                              where Just execSem = execSemMap o
                           Join _ ->
                               MirJoin
                                   { mirJoinProject =
@@ -516,11 +541,15 @@ noriaMirSourceDir = "noria-server/mir/src"
 
 generate :: [FData] -> CodeGen
 generate compiledNodes CodeGenData {..} = do
-    (ctxMap, iGr) <- annotateAndRewriteQuery compiledNodes graph
+    (ctxMap, iGr) <- annotateAndRewriteQuery graph
     debugLogGR "Annotated graph:" iGr
     tpl <- loadNoriaTemplate "udf_graph.rs"
     let subs =
-            ["graph" ~> [renderDoc $ asRust $ toSerializableGraph ctxMap iGr]]
+            [ "graph" ~>
+              [ renderDoc $ asRust $
+                toSerializableGraph compiledNodes ctxMap iGr
+              ]
+            ]
     tpl' <-
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
     patchFile

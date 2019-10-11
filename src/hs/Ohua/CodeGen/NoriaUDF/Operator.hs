@@ -14,6 +14,10 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , loadNoriaTemplate
     , renderDoc
     , patchFile
+    , ExecSem(..)
+    , ExecSemantic
+    , pattern SimpleSem
+    , pattern ReductionSem
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -66,6 +70,12 @@ data GenerationType
     | GenerateFile FilePath
                    Text
 
+data ExecSem
+    = One
+    | Many
+
+type ExecSemantic = (ExecSem, ExecSem)
+
 data FData = FData
     { generations :: [GenerationType]
     , udfName :: QualifiedBinding
@@ -73,6 +83,7 @@ data FData = FData
     , udfState :: QualifiedBinding
     , referencedFields :: [Int]
     , invokeExpr :: Expression
+    , execSemantic :: (ExecSem, ExecSem)
     }
 
 type AddUDF = FData -> IO ()
@@ -134,6 +145,14 @@ resolveHook ns = pure $ NS.sfImports %~ (extraSfs :) $ ns
           | NS.Other "declare-field" field <- ns ^. NS.pragmas
           , let (f, _) = parseFieldPragma field
           ])
+
+pattern ReductionSem :: ExecSemantic
+
+pattern ReductionSem = (Many, One)
+
+pattern SimpleSem :: ExecSemantic
+
+pattern SimpleSem = (One, One)
 
 -- TODO generate node struct with indices for free vars
 -- TODO make sure during SSA the bindings that the ambient code in noria is going to add are renamed if they occur here
@@ -501,6 +520,7 @@ processStatefulUdf fields udfName program state initState =
                         , udfState = stateType
                         , referencedFields = fieldIndices
                         , invokeExpr = ie
+                        , execSemantic = ReductionSem
                         }
         _ -> error $ "Expected map-reduce pattern, got " <> quickRender program
 
@@ -610,27 +630,33 @@ mkPatchesFor FData {..} =
             -- }
       ]
     , noriaDataflowSourceDir <> "/ops/ohua/att3.rs" ~>
-      [ "generated-udf-inits" ~>
-        [ renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
-          ppBlock
-              (PP.vsep
-                   [ "assert_eq!(over_cols.len(), " <>
-                     pretty (1 `max` length referencedFields) <>
-                     ");"
-                   , pretty
-                         (mkNodePath $ udfName & namespace . unwrapped . ix 0 .~
-                          "super") <>
-                     "::new" <>
-                     PP.tupled
-                         ("parent" : "0" :
-                          map
-                              (\n -> "over_cols" <> PP.brackets (pretty n))
-                              [0 .. pred $ length referencedFields] <>
-                          ["group"])
-                   ] <>
-               ".into()") <>
-          ","
-        ]
+      [ let (replacementKey, extraNodeArg) =
+                case execSemantic of
+                    ReductionSem ->
+                        ("generated-reducing-operator-inits", "group")
+                    SimpleSem -> ("generated-simple-operator-inits", "carry")
+         in replacementKey ~>
+            [ renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
+              ppBlock
+                  (PP.vsep
+                       [ "assert_eq!(over_cols.len(), " <>
+                         pretty (1 `max` length referencedFields) <>
+                         ");"
+                       , pretty
+                             (mkNodePath $ udfName & namespace . unwrapped .
+                              ix 0 .~
+                              "super") <>
+                         "::new" <>
+                         PP.tupled
+                             ("parent" : "0" :
+                              map
+                                  (\n -> "over_cols" <> PP.brackets (pretty n))
+                                  [0 .. pred $ length referencedFields] <>
+                              [extraNodeArg])
+                       ] <>
+                   ".into()") <>
+              ","
+            ]
       ]
     , "noria-server/src/controller/schema.rs" ~>
       [ "type-resolution-for-generated-nodes" ~>
@@ -766,6 +792,7 @@ generateOperators fields addUdf program = do
                                                    ["SqlType::Double"]
                                                  ]
                                                ]
+                                         , execSemantic = SimpleSem
                                          }
                              pure $
                                  Let

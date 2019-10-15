@@ -126,6 +126,13 @@ type Field3' a b = Simple Field3 a b
 
 type Field4' a b = Simple Field4 a b
 
+expectNumLit :: HasCallStack => Lit -> Integer
+expectNumLit (NumericLit n) = n
+expectNumLit other = error $ "Expected numeric literal, found " <> show other
+
+getLit :: IntMap [a] -> Int -> [a]
+getLit m k = fromMaybe [] $ IM.lookup k m
+
 isJoin :: Operator -> Bool
 isJoin Join {} = True
 isJoin _ = False
@@ -241,7 +248,7 @@ collapseNth envInputs =
         sGetContext node >>= \case
             ([((0, 2), inOp)], _, _, outs) -> do
                 let Just (0, NumericLit (fromIntegral -> idx)) =
-                        find ((== 0) . view _1) $ envInputs IM.! node
+                        find ((== 0) . view _1) $ envInputs `getLit` node
                 sDelNode node
                 for_ outs $ \((0, inIdx), tOp) ->
                     sInsEdge (inOp, tOp, (idx, inIdx))
@@ -306,21 +313,21 @@ mkScopeMap lm gr = m
             , let (pre, _, label, _) = GR.context gr n
                   ownCtx =
                       case label of
-                          "ohua.sql.query/group_by" ->
-                              let cols =
-                                      map
-                                          (\case
-                                               NumericLit n ->
-                                                   DFGraph.Target
-                                                       (unsafeMake $ snd pre') $
-                                                   fromIntegral n
-                                                   where [pre'] = pre
-                                               _ -> error "NO!") $
-                                      map snd $
-                                      sortOn fst $
-                                      lm IM.!
-                                      n
-                               in (GroupBy cols :)
+                          "ohua.sql.query/group_by" -> (GroupBy cols :)
+                              where cols =
+                                        map
+                                            (DFGraph.Target (unsafeMake preNum) .
+                                             fromIntegral .
+                                             expectNumLit)
+                                            colNums
+                                    [(_, preNum)] = pre
+                                    colNums =
+                                        case IM.lookup n lm of
+                                            Just [(_, col)] -> [col]
+                                            cols ->
+                                                error $
+                                                "Expected single env argument to `group_by`, found " <>
+                                                maybe "none" show cols
                           -- "ohua.lang/smap" -> (SmapC :)
                           "ohua.lang/collect" -> \(_:xs) -> xs
                           _ -> id

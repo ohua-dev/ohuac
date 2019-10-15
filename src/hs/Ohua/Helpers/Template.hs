@@ -85,9 +85,11 @@ sub Opts{..} subl subs = do
         Keep l -> writeLine l
         Replace sp key
             | Just t <- HashMap.lookup key subs -> do
-                  writeLines $ (if preserveSpace then map (sp <>) else id) (beginMarker key : (t >>= lines) <> [ endMarker key ])
+                  writeSpaced sp $ marked key (t >>= lines)
                   writeReplaced key
-            | otherwise -> logErrorN $ "Key '" <> key <> "' not found in substitutions"
+            | otherwise -> do
+                  logErrorN $ "Key '" <> key <> "' not found in substitutions"
+                  writeSpaced sp $ marked key []
     let unsubstituted = HS.fromMap (fmap (const ()) subs) `HS.difference` replaced
     unless (HS.null unsubstituted) $
         logWarnN $ "Substitution keys " <> show ( HS.toList unsubstituted ) <> " were not used."
@@ -95,6 +97,8 @@ sub Opts{..} subl subs = do
   where
     beginMarker key = "// <begin(" <> key <> ")>"
     endMarker key = "// <end(" <> key <> ")>"
+    writeSpaced sp = writeLines . (if preserveSpace then map (sp <>) else id)
     writeLines = tell . (,mempty)
     writeLine = writeLines . pure
     writeReplaced = tell . (mempty,) . HS.singleton
+    marked key l = beginMarker key : l <> [endMarker key]

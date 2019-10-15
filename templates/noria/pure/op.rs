@@ -46,7 +46,6 @@ impl Typed for
     type Type = SqlType;
     fn typ_static() -> Self::Type {
         // <insert(udf-ret-type)>
-            ::typ_static()
     }
 }
 
@@ -105,13 +104,13 @@ impl Ingredient for
         _: &DomainNodes,
         _: &StateMap,
     ) -> ProcessingResult {
-        for mut r in rs {
+        for mut r in rs.iter_mut() {
             // This could also support multiple returns by pushing more than one arg.
             let computed = {
                 // <insert(function)>
             };
             r.truncate(self.carry);
-            r.push(computed);
+            r.push(computed.into());
         }
         ProcessingResult {
             results: rs,

@@ -46,6 +46,7 @@ import Ohua.Standalone (PreResolveHook)
 import Prelude ((!!))
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
+import System.Directory (makeAbsolute)
 import qualified System.IO.Temp as Temp
 
 import Ohua.ALang.Lang
@@ -80,9 +81,8 @@ data FData = FData
     { generations :: [GenerationType]
     , udfName :: QualifiedBinding
     , inputBindings :: [Binding]
-    , udfState :: QualifiedBinding
+    , udfState :: Maybe QualifiedBinding
     , referencedFields :: [Int]
-    , invokeExpr :: Expression
     , execSemantic :: (ExecSem, ExecSem)
     }
 
@@ -440,7 +440,7 @@ baseUdfSubMap udfName rowName accessedFields =
 
 generatedOpSourcePath :: QualifiedBinding -> FilePath
 generatedOpSourcePath udfName =
-    noriaDataflowSourceDir <> "/state/ohua/generated/" <>
+    noriaDataflowSourceDir <> "/ops/ohua/generated/" <>
     toString (unwrap $ udfName ^. name) <>
     ".rs"
 
@@ -451,7 +451,7 @@ processStatefulUdf ::
     -> Expression
     -> Binding
     -> Expression
-    -> m FData
+    -> m (Expression, FData)
 processStatefulUdf fields udfName program state initState =
     case program of
         Let unit (Smap _ mapF (Var coll)) reduceF
@@ -459,9 +459,7 @@ processStatefulUdf fields udfName program state initState =
                 (mapFn, rowName, fieldIndices) <- mkMapFn fields mapF state coll
                 reduceFn <- mkReduceFn fields state reduceF
                 let nodeSub =
-                        TemplateSubstitution
-                            "map-reduce/op.rs"
-                            (generatedOpSourcePath udfName) $
+                        TemplateSubstitution "map-reduce/op.rs" (generatedOpSourcePath udfName) $
                         baseUdfSubMap udfName rowName accessedFields <>
                         [ "map" ~> ["use " <> stateNSStr <> "::Action;", mapFn]
                         , "reduce" ~> [reduceFn]
@@ -512,14 +510,13 @@ processStatefulUdf fields udfName program state initState =
                                 mkFieldDestrExpr
                                     (foldl' Apply udf $ map Var newBnds)
                 ie <- ALang.normalize $ mkInvokeExpr $ embedE udfName
-                pure
+                pure $ (ie,)
                     FData
                         { generations = [nodeSub, stateSub]
                         , udfName = udfName
                         , inputBindings = []
-                        , udfState = stateType
+                        , udfState = Just stateType
                         , referencedFields = fieldIndices
-                        , invokeExpr = ie
                         , execSemantic = ReductionSem
                         }
         _ -> error $ "Expected map-reduce pattern, got " <> quickRender program
@@ -608,6 +605,15 @@ patchFiles mOutDir udfs =
 
 mkPatchesFor :: FData -> [(FilePath, HashMap Text [Text])]
 mkPatchesFor FData {..} =
+      maybe []  (\st ->
+        [noriaDataflowSourceDir <> "/state/mod.rs" ~>
+          [ ("state-trait-method-def" :: Text) ~>
+            mkStateTraitCoercionFunc udfName st "Option::None"
+                -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
+                --     Option::None
+                -- }
+          ] ]) udfState
+        <>
     [ noriaDataflowSourceDir <> "/ops/mod.rs" ~>
       [ "node-operator-enum" ~> [nodeOpConstr <> "(" <> nodePath <> "),"]
       , "nodeop-from-impl-macro-call" ~>
@@ -621,13 +627,6 @@ mkPatchesFor FData {..} =
       , "impl-ingredient-ref-macro" ~>
         ["NodeOperator::" <> nodeOpConstr <> "(ref i) => i.$fn($($arg),*),"]
              -- NodeOperator::ClickAnaUDF(ref i) => i.$fn($($arg),*),
-      ]
-    , noriaDataflowSourceDir <> "/state/mod.rs" ~>
-      [ ("state-trait-method-def" :: Text) ~>
-        mkStateTraitCoercionFunc udfName udfState "Option::None"
-            -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
-            --     Option::None
-            -- }
       ]
     , noriaDataflowSourceDir <> "/ops/ohua/att3.rs" ~>
       [ let (replacementKey, extraNodeArg) =
@@ -680,134 +679,100 @@ pattern GenFuncsNamespace <- ["ohua", "generated"]
 generateOperators :: Fields -> AddUDF -> Expression -> OhuaM env Expression
 generateOperators fields addUdf program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
-    program' <-
-        let mempty' = mempty @(Dual (Endo Expr), HashSet.HashSet Binding)
-            tellRet var = tell $ mempty' & _2 .~ HashSet.singleton var
-            tellUdfE f = tell $ mempty' & _1 .~ Dual (Endo f)
-            getDeps = map expectVarE . findFreeVariables
-            go st (LetF v (oldExpr, expr) (extract -> body))
-                | v == st =
-                    error $
-                    "Invariant broken, state init happened in scope for " <>
-                    show st
-                | otherwise = do
-                    body' <- body
-                    let contNormal e = _2 <>= eDeps >> pure (Let v e body')
-                    (udfDeps, exprDeps) <- get
-                    if exprUsesState || v `HashSet.member` udfDeps
-                        then do
-                            tellUdfE (Let v oldExpr)
-                            _1 <>= eDeps
-                            if v `HashSet.member` exprDeps
-                                then if exprUsesState
-                                         then tellRet v >> pure body'
-                                         else contNormal oldExpr
-                                else pure body'
-                        else contNormal =<< expr
-              where
-                exprUsesState =
-                    or [s == Var st | BindState s _ <- universe oldExpr]
-                eDeps = HashSet.fromList $ getDeps oldExpr
-            go _ e'' = RS.embed <$> traverse extract e''
-         in transformM
-                (\case
-                     Let st initExpr body
-                         | st `HashSet.member` stateVals -> do
-                             logDebugN $ "Considering the function:\n" <>
-                                 quickRender body
-                             (e', _, (Dual (Endo mut), rets)) <-
-                                 runRWST (RS.para (go st) body) () mempty
-                             bnd <- generateBindingWith ("op_s_" <> st)
-                             let udfName =
-                                     QualifiedBinding GenFuncsNamespace bnd
-                                 -- TODO This also necessitates changing the invoke expression to destructure this output!!
-                             (v', handleReturn) <-
-                                 setupReturnRecieve $ HashSet.toList rets
-                             let udf = mut v'
-                                 freeVars =
-                                     filter (/= Var st) $ findFreeVariables udf
-                             logDebugN $ "Found operator function " <>
-                                 quickRender udfName <>
-                                 "\n" <>
-                                 quickRender (Let st initExpr udf)
-                             fdata <-
-                                 processStatefulUdf
-                                     fields
-                                     udfName
-                                     udf
-                                     st
-                                     initExpr
-                             liftIO $ addUdf fdata
-                             pure $ handleReturn (invokeExpr fdata) e'
-                     e -> pure e)
-                program >>=
-            transformM
-                (\case
-                     Let bnd val@Apply {} body
-                         | not $ isKnownFunction function
-                        -- This relies heavily of having the expected `let x = f a b c`
-                        -- structure
-                          -> do
-                             opName <-
-                                 generateBindingWith
-                                     ("op_p_" <> function ^. name <> "_")
-                             let udfName =
-                                     QualifiedBinding GenFuncsNamespace opName
-                             argVars <- traverse expectVar args
-                             liftIO $
-                                 addUdf
-                                     FData
-                                         { udfName = udfName
-                                         , inputBindings = argVars
-                                         , invokeExpr =
-                                               error
-                                                   "This should not be necessary here"
-                                         , udfState =
-                                               error "It doesn't have one"
-                                         , referencedFields = fieldIndices
-                                         , generations =
-                                               [ TemplateSubstitution
-                                                     "pure/op.rs"
-                                                     (generatedOpSourcePath
-                                                          udfName) $
-                                                 baseUdfSubMap
-                                                     udfName
-                                                     "r"
-                                                     accessedFields <>
-                                                 [ "function" ~>
-                                                   [ renderDoc $ asRust function <>
-                                                     PP.tupled
-                                                         (map (\i ->
-                                                                   "&r[" <>
-                                                                   pretty
-                                                                       (idxPropFromName
-                                                                            i) <>
-                                                                   "].clone()")
-                                                              (if args ==
-                                                                  [Lit UnitLit]
-                                                                   then []
-                                                                   else accessedFields))
-                                                   ]
-                                                 , "udf-ret-type" ~>
-                                                   ["SqlType::Double"]
-                                                 ]
-                                               ]
-                                         , execSemantic = SimpleSem
-                                         }
-                             pure $
-                                 Let
-                                     bnd
-                                     (fromListToApply
-                                          (FunRef udfName Nothing)
-                                          args)
-                                     body
-                         where (FunRef function _, args) = fromApplyToList val
-                               fieldIndices = [0 .. length args - 1]
-                               accessedFields = map ("none", ) fieldIndices
-                     other -> pure other)
+    program' <- transformM genStatefulOps program >>= transformM genPureOps
     logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
+    mempty' = mempty @(Dual (Endo Expr), HashSet.HashSet Binding)
+    tellRet var = tell $ mempty' & _2 .~ HashSet.singleton var
+    tellUdfE f = tell $ mempty' & _1 .~ Dual (Endo f)
+    getDeps = map expectVarE . findFreeVariables
+    go st (LetF v (oldExpr, expr) (extract -> body))
+        | v == st =
+            error $ "Invariant broken, state init happened in scope for " <>
+            show st
+        | otherwise = do
+            body' <- body
+                    -- Its a bit of a hack to record the return binding. It's
+                    -- necessary because this pass is still a bit unstable in general.
+            case body' of
+                Var v -> _2 <>= [ v ]
+                _ -> pure ()
+            let contNormal e = _2 <>= eDeps >> pure (Let v e body')
+            (udfDeps, exprDeps) <- get
+            if exprUsesState || v `HashSet.member` udfDeps
+                then do
+                    tellUdfE (Let v oldExpr)
+                    _1 <>= eDeps
+                    if v `HashSet.member` exprDeps
+                        then if exprUsesState
+                                 then tellRet v >> pure body'
+                                 else contNormal oldExpr
+                        else pure body'
+                else contNormal =<< expr
+      where
+        exprUsesState = or [s == Var st | BindState s _ <- universe oldExpr]
+        eDeps = HashSet.fromList $ getDeps oldExpr
+    go _ e'' = RS.embed <$> traverse extract e''
+    genStatefulOps (Let st initExpr body)
+        | st `HashSet.member` stateVals = do
+            logDebugN $ "Considering the function:\n" <> quickRender body
+            (e', _, (Dual (Endo mut), rets)) <-
+                runRWST (RS.para (go st) body) () mempty
+            bnd <- generateBindingWith ("op_s_" <> st)
+            let udfName = QualifiedBinding GenFuncsNamespace bnd
+                                 -- TODO This also necessitates changing the invoke expression to destructure this output!!
+            logDebugN $ "Returns found " <> show rets
+            (v', handleReturn) <- setupReturnRecieve $ HashSet.toList rets
+            let udf = mut v'
+                freeVars = filter (/= Var st) $ findFreeVariables udf
+            logDebugN $ "Found operator function " <> quickRender udfName <>
+                "\n" <>
+                quickRender (Let st initExpr udf)
+            ( invokeExpr, fdata ) <- processStatefulUdf fields udfName udf st initExpr
+            liftIO $ addUdf fdata
+            pure $ handleReturn invokeExpr e'
+    genStatefulOps e = pure e
+    genPureOps (Let bnd val@Apply {} body)
+        | not $ isKnownFunction function = do
+            opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
+                        -- This relies heavily of having the expected `let x = f a b c`
+                        -- structure
+            let udfName = QualifiedBinding GenFuncsNamespace opName
+                opGen =
+                    TemplateSubstitution
+                        "pure/op.rs"
+                        (generatedOpSourcePath udfName) $
+                    baseUdfSubMap udfName "r" accessedFields <>
+                    [ "function" ~>
+                      [ renderDoc $ asRust function <>
+                        PP.tupled
+                            (map (\i ->
+                                      "r[self." <> pretty (idxPropFromName i) <>
+                                      "].clone().into()")
+                                 (if args == [Lit UnitLit]
+                                      then []
+                                      else accessedFields))
+                      ]
+                    , "udf-ret-type" ~> ["SqlType::Double"]
+                    ]
+            argVars <- traverse expectVar args
+            liftIO $
+                addUdf
+                    FData
+                        { udfName = udfName
+                        , inputBindings = argVars
+                        , udfState = Nothing
+                        , referencedFields = fieldIndices
+                        , generations = [opGen]
+                        , execSemantic = SimpleSem
+                        }
+            pure $ Let bnd (fromListToApply (FunRef udfName Nothing) args) body
+      where
+        (FunRef function _, args) = fromApplyToList val
+        fieldIndices = [0 .. length args - 1]
+        accessedFields = map ("none", ) fieldIndices
+    genPureOps other = pure other
     globalVals = HashSet.fromList $ RS.cata f program
       where
         f =
@@ -874,12 +839,14 @@ doTheGenerating scopePath toGen = do
                 (error $ "Invariant broken, template not found " <> toText t) $
             HashMap.lookup t templates
     Data.Foldable.for_ toGen $ \case
-        TemplateSubstitution t (scopePath -> path) subs ->
+        TemplateSubstitution t (scopePath -> path) subs -> do
+            p <- liftIO $ makeAbsolute path
+            logDebugN $ "Outputting to path " <> fromString p
             outputFile path =<<
-            TemplateHelper.sub
-                TemplateHelper.Opts {preserveSpace = True}
-                (getTemplate t)
-                subs
+                TemplateHelper.sub
+                    TemplateHelper.Opts {preserveSpace = True}
+                    (getTemplate t)
+                    subs
         GenerateFile (scopePath -> path) content ->
             liftIO $ writeFile path content
 
@@ -901,13 +868,22 @@ extraOperatorProcessing useSandbox udfs = do
                 pure $ Just fp
             else pure Nothing
     let scopePath = maybe id (FP.</>) outDir
+        mkPath d =
+            scopePath $
+            noriaDataflowSourceDir FP.</> d FP.</> "ohua/generated" FP.</>
+            "mod.rs"
     doTheGenerating scopePath (udfs >>= generations)
-    for_ (["ops", "state"] :: [FilePath]) $ \d ->
-        outputFile
-            (scopePath $ noriaDataflowSourceDir FP.</> d FP.</> "ohua/generated" FP.</>
-             "mod.rs") $
+    outputFile (mkPath "ops") $
         T.unlines $
         map (\u -> "pub mod " <> unwrap (udfName u ^. name) <> ";") udfs
+    outputFile (mkPath "state") $
+        T.unlines $
+        mapMaybe
+            (\case
+                 u@FData {udfState = Just _} ->
+                     Just $ "pub mod " <> unwrap (udfName u ^. name) <> ";"
+                 _ -> Nothing)
+            udfs
     patchFiles outDir udfs
   where
     createSysTempDir pat =

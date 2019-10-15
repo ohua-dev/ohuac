@@ -381,8 +381,11 @@ multiArcToJoin ctxMap = do
         id <- mkNode $ Join lowerCtx
         _3 %= IM.insert id lowerCtx
         -- TODO update scopes
+        let adjustment
+                | null p1Cols = error "p1cols should not be empty"
+                | otherwise = succ $ maximum (map fst p1Cols)
         _1 %= GR.insEdges [(p1, id, p1Cols), (p2, id, p2Cols)]
-        pure (p1Cols ++ p2Cols, id)
+        pure (p1Cols ++ map (first (adjustment +))  p2Cols, id)
     -- UDF {
     --     function_name: String,
     --     //Do I need this?

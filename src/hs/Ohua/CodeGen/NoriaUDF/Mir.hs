@@ -493,8 +493,11 @@ toSerializableGraph compiledNodes cm mg =
                               map (colFrom n . fst) $ sortOn snd edges
                           _ -> error $ "Too many ancestors for " <> show op
                   cols
+                      | Join {} <- op = cols1 <> flattenCtx ctx <> cols2 -- dirty hack
                       | null outs = []
-                      | otherwise =
+                      | otherwise = normalCols
+                    where
+                      normalCols =
                           map
                               (colFrom n)
                               [0 .. maximum
@@ -502,6 +505,9 @@ toSerializableGraph compiledNodes cm mg =
                                         | out <- outs
                                         , (outIdx, _) <- fst out
                                         ]]
+                      -- For dirty hack
+                      [(e1, _), (e2, _)] = ins
+                      (cols1, cols2) = splitAt (length e1) normalCols
                   newOp =
                       case op of
                           CustomOp o ->

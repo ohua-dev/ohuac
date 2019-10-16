@@ -6,39 +6,17 @@ module Ohua.CodeGen.NoriaUDF.Mir
 
 import Ohua.Prelude hiding (First, Identity)
 
-import Control.Arrow ((***))
-import Control.Category ((>>>))
-import Control.Comonad (extract)
-import Control.Lens (Simple, (%=), (<>=), (^..), (^?!), ix, to, use)
-import Control.Monad.RWS (runRWST)
-import Control.Monad.Writer (runWriterT, tell)
-import qualified Data.Foldable
-import qualified Data.Functor.Foldable as RS
+import Control.Lens (Simple, (%=), (^?!), ix, to, use)
 import qualified Data.HashMap.Strict as HashMap
-import qualified Data.HashSet as HashSet
 import qualified Data.IntMap as IM
-import qualified Data.IntSet as IS
 import Data.Maybe (fromJust)
-import qualified Data.Text as T
 import qualified Data.Text.Lazy as LT
 import qualified Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
-import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
-import Data.Traversable (for)
-import Ohua.Standalone (PreResolveHook)
 import Prelude ((!!))
-import System.Directory (createDirectoryIfMissing)
-import qualified System.FilePath as FP
-import qualified System.IO.Temp as Temp
 
-import Ohua.ALang.Lang
-import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
-import qualified Ohua.ALang.Passes as ALang (normalize)
-import qualified Ohua.ALang.Refs as ALang
-import Ohua.ALang.Util (findFreeVariables)
 import Ohua.CodeGen.Iface
-import qualified Ohua.CodeGen.JSONObject as JSONObject
 import Ohua.CodeGen.NoriaUDF.Operator
     ( ExecSemantic
     , FData
@@ -52,9 +30,7 @@ import Ohua.CodeGen.NoriaUDF.Operator
     , renderDoc
     )
 import qualified Ohua.DFGraph as DFGraph
-import qualified Ohua.Frontend.NS as NS
 import qualified Ohua.Helpers.Graph as GR
-import Ohua.Helpers.Template (Substitutions, Template)
 import qualified Ohua.Helpers.Template as TemplateHelper
 
 type Column = (Int, Int)

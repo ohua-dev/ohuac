@@ -1,6 +1,7 @@
 module Ohua.CodeGen.NoriaUDF
     ( generateOperators
     , generate
+    , suggestName
     , extraOperatorProcessing
     ) where
 

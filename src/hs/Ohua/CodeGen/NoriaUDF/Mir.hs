@@ -2,6 +2,7 @@
 
 module Ohua.CodeGen.NoriaUDF.Mir
     ( generate
+    , suggestName
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -531,6 +532,10 @@ unimplemented = error "Function or branch not yet implemented"
 noriaMirSourceDir :: IsString s => s
 noriaMirSourceDir = "noria-server/mir/src"
 
+suggestName :: NameSuggester
+suggestName entryPoint =
+    noriaMirSourceDir <> "/udfs/" <> unwrap (entryPoint ^. name) <> "_graph.rs"
+
 generate :: [FData] -> CodeGen
 generate compiledNodes CodeGenData {..} = do
     (ctxMap, iGr) <- annotateAndRewriteQuery graph
@@ -538,8 +543,8 @@ generate compiledNodes CodeGenData {..} = do
     tpl <- loadNoriaTemplate "udf_graph.rs"
     let subs =
             [ "graph" ~>
-              [ renderDoc $ asRust $
-                toSerializableGraph compiledNodes ctxMap iGr
+              [ renderDoc $
+                asRust $ toSerializableGraph compiledNodes ctxMap iGr
               ]
             ]
     tpl' <-
@@ -547,13 +552,12 @@ generate compiledNodes CodeGenData {..} = do
     patchFile
         Nothing
         (noriaMirSourceDir <> "/udfs/mod.rs")
-        [ "graph-mods" ~> ["mod " <> unwrap entryPointName <> "_graph;"]
+        [ "graph-mods" ~> ["mod " <> entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
-          [ "\"" <> unwrap entryPointName <> "\" => Some(" <>
-            unwrap entryPointName <>
+          [ "\"" <> entryPointName <> "\" => Some(" <> entryPointName <>
             "_graph::mk_graph()),"
           ]
         ]
-    pure (sugg, LT.encodeUtf8 $ LT.fromStrict tpl')
+    pure $ LT.encodeUtf8 $ LT.fromStrict tpl'
   where
-    sugg = noriaMirSourceDir <> "/udfs/" <> unwrap entryPointName <> "_graph.rs"
+    entryPointName = unwrap $ entryPoint ^. name

@@ -14,7 +14,9 @@ instance ToJSON GraphFile where
 instance FromJSON GraphFile where
     parseJSON = genericParseJSON defaultOptions
 
+suggestName :: NameSuggester
+suggestName bnd = unwrap $ bnd ^. name <> ".ohuao"
 
 generate :: CodeGen
-generate cgdf@CodeGenData {entryPointName} =
-    pure (unwrap $ entryPointName <> ".ohuao", encode $ cgDataToGrFile cgdf)
+generate cgdf =
+    pure $ encode $ cgDataToGrFile cgdf

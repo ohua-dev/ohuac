@@ -16,8 +16,7 @@ data CodeGenData = CodeGenData
   , entryPointArity :: Int
   , sfDependencies :: Set.HashSet QualifiedBinding
   , annotations :: Maybe TyAnnMap
-  , entryPointName :: Binding
-  , entryPointNamespace :: NSRef
+  , entryPoint :: QualifiedBinding
   }
 
 cgDataToGrFile :: CodeGenData -> GR.GraphFile
@@ -28,7 +27,7 @@ cgDataToGrFile CodeGenData {..} =
         , GR.mainArity = entryPointArity
         }
 
-type NameSuggester = Text
+type NameSuggester = QualifiedBinding -> Text
 
 type CodeGen
      = forall m. ( MonadReader CodeGenOpts m
@@ -36,4 +35,4 @@ type CodeGen
                  , MonadLogger m
                  , MonadIO m
                  ) =>
-                     CodeGenData -> m (NameSuggester, LByteString)
+                     CodeGenData -> m LByteString

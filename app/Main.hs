@@ -20,8 +20,9 @@ import Ohua.ALang.Lang (Expr(Lambda))
 import Options.Applicative as O
 import Options.Applicative.Help.Pretty as O
 import qualified Prelude
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesFileExist, getModificationTime)
 import qualified System.FilePath as FP
+import Control.Monad.Trans.Control (MonadBaseControl)
 
 import Ohua.ALang.PPrint ()
 import Ohua.CodeGen.Iface
@@ -60,6 +61,7 @@ data CommonCmdOpts = CommonCmdOpts
     , entrypoint :: Binding
     , outputPath :: Maybe Text
     , logLevel :: LogLevel
+    , forceRebuild :: Bool
     }
 
 data CodeGenSelection
@@ -131,6 +133,165 @@ runCompM targetLevel c =
         logErrorN message
         exitFailure
 
+abortIfUnchanged :: (?copts :: CommonCmdOpts, MonadIO m, MonadLogger m ) => Text -> Text -> m ()
+abortIfUnchanged (toString -> source) (toString -> target)
+    | forceRebuild ?copts = pure ()
+    | otherwise =
+        liftIO (doesFileExist target) >>= \case
+            False -> pure ()
+            True ->
+                liftIO
+                    ((>=) <$> getModificationTime source <*>
+                     getModificationTime target) >>= \case
+                    True -> pure ()
+                    False -> do
+                        logInfoN
+                            "Source file is older than target file. Skipping compilation."
+                        liftIO exitSuccess
+
+getNameSuggest :: CodeGenSelection -> NameSuggester
+getNameSuggest = \case
+    NoriaUDF -> NoriaUDFGen.suggestName
+    JsonGraph -> JSONGen.suggestName
+    SimpleJavaClass -> JavaGen.suggestName
+
+runBuild ::
+       (?copts :: CommonCmdOpts)
+    => BuildOpts
+    -> ProcFun (HashMap Binding Expr) ()
+runBuild BuildOpts { outputFormat
+                   , useStdlib
+                   , stageHandlingOpt
+                   , extraFeatures
+                   , sandbox
+                   } modTracker mainAnns rawMainMod getMain = do
+    abortIfUnchanged inputModuleFile outputPath0
+    when useStdlib $ void $ insertDirectly modTracker stdlib
+    let present =
+            map (\(ns, i) -> show $ PP.pretty ns <> PP.tupled (map PP.pretty i))
+     in do logDebugN $ unlines $ "Algos:" : present (rawMainMod ^. algoImports)
+           logDebugN $ unlines $ "Sfs:" : present (rawMainMod ^. sfImports)
+    mainMod <-
+        let ?env = ResolutionEnv
+                {modTracker = modTracker, preResolveHook = pure}
+         in registerAnd (rawMainMod ^. name) $ loadDepsAndResolve rawMainMod
+    expr' <- getMain $ mainMod ^. decls
+    let expr =
+            case expr'
+                               -- FIXME this is technically not correct for edge cases
+                  of
+                Lambda "_" body -> body
+                e -> e
+    let sfDeps = gatherSFDeps expr
+    let (mainArity, completeExpr) = mainToEnv expr
+    udfs <- newIORef []
+    let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
+    noriaPass <-
+        case outputFormat of
+            NoriaUDF -> do
+                let (streamAnn:_) =
+                        argTypes $ mainAnns ^?! _Just . ix entrypoint
+                    (ftys, constr) =
+                        RS.para
+                            (\case
+                                 TyAppF (_, (tys, f)) (ty, _) -> (ty : tys, f)
+                                 TyRefF r -> ([], r))
+                            streamAnn
+                    Just formatter = Prelude.lookup "rust" langs
+                    fields =
+                        IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
+                pure $ NoriaUDFGen.generateOperators fields addUdf
+            _ -> pure pure
+    gr <-
+        compile
+            (def & stageHandling .~ stageHandlingOpt &
+             transformRecursiveFunctions .~
+             ("tail-recursion" `elem` extraFeatures))
+            (def
+                 { passAfterDFLowering = cleanUnits
+                 , passAfterNormalize = noriaPass
+                 })
+            completeExpr
+    gen <-
+        case outputFormat of
+            JsonGraph -> pure JSONGen.generate
+            SimpleJavaClass -> pure JavaGen.generate
+            NoriaUDF -> do
+                udfs' <- readIORef udfs
+                NoriaUDFGen.extraOperatorProcessing sandbox udfs'
+                pure $ NoriaUDFGen.generate udfs'
+    code <-
+        flip runReaderT CodeGenOpts $
+        gen
+            CodeGenData
+                { graph = gr
+                , entryPointArity = mainArity
+                , sfDependencies = sfDeps
+                , annotations = mainAnns
+                , entryPoint = entryPoint
+                }
+    liftIO $
+        createDirectoryIfMissing True (FP.takeDirectory $ toString outputPath0)
+    liftIO $ L.writeFile (toString outputPath0) code
+    logInfoN $ "Compiled '" <> unwrap entrypoint <> "' from '" <>
+        inputModuleFile <>
+        "' to " <>
+        showCodeGen outputFormat
+    logInfoN $ "Code written to '" <> outputPath0 <> "'"
+  where
+    CommonCmdOpts {..} = ?copts
+    entryPoint = QualifiedBinding (rawMainMod ^. name) entrypoint
+    nameSuggest = getNameSuggest outputFormat entryPoint
+    outputPath0 = fromMaybe nameSuggest outputPath
+
+type ProcFun t b
+     = forall m. (MonadError Text m, MonadLoggerIO m, MonadBaseControl IO m) =>
+                     ModTracker -> Maybe TyAnnMap -> RawNamespace -> (t -> m (IxValue t)) -> m b
+
+withCommonSetup ::
+       (?copts :: CommonCmdOpts, Ixed t, Index t ~ Binding)
+    => ProcFun t b
+    -> IO b
+withCommonSetup f =
+    runCompM logLevel $ do
+        modTracker <- newIORef mempty
+        (mainAnns, rawMainMod) <- readAndParse inputModuleFile
+        let getMain ::
+                   (Ixed m, Index m ~ Binding, MonadError Error mo)
+                => m
+                -> mo (IxValue m)
+            getMain m =
+                case m ^? ix entrypoint of
+                    Nothing ->
+                        throwError $
+                        "Module does not define specified entry point '" <>
+                        unwrap entrypoint <>
+                        "'"
+                    Just x -> pure x
+        f modTracker mainAnns rawMainMod getMain
+  where
+    CommonCmdOpts {..} = ?copts
+
+runDumpType :: (?copts :: CommonCmdOpts) => DumpOpts -> ProcFun TyAnnMap ()
+runDumpType (DumpOpts format) _ mainAnns _ getMain =
+    case mainAnns of
+        Nothing -> throwError "No annotations present for the module"
+        Just m -> do
+            FunAnn args ret <- getMain m
+            let outPath =
+                    fromMaybe (inputModuleFile -<.> "type-dump") outputPath
+            liftIO $ L.writeFile (toString outPath) $ encode $
+                object
+                    ["arguments" A..= map format args, "return" A..= format ret]
+            logInfoN $ "Wrote a type dump of '" <> unwrap entrypoint <>
+                "' from '" <>
+                inputModuleFile <>
+                "' to '" <>
+                outPath <>
+                ("'" :: Text)
+  where
+    CommonCmdOpts {..} = ?copts
+
 main :: IO ()
 main = do
     opts <- execParser odef
@@ -144,146 +305,11 @@ main = do
                       pure $ LitE $ StringL $ show t <> " (" <>
                           show (Time.localTimeOfDay $ Time.utcToLocalTime tz t) <>
                           " local)") :: Text)
-        DumpType common@CommonCmdOpts {..} (DumpOpts format) ->
-            withCommonSetup common $ \_ mainAnns _ getMain ->
-                case mainAnns of
-                    Nothing ->
-                        throwError "No annotations present for the module"
-                    Just m -> do
-                        FunAnn args ret <- getMain m
-                        let outPath =
-                                fromMaybe
-                                    (inputModuleFile -<.> "type-dump")
-                                    outputPath
-                        liftIO $ L.writeFile (toString outPath) $ encode $
-                            object
-                                [ "arguments" A..= map format args
-                                , "return" A..= format ret
-                                ]
-                        logInfoN $ "Wrote a type dump of '" <> unwrap entrypoint <>
-                            "' from '" <>
-                            inputModuleFile <>
-                            "' to '" <>
-                            outPath <>
-                            ("'" :: Text)
-        Build common@CommonCmdOpts {..} BuildOpts { outputFormat
-                                                  , useStdlib
-                                                  , stageHandlingOpt
-                                                  , extraFeatures
-                                                  , sandbox
-                                                  } ->
-            withCommonSetup common $ \modTracker mainAnns rawMainMod getMain -> do
-                when useStdlib $ void $ insertDirectly modTracker stdlib
-                let present =
-                        map
-                            (\(ns, i) ->
-                                 show $ PP.pretty ns <>
-                                 PP.tupled (map PP.pretty i))
-                 in do logDebugN $ unlines $ "Algos:" :
-                           present (rawMainMod ^. algoImports)
-                       logDebugN $ unlines $ "Sfs:" :
-                           present (rawMainMod ^. sfImports)
-                mainMod <-
-                    let ?env = ResolutionEnv
-                            {modTracker = modTracker, preResolveHook = pure}
-                     in registerAnd (rawMainMod ^. name) $
-                        loadDepsAndResolve rawMainMod
-                expr' <- getMain $ mainMod ^. decls
-                let expr =
-                        case expr'
-                               -- FIXME this is technically not correct for edge cases
-                              of
-                            Lambda "_" body -> body
-                            e -> e
-                let sfDeps = gatherSFDeps expr
-                let (mainArity, completeExpr) = mainToEnv expr
-                udfs <- newIORef []
-                let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
-                noriaPass <-
-                    case outputFormat of
-                        NoriaUDF -> do
-                            let (streamAnn:_) =
-                                    argTypes $ mainAnns ^?! _Just .
-                                    ix entrypoint
-                                (ftys, constr) =
-                                    RS.para
-                                        (\case
-                                             TyAppF (_, (tys, f)) (ty, _) ->
-                                                 (ty : tys, f)
-                                             TyRefF r -> ([], r))
-                                        streamAnn
-                                Just formatter = Prelude.lookup "rust" langs
-                                fields =
-                                    IM.fromList $
-                                    zip [0 ..] (map formatter $ reverse ftys)
-                            pure $ NoriaUDFGen.generateOperators fields addUdf
-                        _ -> pure pure
-                gr <-
-                    compile
-                        (def & stageHandling .~ stageHandlingOpt &
-                         transformRecursiveFunctions .~
-                         ("tail-recursion" `elem` extraFeatures))
-                        (def
-                             { passAfterDFLowering = cleanUnits
-                             , passAfterNormalize = noriaPass
-                             })
-                        completeExpr
-                gen <-
-                    case outputFormat of
-                        JsonGraph -> pure JSONGen.generate
-                        SimpleJavaClass -> pure JavaGen.generate
-                        NoriaUDF -> do
-                            udfs' <- readIORef udfs
-                            NoriaUDFGen.extraOperatorProcessing sandbox udfs'
-                            pure $ NoriaUDFGen.generate udfs'
-                (nameSuggest, code) <-
-                    flip runReaderT CodeGenOpts $
-                    gen
-                        CodeGenData
-                            { graph = gr
-                            , entryPointArity = mainArity
-                            , sfDependencies = sfDeps
-                            , annotations = mainAnns
-                            , entryPointName = entrypoint
-                            , entryPointNamespace = rawMainMod ^. name
-                            }
-                let outputPath0 = fromMaybe nameSuggest outputPath
-                liftIO $
-                    createDirectoryIfMissing
-                        True
-                        (FP.takeDirectory $ toString outputPath0)
-                liftIO $ L.writeFile (toString outputPath0) code
-                logInfoN $ "Compiled '" <> unwrap entrypoint <> "' from '" <>
-                    inputModuleFile <>
-                    "' to " <>
-                    showCodeGen outputFormat
-                logInfoN $ "Code written to '" <> outputPath0 <> "'"
+        DumpType common dopts -> withCommonSetup $ runDumpType dopts
+            where ?copts = common
+        Build common bopts -> withCommonSetup $ runBuild bopts
+            where ?copts = common
   where
-    withCommonSetup ::
-           (m ~ ExceptT Text (LoggingT IO))
-        => CommonCmdOpts
-        -> (IORef ModMap -> Maybe TyAnnMap -> RawNamespace -> (forall map. ( Ixed map
-                                                                           , Index map ~ Binding
-                                                                           ) =>
-                                                                               map -> m (IxValue map)) -> m a)
-        -> IO a
-    withCommonSetup CommonCmdOpts {..} f =
-        runCompM logLevel $ do
-            modTracker <- newIORef mempty
-            (mainAnns, rawMainMod) <- readAndParse inputModuleFile
-            let getMain ::
-                       (Ixed m, Index m ~ Binding, MonadError Error mo)
-                    => m
-                    -> mo (IxValue m)
-                getMain m =
-                    case m ^? ix entrypoint of
-                        Nothing ->
-                            throwError $
-                            "Module does not define specified entry point '" <>
-                            unwrap entrypoint <>
-                            "'"
-                        Just x -> pure x
-            f modTracker mainAnns rawMainMod getMain
     odef =
         info
             (helper <*> optsParser)
@@ -391,4 +417,6 @@ main = do
               help "Print more detailed logging messages") <*>
          switch
              (long "debug" <>
-              help "Activate all logging messages for debugging purposes."))
+              help "Activate all logging messages for debugging purposes.")) <*>
+         switch
+             (long "force" <> help "Compile, even if the source is older than the target")

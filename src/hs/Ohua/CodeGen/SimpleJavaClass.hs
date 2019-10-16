@@ -1,5 +1,5 @@
 {-# LANGUAGE NoOverloadedLists #-}
-module Ohua.CodeGen.SimpleJavaClass (generate) where
+module Ohua.CodeGen.SimpleJavaClass (suggestName, generate) where
 
 import Ohua.Prelude
 
@@ -280,21 +280,31 @@ configuredClassConstructorDecl =
               (ExpName $ Name [runtimeConfigurationFieldI])
         ]
 
+mkNsList :: QualifiedBinding -> [String]
+mkNsList entryPoint = map (toSnake . fromAny . toString . unwrap) $ unwrap $ entryPoint ^. namespace
+
+mkClassNameStr :: QualifiedBinding -> String
+mkClassNameStr entryPoint = toPascal $ fromAny $ toString $ unwrap $ entryPoint ^. name
+
+suggestName :: NameSuggester
+suggestName entryPoint = T.intercalate "/" (map toText $ nsList ++ [classNameStr]) <> ".java"
+  where
+    nsList = mkNsList entryPoint
+    classNameStr = mkClassNameStr entryPoint
 
 -- | TODO handle compound and state arcs
 generate :: CodeGen
 generate CodeGenData {..} =
     pure
-        ( T.intercalate "/" (map toText $ nsList ++ [classNameStr]) <> ".java"
-        , LB.pack (prettyPrint classCode) <> "\n//" <> generationInfoString <> "\n")
+        $ LB.pack (prettyPrint classCode) <> "\n//" <> generationInfoString <> "\n"
     -- Values computed from CodeGenData
   where
-    nsList = map (toSnake . fromAny . toString . unwrap) $ unwrap entryPointNamespace
-    classNameStr = toPascal $ fromAny $ toString $ unwrap entryPointName
+    nsList = mkNsList entryPoint
+    classNameStr = mkClassNameStr entryPoint
     className = Ident classNameStr
     retId = succ $ maximum $ map operatorId $ operators graph
     enumerateArgs = map unsafeMake [0 .. entryPointArity - 1]
-    entryPointAnnotations = annotations >>= HM.lookup entryPointName
+    entryPointAnnotations = annotations >>= HM.lookup (entryPoint ^. name)
     returnType =
         case entryPointAnnotations of
             Nothing -> Just objectType

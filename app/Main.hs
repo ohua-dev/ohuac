@@ -210,6 +210,9 @@ runBuild BuildOpts { outputFormat
             (def
                  { passAfterDFLowering = cleanUnits
                  , passAfterNormalize = noriaPass
+                 , passBeforeNormalize = case outputFormat of
+                         NoriaUDF -> NoriaUDFGen.rewriteQueryExpressions addUdf
+                         _ -> pure
                  })
             completeExpr
     gen <-

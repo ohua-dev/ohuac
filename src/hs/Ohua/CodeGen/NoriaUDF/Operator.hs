@@ -2,8 +2,9 @@
 
 module Ohua.CodeGen.NoriaUDF.Operator
     ( generateOperators
-    , FData(..)
-    , AddUDF
+    , OperatorDescription(..)
+    , UDFDescription(..)
+    , RegisterOperator
     , GenerationType(..)
     , patchFiles
     , udfFileToPathThing
@@ -18,6 +19,7 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , ExecSemantic
     , pattern SimpleSem
     , pattern ReductionSem
+    , rewriteQueryExpressions
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -61,40 +63,17 @@ import qualified Ohua.Frontend.NS as NS
 import qualified Ohua.Helpers.Graph as GR
 import Ohua.Helpers.Template (Substitutions, Template)
 import qualified Ohua.Helpers.Template as TemplateHelper
+import Ohua.CodeGen.NoriaUDF.Util
+import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL)
+import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
+import Ohua.CodeGen.NoriaUDF.Types
 
 import Paths_ohuac
 
-data GenerationType
-    = TemplateSubstitution Template
-                           FilePath
-                           Substitutions
-    | GenerateFile FilePath
-                   Text
-
-data ExecSem
-    = One
-    | Many
-
-type ExecSemantic = (ExecSem, ExecSem)
-
-data FData = FData
-    { generations :: [GenerationType]
-    , udfName :: QualifiedBinding
-    , inputBindings :: [Binding]
-    , udfState :: Maybe QualifiedBinding
-    , referencedFields :: [Int]
-    , execSemantic :: (ExecSem, ExecSem)
-    }
-
-type AddUDF = FData -> IO ()
 
 type Fields = IM.IntMap Text
 
--- | Just a simple helper to make writing the HashMap literals nicer
-(~>) :: a -> b -> (a, b)
-a ~> b = (a, b)
 
-infixl 4 ~>
 
 -- | TODO Should be `RustTyExpr` at some point
 type FieldSpec = (Binding, Text)
@@ -451,7 +430,7 @@ processStatefulUdf ::
     -> Expression
     -> Binding
     -> Expression
-    -> m (Expression, FData)
+    -> m (Expression, OperatorDescription)
 processStatefulUdf fields udfName program state initState =
     case program of
         Let unit (Smap _ mapF (Var coll)) reduceF
@@ -510,8 +489,8 @@ processStatefulUdf fields udfName program state initState =
                                 mkFieldDestrExpr
                                     (foldl' Apply udf $ map Var newBnds)
                 ie <- ALang.normalize $ mkInvokeExpr $ embedE udfName
-                pure $ (ie,)
-                    FData
+                pure $ (ie,) $
+                    Op_UDF $ UDFDescription
                         { generations = [nodeSub, stateSub]
                         , udfName = udfName
                         , inputBindings = []
@@ -592,7 +571,7 @@ patchFile mOutDir file subs = do
             liftIO $ outputFile (dir FP.</> filename) content
 
 -- TODO create the state impls in map-reduce/state.rs needs sub key "state-trait-coerce-impls"
-patchFiles :: (MonadIO m, MonadLogger m) => Maybe FilePath -> [FData] -> m ()
+patchFiles :: (MonadIO m, MonadLogger m) => Maybe FilePath -> [UDFDescription] -> m ()
 patchFiles mOutDir udfs =
     mapM_ (uncurry $ patchFile mOutDir) (HashMap.toList fileMap)
   where
@@ -603,8 +582,8 @@ patchFiles mOutDir udfs =
         HashMap.fromListWith (HashMap.unionWith (<>))
     fileMap = toMap $ udfs >>= mkPatchesFor
 
-mkPatchesFor :: FData -> [(FilePath, HashMap Text [Text])]
-mkPatchesFor FData {..} =
+mkPatchesFor :: UDFDescription -> [(FilePath, HashMap Text [Text])]
+mkPatchesFor UDFDescription {..} =
       maybe []  (\st ->
         [noriaDataflowSourceDir <> "/state/mod.rs" ~>
           [ ("state-trait-method-def" :: Text) ~>
@@ -676,10 +655,20 @@ pattern GenFuncsNamespace :: NSRef
 pattern GenFuncsNamespace <- ["ohua", "generated"]
   where GenFuncsNamespace = ["ohua", "generated"]
 
-generateOperators :: Fields -> AddUDF -> Expression -> OhuaM env Expression
-generateOperators fields addUdf program = do
+
+rewriteQueryExpressions :: RegisterOperator -> Expr -> OhuaM env Expr
+rewriteQueryExpressions register e = do
+    logDebugN $ "Expression before Query EDSL rewrite: \n" <> quickRender e
+    flip transformM e $ \case
+        BindState st (Lit (FunRefLit (FunRef f _))) `Apply` arg
+            | Just process <- queryEDSL f -> process register st [arg]
+        other -> pure other
+
+generateOperators :: Fields -> RegisterOperator -> Expression -> OhuaM env Expression
+generateOperators fields registerOp program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
-    program' <- transformM genStatefulOps program >>= transformM genPureOps
+    program' <- transformM genStatefulOps program
+        >>= transformM genPureOps
     logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
@@ -730,7 +719,7 @@ generateOperators fields addUdf program = do
                 "\n" <>
                 quickRender (Let st initExpr udf)
             ( invokeExpr, fdata ) <- processStatefulUdf fields udfName udf st initExpr
-            liftIO $ addUdf fdata
+            liftIO $ registerOp fdata
             pure $ handleReturn invokeExpr e'
     genStatefulOps e = pure e
     genPureOps (Let bnd val@Apply {} body)
@@ -757,9 +746,8 @@ generateOperators fields addUdf program = do
                     , "udf-ret-type" ~> ["SqlType::Double"]
                     ]
             argVars <- traverse expectVar args
-            liftIO $
-                addUdf
-                    FData
+            liftIO $ registerOp $
+                    Op_UDF $ UDFDescription
                         { udfName = udfName
                         , inputBindings = argVars
                         , udfState = Nothing
@@ -857,8 +845,9 @@ loadNoriaTemplate t =
         TemplateHelper.parseTemplate <$> readFile path
 
 extraOperatorProcessing ::
-       (MonadError Error m, MonadIO m, MonadLogger m) => Bool -> [FData] -> m ()
-extraOperatorProcessing useSandbox udfs = do
+       (MonadError Error m, MonadIO m, MonadLogger m) => Bool -> [OperatorDescription] -> m ()
+extraOperatorProcessing useSandbox ops = do
+    let udfs = mapMaybe (\case Op_UDF desc -> Just desc; _ -> Nothing) ops
     outDir <-
         if useSandbox
             then do
@@ -880,7 +869,7 @@ extraOperatorProcessing useSandbox udfs = do
         T.unlines $
         mapMaybe
             (\case
-                 u@FData {udfState = Just _} ->
+                 u@(UDFDescription {udfState = Just _} ) ->
                      Just $ "pub mod " <> unwrap (udfName u ^. name) <> ";"
                  _ -> Nothing)
             udfs

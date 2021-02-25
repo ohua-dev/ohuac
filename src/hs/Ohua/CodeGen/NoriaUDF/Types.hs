@@ -40,7 +40,7 @@ data Operator
     | Projection [Column]
     | Identity
     | Sink
-    | Source
+    | Source Text
     | Filter { conditions :: HashMap (Either Column Mir.Column) Mir.FilterCondition }
     deriving (Show, Eq, Generic)
 

@@ -60,7 +60,7 @@ type MirIndex = Word
 data SerializableGraph = SerializableGraph
     { adjacencyList :: AdjList Mir.Node
     , sink :: (Word, [Mir.Column])
-    , source :: [Mir.Column]
+    , sources :: [(Text, [Mir.Column])]
     }
 
 type OpMap = IntMap OpMapEntry
@@ -93,7 +93,7 @@ isSink Sink = True
 isSink _ = False
 
 isSource :: Operator -> Bool
-isSource Source = True
+isSource Source{} = True
 isSource _ = False
 
 groupOnInt :: [(a, Int)] -> [([a], Int)]
@@ -287,7 +287,7 @@ retype :: GeneratedMirNodes -> NoriaGraph QualifiedBinding b -> NoriaGraph Opera
 retype m =
     GR.nmap $ \case
         "intrinsic/sink" -> Sink
-        "intrinsic/source" -> Source
+        "intrinsic/source" -> error "sources now need table names"
         "ohua.lang/(,)" -> Identity -- Needs to become a project instead
         other ->
             fromMaybe (CustomOp other) $ HashMap.lookup other m
@@ -369,7 +369,7 @@ instance ToRust SerializableGraph where
             , "sink" ~>
               let (n, idxs) = sink graph
                in PP.tupled [pretty n, "vec!" <> PP.list (encodeCols idxs)]
-            , "source" ~> "vec!" <> PP.list (encodeCols $ source graph)
+            , "source" ~> "vec!" <> PP.list (map (\(t, s) -> PP.tupled [pretty t, "vec!" <> PP.list (encodeCols s)]) $ sources graph)
             ]
       where
         toAListElem (node, cols, preds) =
@@ -454,10 +454,13 @@ toSerializableGraph udfs cm mg =
               let [sink] = filter (isSink . snd) (GR.labNodes mg)
                   [(s, _, l)] = GR.inn mg $ fst sink
                in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s)
-        , source =
-              let [src] = filter (isSource . snd) (GR.labNodes mg)
-                  labels = concatMap (^. _3) $ GR.out mg (fst src)
-               in map (colFrom (-1)) [0 .. maximum (map fst labels)]
+        , sources =
+          let f = \case
+                  (s, Source name) ->
+                      let labels = concatMap (^. _3) $ GR.out mg s in
+                          Just (name, map (colFrom (-1)) [0 .. maximum (map fst labels)])
+                  _ -> Nothing
+          in mapMaybe f $ GR.labNodes mg
         }
   where
     execSemMap :: QualifiedBinding -> Maybe ExecSemantic
@@ -521,7 +524,7 @@ toSerializableGraph udfs cm mg =
                           Identity -> Mir.Identity $ opMap ^?! ix p . _3
                               where [(_, p)] = ins
                           Sink -> error "impossible"
-                          Source -> error "impossible"
+                          Source{} -> error "impossible"
                           Filter f ->
                               let elems = HashMap.toList f in
                               Mir.Filter

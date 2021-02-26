@@ -1,4 +1,4 @@
-{-# LANGUAGE TemplateHaskell, CPP, ImplicitParams #-}
+{-# LANGUAGE TemplateHaskell, ImplicitParams #-}
 
 module Main where
 
@@ -10,6 +10,7 @@ import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashSet as HS (HashSet, fromList, member)
+import qualified Data.HashMap.Strict as HashMap
 import qualified Data.IntMap as IM
 import Data.List (intercalate, lookup)
 import qualified Data.String as Str
@@ -23,6 +24,8 @@ import qualified Prelude
 import System.Directory (createDirectoryIfMissing, doesFileExist, getModificationTime)
 import qualified System.FilePath as FP
 import Control.Monad.Trans.Control (MonadBaseControl)
+import qualified Paths_ohuac as Paths
+import qualified Data.Version as Version
 
 import Ohua.ALang.PPrint ()
 import Ohua.CodeGen.Iface
@@ -183,12 +186,12 @@ runBuild BuildOpts { outputFormat
                 Lambda "_" body -> body
                 e -> e
     let sfDeps = gatherSFDeps expr
-    let (mainArity, completeExpr) = mainToEnv expr
-    udfs <- newIORef []
-    let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
-    noriaPass <-
+    let defWithCleanUnit = def { passAfterDFLowering = cleanUnits }
+    (passes, handleMainArgs, gen) <-
         case outputFormat of
             NoriaUDF -> do
+                udfs <- newIORef []
+                let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
                 let (streamAnn:_) =
                         argTypes $ mainAnns ^?! _Just . ix entrypoint
                     (ftys, constr) =
@@ -200,29 +203,30 @@ runBuild BuildOpts { outputFormat
                     Just formatter = Prelude.lookup "rust" langs
                     fields =
                         IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
-                pure $ NoriaUDFGen.generateOperators fields addUdf
-            _ -> pure pure
+                tableMap <- newIORef Nothing
+                pure ( defWithCleanUnit
+                       { passBeforeNormalize = NoriaUDFGen.rewriteQueryExpressions addUdf
+                       , passAfterNormalize = NoriaUDFGen.generateOperators fields addUdf
+                       }
+                     , \a -> do
+                           let (arity, tMap, e) = NoriaUDFGen.mainArgsToTableRefs a
+                           writeIORef tableMap (Just $ HashMap.fromList tMap)
+                           pure (fromIntegral arity, e)
+                     , \dat -> do
+                             udfs' <- readIORef udfs
+                             tMap <- fromMaybe (error "Table map unset") <$> readIORef tableMap
+                             NoriaUDFGen.extraOperatorProcessing sandbox udfs'
+                             NoriaUDFGen.generate tMap udfs' dat)
+            JsonGraph -> pure (defWithCleanUnit, pure . mainToEnv, JSONGen.generate )
+            SimpleJavaClass -> pure (defWithCleanUnit, pure . mainToEnv, JavaGen.generate )
+    (mainArity, completeExpr) <- handleMainArgs expr
     gr <-
         compile
             (def & stageHandling .~ stageHandlingOpt &
              transformRecursiveFunctions .~
              ("tail-recursion" `elem` extraFeatures))
-            (def
-                 { passAfterDFLowering = cleanUnits
-                 , passAfterNormalize = noriaPass
-                 , passBeforeNormalize = case outputFormat of
-                         NoriaUDF -> NoriaUDFGen.rewriteQueryExpressions addUdf
-                         _ -> pure
-                 })
+            passes
             completeExpr
-    gen <-
-        case outputFormat of
-            JsonGraph -> pure JSONGen.generate
-            SimpleJavaClass -> pure JavaGen.generate
-            NoriaUDF -> do
-                udfs' <- readIORef udfs
-                NoriaUDFGen.extraOperatorProcessing sandbox udfs'
-                pure $ NoriaUDFGen.generate udfs'
     code <-
         flip runReaderT CodeGenOpts $
         gen
@@ -300,7 +304,7 @@ main = do
     opts <- execParser odef
     case opts of
         ShowVersion -> do
-            putStrLn ("ohuac v" <> CURRENT_PACKAGE_VERSION :: Text)
+            putStrLn ("ohuac v" <> toText ( Version.showVersion Paths.version ))
             putStrLn
                 ("Compiled at " <>
                  $(do t <- liftIO Time.getCurrentTime

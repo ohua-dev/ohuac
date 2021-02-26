@@ -4,8 +4,8 @@ module Ohua.CodeGen.NoriaUDF
     , suggestName
     , extraOperatorProcessing
     , rewriteQueryExpressions
+    , mainArgsToTableRefs
     ) where
 
 import Ohua.CodeGen.NoriaUDF.Operator
-import Ohua.CodeGen.NoriaUDF.Mir
 import Ohua.CodeGen.NoriaUDF.LowerToMir

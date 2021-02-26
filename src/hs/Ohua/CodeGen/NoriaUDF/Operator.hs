@@ -20,6 +20,7 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , pattern SimpleSem
     , pattern ReductionSem
     , rewriteQueryExpressions
+    , mainArgsToTableRefs
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -878,3 +879,8 @@ extraOperatorProcessing useSandbox ops = do
     createSysTempDir pat =
         Temp.getCanonicalTemporaryDirectory >>= \sysd ->
             Temp.createTempDirectory sysd pat
+
+mainArgsToTableRefs :: Expr -> (Word, [(Binding, Word)], Expr)
+mainArgsToTableRefs = RS.para $ \case
+    LambdaF a (_,  (i, l, e) ) -> (i + 1, (a,i):l, Let a (embedE ( QualifiedBinding [ "ohua", "sql", "rel" ] a ) `Apply` embedE UnitLit) e)
+    other -> (0, [], RS.embed $ fmap fst other)

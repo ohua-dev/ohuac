@@ -7,6 +7,7 @@ module Ohua.CodeGen.NoriaUDF.LowerToMir
 
 import Ohua.Prelude hiding (First, Identity)
 
+import qualified Data.HashSet as HashSet
 import Control.Lens (Simple, (%=), (^?!), ix, to, use)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.IntMap as IM
@@ -463,6 +464,94 @@ toMirCol DFGraph.Target {..} =
         , name = showT $ "o" <> (pretty operator) <> "_i" <> (pretty index)
         }
 
+toSerializableGraph2 ::
+       [UDFDescription] -> ScopeMap -> MirGraph -> SerializableGraph
+toSerializableGraph2 udfs cm mg =
+    SerializableGraph
+        { adjacencyList =
+              [ (entry ^. _1, completeOutputColsFor entry, map toNIdx ins)
+              | n <- nonSinkSourceNodes
+              , let entry = opMap IM.! n
+                    ins = GR.pre mg n
+              ]
+        , sink =
+              let [(s, _, l)] = GR.inn mg $ fst sink
+               in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s)
+        , sources = sources
+        }
+  where
+    columnDemand =
+        IM.fromList
+            [ ( id
+              , case op of
+                    Join {} -> undefined
+                    other -> selfDemand <> scopeDemand <> downstreamDemand)
+            | (_, id) <- indexMapping
+            , let (ins, _, op, outs) = GR.context mg id
+                  downstreamDemand =
+                      HashSet.unions $ map ((columnDemand IM.!) . snd) outs
+                  scopeDemand =
+                      HashSet.fromList
+                          [ Left (unwrap fid, i)
+                          | GroupBy b <- cm IM.! id
+                          , DFGraph.Target fid i <- b
+                          ]
+                  selfDemand =
+                      HashSet.fromList $
+                      case op of
+                          Join {} -> error "impossible"
+                          Filter f -> HashMap.keys f
+                          Projection p -> map Left p
+                          Identity -> fromIn
+                          Sink -> fromIn
+                          Source {} -> []
+                          CustomOp _ -> fromIn
+                  fromIn =
+                      [ Left c
+                      | (cols, _) <- ins
+                      , c@(_, idx) <- cols
+                      , idx /= negate 1
+                      ]
+            ]
+    opMap =
+        IM.fromList
+            [ (oldId, (undefined, cols))
+            | (newId, oldId) <- indexMapping
+            , let (ins, _, op, outs) = GR.context mg n
+                  cols =
+                      case op of
+                          _ -> stdCols
+                  [((opMap IM.!) -> parent)] = ins
+                  stdCols = parent ^. _2
+            ]
+    indexMapping :: [(Word, Int)]
+    indexMapping =
+        zip
+            [0 ..] -- new indices corresponding to index in this list
+            (fst sink : -- sink node will be inserted first from noria
+             map (^. _3) (sortOn (^. _2) sources) -- then follow all base tables
+              ++
+             nonSinkSourceNodes)
+    nonSinkSourceNodes :: [Int]
+    nonSinkSourceNodes =
+        [ n
+        | (n, op) <- GR.labNodes mg
+        , case op -- and on this end we must filter all those nodes
+                          -- we've already explicitly inserted before
+                of
+              Sink -> False
+              Source {} -> False
+              _ -> True
+        ]
+    sources =
+        [ ( name
+          , idx
+          , s
+          , map (Mir.Column (Just name) . showT) [0 .. maximum (map fst labels)])
+        | (s, Source idx name) <- GR.labNodes mg
+        , let labels = concatMap (^. _3) $ GR.out mg s
+        ]
+
 toSerializableGraph ::
        [UDFDescription] -> ScopeMap -> MirGraph -> SerializableGraph
 toSerializableGraph udfs cm mg =
@@ -487,7 +576,7 @@ toSerializableGraph udfs cm mg =
     opMap =
         IM.fromList
             [ (n, (newOp, flattenCtx ctx, cols))
-            | (_, n) <- drop 2 indexMapping
+            | n <- nonSinkSourceNodes
             , let (ins, _, op, outs) = GR.context mg n
                   ctx = cm IM.! n
                   indices =
@@ -496,10 +585,10 @@ toSerializableGraph udfs cm mg =
                           [(edges, n)] ->
                               map (colFrom n . fst) $ sortOn snd edges
                           _ -> error $ "Too many ancestors for " <> show op
-                  cols
-                      | Join {} <- op = cols1 <> flattenCtx ctx <> cols2 -- dirty hack
-                      | null outs = []
-                      | otherwise = normalCols
+                  cols = case op of
+                      Join {} -> cols1 <> flattenCtx ctx <> cols2 -- dirty hack
+                      _ | null outs -> []
+                        | otherwise -> normalCols
                     where
                       normalCols =
                           map
@@ -556,25 +645,22 @@ toSerializableGraph udfs cm mg =
     colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
     [sink] = filter (isSink . snd) (GR.labNodes mg)
     sources =
-        let f =
-                \case
-                    (s, Source idx name) ->
-                        let labels = concatMap (^. _3) $ GR.out mg s
-                         in Just
-                                ( name
-                                , idx
-                                , s
-                                , map (Mir.Column (Just name) . showT)
-                                      [0 .. maximum (map fst labels)])
-                    _ -> Nothing
-         in mapMaybe f $ GR.labNodes mg
+        [ ( name
+          , idx
+          , s
+          , map (Mir.Column (Just name) . showT) [0 .. maximum (map fst labels)])
+        | (s, Source idx name) <- GR.labNodes mg
+        , let labels = concatMap (^. _3) $ GR.out mg s
+        ]
     indexMapping :: [(Word, Int)]
     indexMapping =
         zip
             [0 ..] -- new indices corresponding to index in this list
             (fst sink : -- sink node will be inserted first from noria
              map (^. _3) (sortOn (^. _2) sources) -- then follow all base tables
-              ++
+              ++ nonSinkSourceNodes)
+    nonSinkSourceNodes :: [Int]
+    nonSinkSourceNodes =
              [ n
              | (n, op) <- GR.labNodes mg
              , case op of -- and on this end we must filter all those nodes
@@ -582,7 +668,7 @@ toSerializableGraph udfs cm mg =
                    Sink -> False
                    Source {} -> False
                    _ -> True
-             ])
+             ]
     toNIdx :: Int -> Word
     toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
     scopeSize = fromIntegral . length . flattenCtx

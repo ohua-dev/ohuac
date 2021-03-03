@@ -1,0 +1,31 @@
+
+indent-size: 4
+line-length: 80
+force-trailing-newline: true
+extensions:
+  - MultiParamTypeClasses
+  - FunctionalDependencies
+  - TypeFamilies
+  - GADTs
+  - FlexibleContexts
+  - FlexibleInstances
+  - TypeSynonymInstances
+  - LambdaCase
+  - TupleSections
+  - BangPatterns
+  - ExplicitForAll
+  - ScopedTypeVariables
+  - DefaultSignatures
+  - DeriveFunctor
+  - DeriveFoldable
+  - DeriveTraversable
+  - DeriveGeneric
+  - PatternSynonyms
+  - NoImplicitPrelude
+  - TypeApplications
+  - NamedFieldPuns
+  - RecordWildCards
+  - RankNTypes
+  - ViewPatterns
+  - NoImplicitPrelude
+  - StandaloneDeriving

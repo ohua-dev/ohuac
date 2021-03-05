@@ -26,13 +26,13 @@ type Column = (Int, Int)
 
 -- instance Hashable Column
 -- instance NFData Column
-
-data Scope =
-    GroupBy [DFGraph.Target]
+type Scope = GScope DFGraph.Target
+data GScope col =
+    GroupBy [col]
     deriving (Show, Eq, Generic)
 
--- instance Hashable Scope
-instance NFData Scope
+instance Hashable a => Hashable (GScope a)
+instance NFData a => NFData (GScope a)
 
 data Operator
     = CustomOp QualifiedBinding
@@ -40,7 +40,7 @@ data Operator
     | Projection [Column]
     | Identity
     | Sink
-    | Source Word Text
+    | Source Word
     | Filter { conditions :: HashMap (Either Column Mir.Column) Mir.FilterCondition }
     deriving (Show, Eq, Generic)
 

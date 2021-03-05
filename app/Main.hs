@@ -203,20 +203,15 @@ runBuild BuildOpts { outputFormat
                     Just formatter = Prelude.lookup "rust" langs
                     fields =
                         IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
-                tableMap <- newIORef Nothing
                 pure ( defWithCleanUnit
                        { passBeforeNormalize = NoriaUDFGen.rewriteQueryExpressions addUdf
                        , passAfterNormalize = NoriaUDFGen.generateOperators fields addUdf
                        }
-                     , \a -> do
-                           let (arity, tMap, e) = NoriaUDFGen.mainArgsToTableRefs a
-                           writeIORef tableMap (Just $ HashMap.fromList tMap)
-                           pure (fromIntegral arity, e)
+                     , pure . mainToEnv
                      , \dat -> do
                              udfs' <- readIORef udfs
-                             tMap <- fromMaybe (error "Table map unset") <$> readIORef tableMap
                              NoriaUDFGen.extraOperatorProcessing sandbox udfs'
-                             NoriaUDFGen.generate tMap udfs' dat)
+                             NoriaUDFGen.generate udfs' dat)
             JsonGraph -> pure (defWithCleanUnit, pure . mainToEnv, JSONGen.generate )
             SimpleJavaClass -> pure (defWithCleanUnit, pure . mainToEnv, JavaGen.generate )
     (mainArity, completeExpr) <- handleMainArgs expr

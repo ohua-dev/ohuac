@@ -65,5 +65,4 @@ data Node
     | Identity [Column]
     | Filter
           { conditions :: [Maybe FilterCondition]
-          , indices :: [Column]
           }

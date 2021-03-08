@@ -24,9 +24,10 @@ type ExecSemantic = (ExecSem, ExecSem)
 
 type Column = (Int, Int)
 
+type SomeColumn = Either Column Mir.Column
 -- instance Hashable Column
 -- instance NFData Column
-type Scope = GScope DFGraph.Target
+type Scope = GScope SomeColumn
 data GScope col =
     GroupBy [col]
     deriving (Show, Eq, Generic)

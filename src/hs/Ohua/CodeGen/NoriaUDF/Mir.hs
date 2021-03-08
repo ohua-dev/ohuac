@@ -21,6 +21,7 @@ data ExecutionType
           { groupBy :: [Column]
           }
     | Simple Word
+  deriving (Show)
 
 data Operator
     = Equal
@@ -66,3 +67,4 @@ data Node
     | Filter
           { conditions :: [Maybe FilterCondition]
           }
+  deriving (Show)

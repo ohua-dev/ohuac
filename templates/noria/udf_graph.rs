@@ -5,7 +5,7 @@ use nom_sql::Operator;
 use dataflow::ops::filter::{Value, FilterCondition };
 use common::DataType;
 
-pub fn mk_graph(tables : &[&str]) -> UDFGraph {
+pub fn mk_graph(tables : &[String]) -> UDFGraph {
     // <begin(graph)>
     super::UDFGraph {
         adjacency_list: vec![],

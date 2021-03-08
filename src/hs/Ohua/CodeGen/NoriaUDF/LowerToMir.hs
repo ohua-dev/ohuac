@@ -42,7 +42,7 @@ import qualified Ohua.Helpers.Template as TemplateHelper
 type GetGraph g a b s m
      = (MonadState s m, Field1 s s (g a b) (g a b), GR.DynGraph g)
 
-type ScopeMap = IntMap [Scope]
+type ScopeMap = IntMap [GScope SomeColumn]
 
 type Gr = GR.Gr
 
@@ -61,7 +61,7 @@ data SerializableGraph =
         { adjacencyList :: AdjList Mir.Node
         , sink :: (Word, [Mir.Column])
         , sources :: [(Word, Int, [Mir.Column])]
-        }
+        } deriving (Show)
 
 type OpMap = IntMap OpMapEntry
 
@@ -277,9 +277,19 @@ mkScopeMap lm gr = m
                           CustomOp "ohua.sql.query/group_by" -> (GroupBy cols :)
                               where cols =
                                         map
-                                            (DFGraph.Target (unsafeMake preNum) .
-                                             fromIntegral .
-                                             expectNumLit)
+                                            (\case
+                                                 NumericLit l ->
+                                                     (Left
+                                                          ( preNum
+                                                          , fromIntegral l))
+                                                 FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "field"] f) _) ->
+                                                     Right
+                                                         (Mir.Column Nothing $
+                                                          unwrap f)
+                                                 o ->
+                                                     error $
+                                                     "Expected numeric literal or field reference, got " <>
+                                                     quickRender o)
                                             colNums
                                     [(_, preNum)] = pre
                                     colNums =
@@ -290,7 +300,13 @@ mkScopeMap lm gr = m
                                                 "Expected single env argument to `group_by`, found " <>
                                                 maybe "none" show cols
                           -- "ohua.lang/smap" -> (SmapC :)
-                          CustomOp "ohua.lang/collect" -> \(_:xs) -> xs
+                          CustomOp "ohua.lang/collect" ->
+                              \(x:xs) ->
+                                  assert
+                                      (case x of
+                                           GroupBy _ -> True
+                                           _ -> False) $
+                                  xs
                           _ -> id
             ]
 
@@ -463,6 +479,10 @@ instance ToRust SerializableGraph where
 completeOutputColsFor :: OpMapEntry -> [Mir.Column]
 completeOutputColsFor i = i ^. _2 <> i ^. _3
 
+someColToMirCol :: SomeColumn -> Mir.Column
+someColToMirCol =
+    either (\(op, idx) -> toMirCol $ DFGraph.Target (unsafeMake op) idx) id
+
 toMirCol :: DFGraph.Target -> Mir.Column
 toMirCol DFGraph.Target {..} =
     Mir.Column
@@ -470,36 +490,46 @@ toMirCol DFGraph.Target {..} =
         , name = showT $ "o" <> (pretty operator) <> "_i" <> (pretty index)
         }
 
-type SomeColumn = Either (Int, Int) Mir.Column
-
 calcColumns :: ScopeMap -> OperatorGraph -> IntMap [SomeColumn]
 calcColumns cm gr =
     IM.map
-        (\m ->
-             HashMap.toList m >>= \(a, b) ->
-                 if null b
-                     then [Left a]
-                     else map Right b) $
+        (>>= \case
+                 Left (a, b)
+                     | null b -> [Left a]
+                     | otherwise -> map Right b
+                 Right c -> [Right c]) $
+    traceShowId $
     flip execState initial $
-    for_ (GR.topsort gr) $ \self ->
+    for_ (GR.topsort gr) $ \self -> do
         let (ins, _, op, _) = GR.context gr self
-         in case op of
+        trace ("Handling " ++ show self ++ " (" ++ show op ++ ")") $ pure ()
+        case op of
                 Filter conds ->
                     case ins of
                         [([col], parent)] ->
                             mapM_
                                 (either (const $ pure ()) $ void .
-                                 addField parent col)
+                                 addField parent (Left $ fst col))
                                 (HashMap.keys conds)
                         _ ->
+
                             error $ "weird shape for parent of filter " <>
                             showT ins
                 _ -> pure ()
   where
-    addField node col field = do
+    log msg = trace msg $ pure ()
+    addField node col' field = do
+        log $ "Adding field " ++ show field ++ " to " ++ show node
         prev <- lookupField node col $ Mir.name field
-        maybe escalate pure prev
+        case prev of
+            Nothing -> do
+                log $ "No previous field " <> showT field <> " found, escalating"
+                escalate
+            Just f -> do
+                log $ "Previous field " <> showT f <> " found"
+                pure f
       where
+        col = either (node, ) id col'
         (ins, _, op, _) = GR.context gr node
         escalate = do
             fieldWithTable <-
@@ -508,50 +538,65 @@ calcColumns cm gr =
                         assertM (Mir.table field == Nothing)
                         pure $
                             Mir.Column
-                                (Just $ "tables[" <> showT tidx <> "].clone()") $
+                                (Just $ "&tables[" <> showT tidx <> "].clone()") $
                             Mir.name field
                     Join {} -> unimplemented
                     _ ->
                         case ins of
-                            [([col], parent)] -> addField parent col field
+                            [([col], parent)] ->
+                                addField
+                                    parent
+                                    (mapLeft (const $ fst col) col')
+                                    field
                             _ ->
                                 error $ "weird shape for parent in add column " <>
                                 showT ins
-            modify
-                (IM.adjust
-                     (HashMap.alter
-                          (Just . (fieldWithTable :) . fromMaybe [])
-                          col)
-                     node)
+            log $ "Found field " <> showT fieldWithTable <> " inserting with " <> showT col
+            modify (IM.adjust (alter (fieldWithTable :) col) node)
+            log . showT =<< gets (IM.! node)
             pure fieldWithTable
+    alter :: Eq a => Show a => Show b => Show b1 => (b -> b) -> a -> [Either (a, b) b1] -> [Either (a, b) b1]
+    alter f k seq =
+        flip evalState Nothing $ do
+            s <-
+                traverse
+                    (\case
+                         Left (c, l)
+                             | c == k -> put (Just (c, f l)) $> (Left (c, f l))
+                         other -> pure other)
+                    seq
+            get >>= maybe (error "not found") pure
+            pure $ traceShowId s
+    find :: Show b => (b -> Bool) -> [Either (a, [b]) b] -> Maybe b
+    find p =
+        (\case
+             [f] -> Just f
+             [] -> Nothing
+             more -> error $ "Too many matching fields: " <> showT more) .
+        filter p .
+        (>>= either snd pure)
     lookupField ::
-           MonadState (IntMap (HashMap Column [Mir.Column])) m
+           MonadState (IntMap [Either (Column, [Mir.Column]) Mir.Column]) m
         => Int
         -> Column
         -> Text
         -> m (Maybe Mir.Column)
-    lookupField node col f =
-        (=<<)
-            (\fs ->
-                 case filter ((== f) . Mir.name) fs of
-                     [f] -> Just f
-                     [] -> Nothing
-                     _more ->
-                         error $ "multiple fields with name " <> showT f <>
-                         " found in " <>
-                         showT fs) <$>
-        gets (HashMap.lookup col . (IM.! node))
-    initial :: IntMap (HashMap Column [Mir.Column])
-    initial =
+    lookupField node col f = gets (find ((== f) . Mir.name) . (IM.! node))
+    initial :: IntMap [Either (Column, [Mir.Column]) Mir.Column]
+    initial
+        -- Possibly I need to add the context differently so that it registers the columns with the parents
+     =
         IM.fromList
-            [ (node, HashMap.fromList $ outs >>= map (, []) . view _3)
+            [ ( node
+              , (cm IM.! node >>= \(GroupBy c) -> map (mapLeft (, [])) c) <>
+                map (Left . (, []) . (node,)) (sort $ hashNub [idx | (cols, _) <- outs, (idx, _) <- cols] ))
             | node <- GR.nodes gr
-            , let outs = GR.out' $ GR.context gr node
+            , let (_, _, _, outs) = GR.context gr node
             ]
 
 toSerializableGraph2 ::
        [UDFDescription] -> ScopeMap -> OperatorGraph -> SerializableGraph
-toSerializableGraph2 udfs cm mg =
+toSerializableGraph2 udfs cm mg = traceShowId
     SerializableGraph
         { adjacencyList = adjacencies
         , sink =
@@ -595,22 +640,18 @@ toSerializableGraph2 udfs cm mg =
                 Source {} -> error "impossible"
                 Filter f ->
                     Mir.Filter {conditions = map (flip HashMap.lookup f) cols}
-          , map eitherToMirCol cols
+          , map someColToMirCol cols
           , map (toNIdx . snd) ins)
         | n <- nonSinkSourceNodes
         , let (ins, _, op, _) = GR.context mg n
               cols = actualColumn IM.! n
         ]
-    actualColumn = calcColumns cm mg
+    actualColumn = traceShowId $ calcColumns cm mg
     execSemMap :: QualifiedBinding -> Maybe ExecSemantic
     execSemMap =
         flip HashMap.lookup $ HashMap.fromList $
         map (\UDFDescription {..} -> (udfName, execSemantic)) udfs
-    completeOutputColsFor = map eitherToMirCol . (actualColumn IM.!)
-    eitherToMirCol =
-        \case
-            Left (f, i) -> toMirCol $ DFGraph.Target (unsafeMake f) i
-            Right c -> c
+    completeOutputColsFor = map someColToMirCol . (actualColumn IM.!)
     indexMapping :: [(Word, Int)]
     indexMapping =
         zip
@@ -633,9 +674,9 @@ toSerializableGraph2 udfs cm mg =
     sources =
         [ ( idx
           , s
-          , map (Mir.Column Nothing . showT) [0 .. maximum (map fst labels)])
+          , completeOutputColsFor s
+          )
         | (s, Source idx) <- GR.labNodes mg
-        , let labels = concatMap (^. _3) $ GR.out mg s
         ]
     [sink] = filter (isSink . snd) (GR.labNodes mg)
     toNIdx :: Int -> Word
@@ -725,8 +766,7 @@ toSerializableGraph udfs cm mg =
                           Filter f ->
                               let elems = HashMap.toList f
                                in Mir.Filter
-                                      { conditions = map (Just . snd) elems
-                                      }
+                                      {conditions = map (Just . snd) elems}
             ]
     adjToProduced (edges, opid) = map (\(out, _) -> colFrom opid out) edges
     colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
@@ -737,7 +777,7 @@ toSerializableGraph udfs cm mg =
           , map (Mir.Column (Just name) . showT) [0 .. maximum (map fst labels)])
         | (s, Source idx) <- GR.labNodes mg
         , let labels = concatMap (^. _3) $ GR.out mg s
-              name = "tables[" <> showT idx <> "].copy()" -- jikes this is dirty
+              name = "&tables[" <> showT idx <> "].copy()" -- jikes this is dirty
         ]
     indexMapping :: [(Word, Int)]
     indexMapping =
@@ -763,7 +803,7 @@ toSerializableGraph udfs cm mg =
     scopeSize = fromIntegral . length . flattenCtx
 
 flattenCtx :: [Scope] -> [Mir.Column]
-flattenCtx = (>>= \(GroupBy l) -> map toMirCol l)
+flattenCtx = (>>= \(GroupBy l) -> map someColToMirCol l)
 
 unimplemented :: HasCallStack => a
 unimplemented = error "Function or branch not yet implemented"
@@ -799,7 +839,7 @@ generate compiledNodes CodeGenData {..} = do
         [ "graph-mods" ~> ["mod " <> entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
           [ "\"" <> entryPointName <> "\" => Some(" <> entryPointName <>
-            "_graph::mk_graph()),"
+            "_graph::mk_graph(tables)),"
           ]
         ]
     pure $ LT.encodeUtf8 $ LT.fromStrict tpl'

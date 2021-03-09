@@ -882,8 +882,8 @@ generate compiledNodes CodeGenData {..} = do
         (noriaMirSourceDir <> "/udfs/mod.rs")
         [ "graph-mods" ~> ["mod " <> entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
-          [ "\"" <> entryPointName <> "\" => Some(" <> entryPointName <>
-            "_graph::mk_graph(tables)),"
+          [ "\"" <> entryPointName <> "\" => Some(Box::new(" <> entryPointName <>
+            "_graph::mk_graph)),"
           ]
         ]
     pure $ LT.encodeUtf8 $ LT.fromStrict tpl'

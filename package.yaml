@@ -66,6 +66,7 @@ library:
   - temporary
   - fgl
   - comonad
+  - graphviz
   when:
     - condition: flag(with-clike-parser)
       dependencies:

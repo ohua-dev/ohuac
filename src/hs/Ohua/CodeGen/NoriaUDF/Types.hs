@@ -22,7 +22,15 @@ type ExecSemantic = (ExecSem, ExecSem)
     -- - | MirJoin
     -- - | MirProjection
 
-type Column = (Int, Int)
+data InternalColumn = InternalColumn
+    { producingOperator :: Int
+    , outputIndex :: Int
+    } deriving (Show, Eq, Ord, Generic)
+
+instance Hashable InternalColumn
+instance NFData InternalColumn
+
+type Column = InternalColumn
 
 type SomeColumn = Either Column Mir.Column
 -- instance Hashable Column
@@ -35,14 +43,22 @@ data GScope col =
 instance Hashable a => Hashable (GScope a)
 instance NFData a => NFData (GScope a)
 
+data JoinType
+    = FullJoin
+    | InnerJoin [SomeColumn]
+    deriving (Show, Eq, Generic)
+
+instance NFData JoinType
+instance Hashable JoinType
+
 data Operator
-    = CustomOp QualifiedBinding
-    | Join { joinOn :: [Scope] }
-    | Projection [Column]
+    = CustomOp QualifiedBinding [(Int, SomeColumn)]
+    | Join JoinType
+    | Project [SomeColumn]
     | Identity
     | Sink
     | Source Word
-    | Filter { conditions :: HashMap (Either Column Mir.Column) Mir.FilterCondition }
+    | Filter { conditions :: HashMap SomeColumn Mir.FilterCondition }
     deriving (Show, Eq, Generic)
 
 -- instance Hashable Operator

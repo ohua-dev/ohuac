@@ -6,44 +6,86 @@ import Control.Lens.TH
 import Data.Functor.Foldable
 import qualified Data.HashMap.Strict as HashMap
 import Ohua.ALang.Lang
-import Ohua.ALang.PPrint (quickRender)
+import Ohua.ALang.PPrint (Pretty, quickRender)
+import Ohua.ALang.Util (fromListToApply)
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import Ohua.CodeGen.NoriaUDF.Types
 import Ohua.CodeGen.NoriaUDF.Util
 import Ohua.Prelude
 import Ohua.Unit
+import Control.Monad.Writer
+import qualified Control.Lens.Plated as Plated
+
+pattern BuiltinFunE b <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang"] b) _))
+
+data Conjunction = And | Or deriving (Show, Eq, Ord)
+
+data Condition = Comp (Either Column Mir.Column, Mir.FilterCondition ) | Conj Conjunction Condition Condition
+    deriving (Show, Eq, Generic)
+
+instance Plated.Plated Condition where
+    plate = Plated.gplate
 
 exprToMirCondition ::
        Expr
-    -> OhuaM env (HashMap.HashMap (Either Column Mir.Column) Mir.FilterCondition)
-exprToMirCondition (Lambda table body) = pure $ HashMap.fromList $ apo f body
+    -> OhuaM env (HashMap.HashMap (Either Column Mir.Column) Mir.FilterCondition, [Binding])
+exprToMirCondition (Lambda table body) =
+    pure $ first HashMap.fromList $ runWriter $ fmap andToList $ f body
   where
-    toCond (Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang"] o) _)) `Apply` left `Apply` right) =
-        (Right baseCol, Mir.Comparison actualOp val)
-      where
-        op =
-            case o of
-                "eq" -> Mir.Equal
-                other -> error $ "Unknown operator " <> quickRender other
-        (actualOp, baseCol, val) =
-            case (toVal left, toVal right) of
-                (Mir.ColumnValue c, other) -> (op, c, other)
-                (other, Mir.ColumnValue c) -> (flipOp op, c, other)
-                other ->
-                    error $
-                    "Unexpectedly no column in this filter: " <> showT other
-    toCond other = error $ "can't convert " <> quickRender other
+    mkE :: (HasCallStack , Pretty a) => a -> b
+    mkE t = error $ "Cannot convert \"" <> quickRender t <> "\" in " <> quickRender body
     toVal (t `BindState` Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] n) _))) =
-        assert (t == Var table) $
-        Mir.ColumnValue (Mir.Column Nothing (unwrap n))
-    toVal (Lit l) = Mir.ConstantValue l
-    toVal other = error $ "can't convert " <> quickRender other
+        case t of
+            Var v -> do
+                unless (v == table) $ tell [v]
+                pure $ Mir.ColumnValue (Mir.Column Nothing (unwrap n))
+            _ -> mkE t
+    toVal (Lit l) = pure $ Mir.ConstantValue l
+    toVal other = mkE other
     flipOp =
         \case
             Mir.Equal -> Mir.Equal
-    f (Lit (FunRefLit (FunRef o _)) `Apply` left `Apply` right)
-        | o == "ohua.lang/&&" = Cons (toCond left) $ Right right
-    f other = Cons (toCond other) (Left [])
+            other -> Mir.deMorganOp other -- Not sure this is actually true, I'm just lazy
+    f (BuiltinFunE b `Apply` left `Apply` right)
+        | b == "and" = do
+              l <- f left
+              r <- f right
+              pure $ Conj And l r
+        | otherwise = do
+              vl <- toVal left
+              vr <- toVal right
+              let (actualOp, baseCol, val) =
+                      case (vl, vr) of
+                          (Mir.ColumnValue c, other) -> (op, c, other)
+                          (other, Mir.ColumnValue c) -> (flipOp op, c, other)
+                          other ->
+                              error $
+                              "Unexpectedly no column in this filter: " <> showT other
+              pure $ Comp (Right baseCol, Mir.Comparison actualOp val)
+                where
+                  op =
+                      case b of
+                          "eq" -> Mir.Equal
+                          "neq" -> Mir.NotEqual
+                          "geq" -> Mir.GreaterOrEqual
+                          "lt" -> Mir.Less
+                          "leq" -> Mir.LessOrEqual
+                          other -> error $ "Unknown operator " <> quickRender other
+    f (BuiltinFunE "not" `Apply` thing) = deMorgan <$> f thing
+    f other =
+        toVal other >>= \case
+            Mir.ColumnValue c -> pure $ Comp (Right c, Mir.Comparison Mir.Equal $ Mir.ConstantValue (NumericLit 1))
+            _ -> mkE other
+    deMorgan = transform $ \case
+        (Conj con a b) -> Conj (deMorganConjunction con) a b
+        (Comp (c, Mir.Comparison op v)) -> Comp (c, Mir.Comparison (Mir.deMorganOp op) v)
+    deMorganConjunction = \case And -> Or; Or -> And
+    andToList = Plated.para f'
+      where
+        f' (Conj op _ _) sub
+            | op == Or = error $ "Disjunction not supported like this " <> quickRender body
+            | otherwise = concat sub
+        f' (Comp v) [] = [v]
 exprToMirCondition other = error $ "can't convert " <> quickRender other
 
 type EDSLRewrite env = (RegisterOperator -> Expr -> [Expr] -> OhuaM env Expr)
@@ -57,16 +99,24 @@ queryEDSL = flip HashMap.lookup table
         [ fn "select" ~>
           ((\_ state args -> assertM (null args) >> pure state) :: EDSLRewrite env)
          -- eventually this should insert a remapping and field selection node
-        , fn "where_" ~>
+        , fn "filter" ~>
           ((\register state args -> do
                 let arg = case args of
                         [arg] -> arg
                         other -> error $ "too many argument " <> quickRender other
-                conditionMap <- exprToMirCondition arg
+                (conditionMap, free)  <- exprToMirCondition arg
                 name <- generateBindingWith "where_"
                 let newFnName =
                         QualifiedBinding ["ohua", "generated", "sql_ops"] name
                 liftIO $ register $ Op_MIR (newFnName, Filter conditionMap)
-                pure $ Apply (embedE newFnName) state) :: EDSLRewrite env)
+                pure $ fromListToApply (FunRef newFnName Nothing) (state : map Var free)) :: EDSLRewrite env)
          -- should resolve to the base state to figure out the table this references
         ]
+
+rewriteFieldAccess :: Expr -> OhuaM env Expr
+rewriteFieldAccess = pure . t
+  where
+    t = rewrite $ \case
+        BindState s f@(Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] _) Nothing))) ->
+            Just $ f `Apply` s
+        _ -> Nothing

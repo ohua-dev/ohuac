@@ -21,6 +21,7 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , pattern ReductionSem
     , rewriteQueryExpressions
     , mainArgsToTableRefs
+    , rewriteFieldAccess
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -65,7 +66,7 @@ import qualified Ohua.Helpers.Graph as GR
 import Ohua.Helpers.Template (Substitutions, Template)
 import qualified Ohua.Helpers.Template as TemplateHelper
 import Ohua.CodeGen.NoriaUDF.Util
-import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL)
+import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL, rewriteFieldAccess)
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import Ohua.CodeGen.NoriaUDF.Types
 

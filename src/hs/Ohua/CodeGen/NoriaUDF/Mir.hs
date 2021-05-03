@@ -29,11 +29,21 @@ data Operator
     | LessOrEqual
     | Greater
     | GreaterOrEqual
+    | NotEqual
     deriving (Show, Eq, Ord, Generic)
 
 instance Hashable Operator
 
 instance NFData Operator
+
+deMorganOp = \case
+    Equal -> NotEqual
+    NotEqual -> Equal
+    Less -> GreaterOrEqual
+    LessOrEqual -> Greater
+    Greater -> LessOrEqual
+    GreaterOrEqual -> Less
+
 
 data Value
     = ColumnValue Column

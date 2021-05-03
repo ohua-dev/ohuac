@@ -204,12 +204,14 @@ runBuild BuildOpts { outputFormat
                     fields =
                         IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
                 pure ( defWithCleanUnit
-                       { passBeforeNormalize = NoriaUDFGen.rewriteQueryExpressions addUdf
-                       , passAfterNormalize = NoriaUDFGen.generateOperators fields addUdf
+                       { passBeforeNormalize = NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
+                       , passAfterNormalize =
+                         NoriaUDFGen.generateOperators fields addUdf
                        }
                      , pure . mainToEnv
                      , \dat -> do
                              udfs' <- readIORef udfs
+                             liftIO . L.writeFile (toString $ unwrap entrypoint <> ".json") =<< JSONGen.generate dat
                              NoriaUDFGen.extraOperatorProcessing sandbox udfs'
                              NoriaUDFGen.generate udfs' dat)
             JsonGraph -> pure (defWithCleanUnit, pure . mainToEnv, JSONGen.generate )

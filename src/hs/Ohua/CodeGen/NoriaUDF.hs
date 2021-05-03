@@ -5,6 +5,7 @@ module Ohua.CodeGen.NoriaUDF
     , extraOperatorProcessing
     , rewriteQueryExpressions
     , mainArgsToTableRefs
+    , rewriteFieldAccess
     ) where
 
 import Ohua.CodeGen.NoriaUDF.Operator

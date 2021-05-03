@@ -18,6 +18,7 @@ import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import Prelude ((!!))
 
+import qualified Ohua.ALang.Refs as Refs
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import Ohua.CodeGen.NoriaUDF.Operator
@@ -111,6 +112,24 @@ forNodes_ pred ac = do
     nodes <- use $ _1 . to GR.labNodes
     for_ nodes $ \(n, lab) -> maybe (pure ()) (void . ac n) $ pred lab
 
+-- roots :: GR.Graph gr => gr a b -> [GR.Node]
+-- roots gr = filter (null . GR.pre gr) $ GR.nodes gr
+
+-- -- | Semantics notes for this function:
+-- --   - When inserting ancestors the behavior is unspecified
+-- --   - graph must be acyclic
+-- --   - Successors are calculated before the action is called
+-- forNodesTopo_ ::
+--        GetGraph g a b s m => (a -> Maybe c) -> (GR.Node -> c -> m x) -> m ()
+-- forNodesTopo_ pred ac = do
+--     gr0 <- use _1
+--     void $ iterateUntilM null
+--         (\(x:xs) -> do
+--              l <- use _2 . to (flip GR.lab x)
+--              su <- use _2 . to (flip GR.suc x)
+--              maybe (pure ()) ac (pred l)
+--              pure xs) (roots gr0)
+
 mkLitMap :: [DFGraph.DirectArc Lit] -> LitMap
 mkLitMap arcs =
     IM.fromListWith
@@ -123,6 +142,33 @@ mkLitMap arcs =
                   l'' -> [l'']
         ]
 
+handleSuperfluousEdgesAndCtrl :: (GR.DynGraph g, MonadLogger m) => (a -> Bool) -> g a b -> m (g a b)
+handleSuperfluousEdgesAndCtrl isCtrl = \g ->
+    let tc = GR.tc g
+        g' = remSuperfluousEdges tc g
+        ctrlWithTooManyParents =
+            [ n
+            | (n, l) <- GR.labNodes g'
+            , isCtrl l
+            , length (GR.pre g' n) > 1
+            ]
+    in
+        if null ctrlWithTooManyParents
+        then pure g'
+        else do
+            logErrorN $ "Too many parents for ctrl nodes " <> show ctrlWithTooManyParents
+            error "abort"
+  where
+    remSuperfluousEdges tc g = GR.delEdges
+        [ (p, n)
+        | n <- GR.nodes g
+        , let pre = GR.pre g n
+        , p <- pre
+        , o <- pre
+        , GR.hasEdge tc (p, o)
+        ]
+        g
+
 -- TODO
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
@@ -133,7 +179,9 @@ annotateAndRewriteQuery ::
     -> m (ScopeMap, OperatorGraph)
 annotateAndRewriteQuery gMirNodes graph = do
     debugLogGR "Initial Graph" iGr
-    let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
+    edgesRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l -> l == Refs.ctrl; _ -> False) iGr
+    let ctrlRemoved = GR.labnfilter (\case (n, CustomOp l) | l == Refs.ctrl -> if length (GR.pre edgesRemoved n) > 1 then error "Not yet implemented" else False; _ -> True ) edgesRemoved
+    let s0 = (ctrlRemoved, succ $ snd $ GR.nodeRange ctrlRemoved)
     s1@(gr1, _) <- flip execStateT s0 $ collapseNth envInputs
     let g = mkScopeMap envInputs gr1
     logInfoN $ "Scope Map\n" <> show g
@@ -198,7 +246,7 @@ sGetContext node = use $ _1 . to (flip GR.context node)
 sInsEdge :: GetGraph g a b s m => GR.LEdge b -> m ()
 sInsEdge edge = _1 %= GR.insEdge edge
 
-collapseMultiArcs :: Gr opLabel edgeLabel -> Gr opLabel [edgeLabel]
+collapseMultiArcs :: GR.DynGraph gr => gr opLabel edgeLabel -> gr opLabel [edgeLabel]
 collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
 
 collapseNth :: GetGraph g Operator Column s m => LitMap -> m ()

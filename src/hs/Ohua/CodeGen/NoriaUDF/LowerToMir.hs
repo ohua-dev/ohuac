@@ -180,7 +180,10 @@ handleSuperfluousEdgesAndCtrl isCtrl =
         , let pre = GR.pre g n
         , (p:other) <- tails pre
         , o <- other
-        , GR.hasEdge tc (p, o) || GR.hasEdge tc (o, p) || o == p
+        , r <- if GR.hasEdge tc (p, o) then [p]
+            else if GR.hasEdge tc (o, p) then [o]
+            else if o == p then [p]
+            else []
         -- This condition excludes cases where `n` is the first node after
         -- `smap` and also receives other input. In such cases this would sever
         -- the collection to `smap` which we rely on to later simply drop all
@@ -188,24 +191,66 @@ handleSuperfluousEdgesAndCtrl isCtrl =
         -- , not (isCtrl $ fromMaybe "node not found" $ GR.lab g o)
         ]
 
+sequentializeScalars :: (GR.DynGraph gr, gr Operator () ~ g) => (Operator -> ExecSemantic) -> g -> g
+sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
+  where
+    tc = GR.tc g0
+    f g n
+        | (One, One) <- getSem l
+        , [(_, p)] <- nins
+        , (Just (pins, _, plab, pouts), g'') <- GR.match p g'
+        , One <- snd (getSem plab) =
+                (nins, n, l, hashNub $ pouts ++ [o | o@(_, o') <- outs, not (any (flip reachable o' . snd) pouts)]) GR.& ((pins, p, plab, []) GR.& g'')
+        | otherwise = (nins, n, l, outs) GR.& g'
+      where
+        reachable p i = i /= p && GR.hasEdge tc (p, i)
+        (Just (ins, _, l, outs), g') = GR.match n g
+        nins = hashNub [((), p) | (_, p) <- ins, not $ any (reachable p . snd) ins ]
+
+
+execSemOf :: (QualifiedBinding -> UDFDescription) -> Operator -> ExecSemantic
+execSemOf nodes = \case
+    Join {} -> (Many, Many)
+    CustomOp op _
+        | op == Refs.collect -> (One, Many)
+        | op == Refs.smapFun -> (Many, One)
+        | op == Refs.ctrl -> (One, Many)
+        | QualifiedBinding ["ohua", "lang"] b <- op
+        , b `elem` (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) -> (One, One)
+        | otherwise -> execSemantic $ nodes op
+    Filter {} -> (Many, Many)
+    Identity -> undefined
+    Project {} -> (One, One)
+    Source _ -> (Many, Many)
+    Sink -> (Many, Many)
+
 -- TODO
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
 annotateAndRewriteQuery ::
        ( MonadLogger m, MonadIO m )
     => GeneratedMirNodes
+    -> [UDFDescription]
     -> DFGraph.OutGraph
     -> m (Gr Operator ())
-annotateAndRewriteQuery gMirNodes graph = do
+annotateAndRewriteQuery gMirNodes udfs graph = do
     debugLogGR "Initial Graph" iGr
     quickDumpGrAsDot "initial-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) iGr
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
     s1@(gr1, _) <- flip execStateT s0 $ inlineFieldAccess envInputs
     debugLogGR "Graph with nth collapsed" gr1
     quickDumpGrAsDot "nth-collapsed.dot" $ GR.nemap showOperator (const ("" :: Text)) gr1
-    ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
-    quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) ctrlRemoved
-    let gr2 = removeSuperfluousOperators ctrlRemoved
+    -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
+    -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) ctrlRemoved
+    let udfSequentialized =
+            sequentializeScalars
+            (execSemOf $
+             \o -> fromMaybe (error $ "Operator " <> quickRender o <> " not found in operator dictionary")
+                $ HashMap.lookup o (HashMap.fromList $ map (\d -> (udfName d, d)) udfs))
+            gr1
+            --ctrlRemoved
+    quickDumpGrAsDot "scalars-sequentialized.dot" $ GR.nemap showOperator (const ("" :: Text)) udfSequentialized
+    let gr2 = removeSuperfluousOperators udfSequentialized
     quickDumpGrAsDot "superf-removed.dot" $ GR.nemap showOperator (const ("" :: Text)) gr2
     let gr3 = multiArcToJoin2 gr2
     quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) gr3
@@ -341,15 +386,14 @@ dropNodesRelink p g = foldr'
          case p l of
              Nothing -> g
              Just newNode ->
-                 GR.insNodes
+                 flip (foldr'  (\(n, f) -> alterLabel n f))
                  [ (n', alterColumns
                        (\case Left c
                                   | producingOperator c == n ->
                                     Just $ Left c {producingOperator = newNode}
                               _ -> Nothing)
-                       $ fromMaybe (error "node not found") $ GR.lab g n'
                    )
-                 | n' <- GR.pre g n
+                 | n' <- GR.suc g n
                  ]
                  $ GR.insEdges (map (newNode, , ()) $ GR.suc g n)
                  $ GR.delNode n g
@@ -588,131 +632,131 @@ toMirCol DFGraph.Target {..} =
         }
 
 calcColumns ::
-       MonadLogger m => ScopeMap -> OperatorGraph -> m (IntMap [SomeColumn])
-calcColumns cm gr = do
-    m0 <-
-        flip execStateT initial $ for_ (GR.topsort gr) $ \self -> do
-            let (ins, _, op, _) = GR.context gr self
-            $(logDebug) $ "Handling " <> showT self <> " (" <> showT op <> ")"
-            case op of
-                Filter conds ->
-                    case ins of
-                        [([col], parent)] ->
-                            forM_ (HashMap.keys conds) $
-                            either (const $ pure ()) $ \c -> do
-                                f <- addField parent (Left $ outputIndex col) c
-                                addToNode f (self, outputIndex col) self
-                                pure ()
-                        _ ->
-                            error $ "weird shape for parent of filter " <>
-                            showT ins
-                _ -> pure ()
-    $(logDebug) "pre-flatten column map"
-    $(logDebug) $ showT m0
-    pure $
-        IM.map
-            (>>= \case
-                     Left (a, b)
-                         | null b -> [Left a]
-                         | otherwise -> map Right b
-                     Right c -> [Right c]) $
-        m0
-  where
-    addField node col' field = do
-        $(logDebug) $ "Adding field " <> show field <> " to " <> show node
-        prev <- lookupField node col $ Mir.name field
-        case prev of
-            Nothing -> do
-                $(logDebug) $ "No previous field " <> showT field <>
-                    " found, escalating"
-                escalate
-            Just f -> do
-                $(logDebug) $ "Previous field " <> showT f <> " found"
-                pure f
-      where
-        col = either (node, ) id col'
-        (ins, _, op, _) = GR.context gr node
-        escalate = do
-            fieldWithTable <-
-                case op of
-                    Source tidx -> do
-                        assertM (Mir.table field == Nothing)
-                        pure $
-                            Mir.Column
-                                (Just $ "&tables[" <> showT tidx <> "].clone()") $
-                            Mir.name field
-                    Join {} -> unimplemented
-                    _ ->
-                        case ins of
-                            [([col], parent)] ->
-                                addField
-                                    parent
-                                    (mapLeft (const $ fst col) col')
-                                    field
-                            _ ->
-                                error $ "weird shape for parent of " <> showT op <>
-                                " node in add column " <>
-                                showT ins
-            $(logDebug) $ "Found field " <> showT fieldWithTable <>
-                " inserting with " <>
-                showT col
-            addToNode fieldWithTable col node
-            $(logDebug) . showT =<< gets (IM.! node)
-            pure fieldWithTable
-    addToNode field col node = do
-        s <- get
-        put =<<
-            lift
-                (IM.alterF
-                     (maybe (pure Nothing) $ fmap Just . alter (field :) col)
-                     node
-                     s)
-    alter ::
-           (MonadLogger m, Eq a, Show a, Show b, Show b1)
-        => (b -> b)
-        -> a
-        -> [Either (a, b) b1]
-        -> m [Either (a, b) b1]
-    alter f k seq =
-        flip evalStateT Nothing $ do
-            s <-
-                traverse
-                    (\case
-                         Left (c, l)
-                             | c == k -> put (Just (c, f l)) $> (Left (c, f l))
-                         other -> pure other)
-                    seq
-            get >>= maybe (error "not found") pure
-            $(logDebug) $ "After `alter`: " <> show s
-            pure s
-    find :: Show b => (b -> Bool) -> [Either (a, [b]) b] -> Maybe b
-    find p =
-        (\case
-             [f] -> Just f
-             [] -> Nothing
-             more -> error $ "Too many matching fields: " <> showT more) .
-        filter p .
-        (>>= either snd pure)
-    lookupField ::
-           MonadState (IntMap [Either (Column, [Mir.Column]) Mir.Column]) m
-        => Int
-        -> Column
-        -> Text
-        -> m (Maybe Mir.Column)
-    lookupField node col f = gets (find ((== f) . Mir.name) . (IM.! node))
-    initial :: IntMap [Either (Column, [Mir.Column]) Mir.Column]
-    initial
-        -- Possibly I need to add the context differently so that it registers the columns with the parents
-     =
-        IM.fromList
-            [ ( node
-              , (cm IM.! node >>= \(GroupBy c) -> map (mapLeft (, [])) c) <>
-                map
-                    (Left . (, []) . (node, ))
-                    (sort $ hashNub [idx | (cols, _) <- outs, (idx, _) <- cols]))
-            | node <- GR.nodes gr
-            , let (_, _, _, outs) = GR.context gr node
-            ]
+       MonadLogger m => ScopeMap -> OperatorGraph -> m (IntMap [Either (Int, Int) Mir.Column])
+calcColumns cm gr = undefined
+  --   m0 <-
+  --       flip execStateT initial $ for_ (GR.topsort gr) $ \self -> do
+  --           let (ins, _, op, _) = GR.context gr self
+  --           $(logDebug) $ "Handling " <> showT self <> " (" <> showT op <> ")"
+  --           case op of
+  --               Filter conds ->
+  --                   case ins of
+  --                       [([col], parent)] ->
+  --                           forM_ (HashMap.keys conds) $
+  --                           either (const $ pure ()) $ \c -> do
+  --                               f <- addField parent (Left $ fst col) c
+  --                               addToNode f (self, fst col) self
+  --                               pure ()
+  --                       _ ->
+  --                           error $ "weird shape for parent of filter " <>
+  --                           showT ins
+  --               _ -> pure ()
+  --   $(logDebug) "pre-flatten column map"
+  --   $(logDebug) $ showT m0
+  --   pure $
+  --       IM.map
+  --           (>>= \case
+  --                    Left (a, b)
+  --                        | null b -> [Left a]
+  --                        | otherwise -> map Right b
+  --                    Right c -> [Right c]) $
+  --       m0
+  -- where
+  --   addField node col' field = do
+  --       $(logDebug) $ "Adding field " <> show field <> " to " <> show node
+  --       prev <- lookupField node col $ Mir.name field
+  --       case prev of
+  --           Nothing -> do
+  --               $(logDebug) $ "No previous field " <> showT field <>
+  --                   " found, escalating"
+  --               escalate
+  --           Just f -> do
+  --               $(logDebug) $ "Previous field " <> showT f <> " found"
+  --               pure f
+  --     where
+  --       col = either (node, ) id col'
+  --       (ins, _, op, _) = GR.context gr node
+  --       escalate = do
+  --           fieldWithTable <-
+  --               case op of
+  --                   Source tidx -> do
+  --                       assertM (Mir.table field == Nothing)
+  --                       pure $
+  --                           Mir.Column
+  --                               (Just $ "&tables[" <> showT tidx <> "].clone()") $
+  --                           Mir.name field
+  --                   Join {} -> unimplemented
+  --                   _ ->
+  --                       case ins of
+  --                           [([col], parent)] ->
+  --                               addField
+  --                                   parent
+  --                                   (mapLeft (const $ fst col) col')
+  --                                   field
+  --                           _ ->
+  --                               error $ "weird shape for parent of " <> showT op <>
+  --                               " node in add column " <>
+  --                               showT ins
+  --           $(logDebug) $ "Found field " <> showT fieldWithTable <>
+  --               " inserting with " <>
+  --               showT col
+  --           addToNode fieldWithTable col node
+  --           $(logDebug) . showT =<< gets (IM.! node)
+  --           pure fieldWithTable
+  --   addToNode field col node = do
+  --       s <- get
+  --       put =<<
+  --           lift
+  --               (IM.alterF
+  --                    (maybe (pure Nothing) $ fmap Just . alter (field :) col)
+  --                    node
+  --                    s)
+  --   alter ::
+  --          (MonadLogger m, Eq a, Show a, Show b, Show b1)
+  --       => (b -> b)
+  --       -> a
+  --       -> [Either (a, b) b1]
+  --       -> m [Either (a, b) b1]
+  --   alter f k seq =
+  --       flip evalStateT Nothing $ do
+  --           s <-
+  --               traverse
+  --                   (\case
+  --                        Left (c, l)
+  --                            | c == k -> put (Just (c, f l)) $> (Left (c, f l))
+  --                        other -> pure other)
+  --                   seq
+  --           get >>= maybe (error "not found") pure
+  --           $(logDebug) $ "After `alter`: " <> show s
+  --           pure s
+  --   find :: Show b => (b -> Bool) -> [Either (a, [b]) b] -> Maybe b
+  --   find p =
+  --       (\case
+  --            [f] -> Just f
+  --            [] -> Nothing
+  --            more -> error $ "Too many matching fields: " <> showT more) .
+  --       filter p .
+  --       (>>= either snd pure)
+  --   lookupField ::
+  --          MonadState (IntMap [Either (Column, [Mir.Column]) Mir.Column]) m
+  --       => Int
+  --       -> Column
+  --       -> Text
+  --       -> m (Maybe Mir.Column)
+  --   lookupField node col f = gets (find ((== f) . Mir.name) . (IM.! node))
+  --   initial :: IntMap [Either (Column, [Mir.Column]) Mir.Column]
+  --   initial
+  --       -- Possibly I need to add the context differently so that it registers the columns with the parents
+  --    =
+  --       IM.fromList
+  --           [ ( node
+  --             , (cm IM.! node >>= \(GroupBy c) -> map (mapLeft (, [])) c) <>
+  --               map
+  --                   (Left . (, []) . (node, ))
+  --                   (sort $ hashNub [idx | (cols, _) <- outs, (idx, _) <- cols]))
+  --           | node <- GR.nodes gr
+  --           , let (_, _, _, outs) = GR.context gr node
+  --           ]
 
 toSerializableGraph2 ::
        MonadLogger m
@@ -966,7 +1010,7 @@ generate compiledNodes CodeGenData {..} = do
                      Op_MIR m -> Left m
                      Op_UDF u -> Right u)
                 compiledNodes
-    iGr <- annotateAndRewriteQuery (HashMap.fromList mirNodes) graph
+    iGr <- annotateAndRewriteQuery (HashMap.fromList mirNodes) udfs graph
     let ctxMap = undefined
     let iGr = undefined
     debugLogGR "Annotated graph:" iGr

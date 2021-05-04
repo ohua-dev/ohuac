@@ -197,15 +197,18 @@ sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
     tc = GR.tc g0
     f g n
         | (One, One) <- getSem l
-        , [(_, p)] <- nins
+        , [(_, p)] <- ins
         , (Just (pins, _, plab, pouts), g'') <- GR.match p g'
         , One <- snd (getSem plab) =
-                (nins, n, l, hashNub $ pouts ++ [o | o@(_, o') <- outs, not (any (flip reachable o' . snd) pouts)]) GR.& ((pins, p, plab, []) GR.& g'')
-        | otherwise = (nins, n, l, outs) GR.& g'
+                (ins, n, l, prune $ pouts ++ outs) GR.& ((pins, p, plab, []) GR.& g'')
+        | (_, Many) <- getSem l = g
+        | null prunedOuts = g
+        | otherwise = (ins, n, l, prunedOuts) GR.& g'
       where
+        prunedOuts = prune outs
         reachable p i = i /= p && GR.hasEdge tc (p, i)
         (Just (ins, _, l, outs), g') = GR.match n g
-        nins = hashNub [((), p) | (_, p) <- ins, not $ any (reachable p . snd) ins ]
+        prune stuff = hashNub $ [o | o@(_, o') <- stuff, not (any (flip reachable o' . snd) stuff)]
 
 
 execSemOf :: (QualifiedBinding -> UDFDescription) -> Operator -> ExecSemantic
@@ -250,11 +253,11 @@ annotateAndRewriteQuery gMirNodes udfs graph = do
             gr1
             --ctrlRemoved
     quickDumpGrAsDot "scalars-sequentialized.dot" $ GR.nemap showOperator (const ("" :: Text)) udfSequentialized
-    let gr2 = removeSuperfluousOperators udfSequentialized
-    quickDumpGrAsDot "superf-removed.dot" $ GR.nemap showOperator (const ("" :: Text)) gr2
-    let gr3 = multiArcToJoin2 gr2
+    let gr3 = multiArcToJoin2 udfSequentialized
     quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) gr3
-    pure gr3
+    let gr2 = removeSuperfluousOperators gr3
+    quickDumpGrAsDot "superf-removed.dot" $ GR.nemap showOperator (const ("" :: Text)) gr2
+    pure gr2
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's

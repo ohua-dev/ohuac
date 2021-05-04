@@ -2,8 +2,12 @@ module Ohua.CodeGen.NoriaUDF.Types where
 
 import qualified Ohua.DFGraph as DFGraph
 import Ohua.Helpers.Template (Substitutions, Template)
-import Ohua.Prelude
+import Ohua.Prelude hiding (Identity)
+import qualified Data.Text.Prettyprint.Doc as PP
+import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
+import Data.Text.Prettyprint.Doc ((<+>), pretty)
+import qualified Data.HashMap.Strict as HashMap
 
 data GenerationType
     = TemplateSubstitution Template
@@ -64,6 +68,27 @@ data Operator
 -- instance Hashable Operator
 instance NFData Operator
 
+
+instance PP.Pretty Operator where
+    pretty = \case
+        Filter conds ->
+            "σ" <+>
+            PP.list
+            [ showCol col <+> PP.pretty cond
+            | (col, cond) <- HashMap.toList conds]
+        Join t ->
+            case t of
+                FullJoin -> "><"
+                InnerJoin c -> "⋈" <+> PP.list (map showCol c)
+        Identity -> "≡"
+        Sink -> "Sink"
+        Source s -> "B" <+> PP.pretty s
+        Project c -> "π" <+> PP.list (map showCol c)
+        CustomOp o c -> PP.pretty o <+> PP.list (map (showCol . snd) $ sortOn fst c)
+      where
+          showCol = \case
+              Left InternalColumn{..} -> PP.pretty producingOperator <> ":" <> PP.pretty outputIndex
+              Right c -> PP.pretty c
 
 data OperatorDescription
     = Op_MIR (QualifiedBinding, Operator)

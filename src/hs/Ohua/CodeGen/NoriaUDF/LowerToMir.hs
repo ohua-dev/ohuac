@@ -238,13 +238,13 @@ annotateAndRewriteQuery ::
     -> m (Gr Operator ())
 annotateAndRewriteQuery gMirNodes udfs graph = do
     debugLogGR "Initial Graph" iGr
-    quickDumpGrAsDot "initial-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) iGr
+    quickDumpGrAsDot "initial-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) iGr
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
     s1@(gr1, _) <- flip execStateT s0 $ inlineFieldAccess envInputs
     debugLogGR "Graph with nth collapsed" gr1
-    quickDumpGrAsDot "nth-collapsed.dot" $ GR.nemap showOperator (const ("" :: Text)) gr1
+    quickDumpGrAsDot "nth-collapsed.dot" $ GR.nemap quickRender (const ("" :: Text)) gr1
     -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
-    -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) ctrlRemoved
+    -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) ctrlRemoved
     let udfSequentialized =
             sequentializeScalars
             (execSemOf $
@@ -252,11 +252,11 @@ annotateAndRewriteQuery gMirNodes udfs graph = do
                 $ HashMap.lookup o (HashMap.fromList $ map (\d -> (udfName d, d)) udfs))
             gr1
             --ctrlRemoved
-    quickDumpGrAsDot "scalars-sequentialized.dot" $ GR.nemap showOperator (const ("" :: Text)) udfSequentialized
+    quickDumpGrAsDot "scalars-sequentialized.dot" $ GR.nemap quickRender (const ("" :: Text)) udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
-    quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $ GR.nemap showOperator (const ("" :: Text)) gr3
+    quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) gr3
     let gr2 = removeSuperfluousOperators gr3
-    quickDumpGrAsDot "superf-removed.dot" $ GR.nemap showOperator (const ("" :: Text)) gr2
+    quickDumpGrAsDot "superf-removed.dot" $ GR.nemap quickRender (const ("" :: Text)) gr2
     pure gr2
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
@@ -366,22 +366,13 @@ inlineFieldAccess envInputs = do
 alterColumns :: (SomeColumn -> Maybe SomeColumn) -> Operator -> Operator
 alterColumns f = \case
     CustomOp b fields -> CustomOp b (map (second $ \i -> fromMaybe i $ f i) fields)
-    Join _ -> error "Not sure this should work"
+    Join j -> Join j
     Project cols -> Project (map (\i -> fromMaybe i $ f i) cols)
     Identity -> Identity
     Sink -> Sink
     Source s -> Source s
     Filter conds -> Filter $ foldr' (\(k, v) m -> maybe m (\k' -> HashMap.insert k' v $ HashMap.delete k m) $ f k) conds (HashMap.toList conds)
 
-showOperator :: Operator -> Text
-showOperator = \case
-    Filter {} -> "σ"
-    Join {} -> "⋈"
-    Identity -> "≡"
-    Sink -> "Sink"
-    Source s -> "B [" <> show s <> "]"
-    Project _ -> "π"
-    CustomOp o _ -> quickRender o
 
 dropNodesRelink :: (GR.DynGraph gr, g ~ gr Operator ()) => (Operator -> Maybe GR.Node) -> g -> g
 dropNodesRelink p g = foldr'

@@ -1,6 +1,6 @@
 {-# LANGUAGE MultiWayIf, ConstraintKinds, TemplateHaskell #-}
-{-# OPTIONS_GHC -fdefer-type-errors #-}
 
+-- {-# OPTIONS_GHC -fdefer-type-errors #-}
 module Ohua.CodeGen.NoriaUDF.LowerToMir
     ( generate
     , suggestName
@@ -12,10 +12,11 @@ import Control.Lens (Simple, (%=), (^?!), ix, to, use)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
 import qualified Data.IntMap as IM
+import qualified Data.List as List
 import Data.Maybe (fromJust)
 import qualified Data.Text.Lazy as LT
-import qualified Data.Text.Lazy.IO as LT
 import qualified Data.Text.Lazy.Encoding as LT
+import qualified Data.Text.Lazy.IO as LT
 import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import Prelude ((!!))
@@ -86,9 +87,16 @@ type Field3' a b = Simple Field3 a b
 
 type Field4' a b = Simple Field4 a b
 
-quickDumpGrAsDot :: (GraphViz.Labellable a, GraphViz.Labellable b, GR.Graph g, MonadIO m) => FilePath -> g a b -> m ()
-quickDumpGrAsDot f = liftIO . LT.writeFile f . GraphViz.renderDot . GraphViz.toDot . GraphViz.graphToDot GraphViz.quickParams
-
+quickDumpGrAsDot ::
+       (GraphViz.Labellable a, GraphViz.Labellable b, GR.Graph g, MonadIO m)
+    => FilePath
+    -> g a b
+    -> m ()
+quickDumpGrAsDot f =
+    liftIO .
+    LT.writeFile f .
+    GraphViz.renderDot .
+    GraphViz.toDot . GraphViz.graphToDot GraphViz.quickParams
 
 expectNumLit :: HasCallStack => Lit -> Integer
 expectNumLit (NumericLit n) = n
@@ -111,8 +119,8 @@ isSource _ = False
 
 groupOnInt :: [(a, Int)] -> [([a], Int)]
 groupOnInt =
-    fmap swap . IM.toList . IM.fromListWith (++) . fmap (second pure) .
-    fmap swap
+    fmap swap .
+    IM.toList . IM.fromListWith (++) . fmap (second pure) . fmap swap
 
 debugLogGR :: (Show a, Show b, MonadLogger m) => Text -> GR.Gr a b -> m ()
 debugLogGR msg gr = logDebugN (msg <> "\n" <> toText (GR.prettify gr))
@@ -125,7 +133,6 @@ forNodes_ pred ac = do
 
 -- roots :: GR.Graph gr => gr a b -> [GR.Node]
 -- roots gr = filter (null . GR.pre gr) $ GR.nodes gr
-
 -- -- | Semantics notes for this function:
 -- --   - When inserting ancestors the behavior is unspecified
 -- --   - graph must be acyclic
@@ -140,7 +147,6 @@ forNodes_ pred ac = do
 --              su <- use _2 . to (flip GR.suc x)
 --              maybe (pure ()) ac (pred l)
 --              pure xs) (roots gr0)
-
 mkLitMap :: [DFGraph.DirectArc Lit] -> LitMap
 mkLitMap arcs =
     IM.fromListWith
@@ -153,45 +159,150 @@ mkLitMap arcs =
                   l'' -> [l'']
         ]
 
-handleSuperfluousEdgesAndCtrl :: (GR.DynGraph g, MonadLogger m) => (a -> Bool) -> g a () -> m (g a ())
-handleSuperfluousEdgesAndCtrl isCtrl =
+typeGraph ::
+       (GR.Graph gr)
+    => (QualifiedBinding -> ExecSemantic)
+    -> LitMap
+    -> gr Operator (Int, Int)
+    -> IM.IntMap ([NType], [NType])
+typeGraph udfs envInputs g = m
+  where
+    getType = (m IM.!)
+    idxOf :: HasCallStack => Int -> NType -> NType
+    idxOf i t =
+        case t of
+            _
+                | i < 0 ->
+                    error $
+                    "Negative indices make no sense in this context " <>
+                    show i <> " " <> quickRender t
+            NTTup ts
+                | Just t' <- ts ^? ix i -> t'
+            NTScalar InternalColumn {..}
+                | outputIndex == -1 ->
+                    NTScalar InternalColumn {producingOperator, outputIndex = i}
+            _ ->
+                error $
+                "Cannot take index " <> show i <> " of type " <> quickRender t
+    mkRetType :: GR.Node -> [NType] -> Operator -> [NType]
+    mkRetType n argTypes o =
+        case o of
+            Filter {} -> [fromIndex Nothing 0]
+            Join {} -> unexpectedOp "Join"
+            Identity -> [fromIndex (Just 1) 0]
+            Sink -> [fromIndex (Just 1) 0]
+            Source t -> [NTSeq (NTRecFromTable $ unsafeMake $ show t)]
+            Project {} -> argTypes
+            CustomOp bnd _
+                | bnd == Refs.nth ->
+                    let Just (0, NumericLit (fromIntegral -> idx)) =
+                            find ((== 0) . view _1) $ envInputs `getLit` n
+                     in [fromIndex Nothing idx]
+                | bnd == Refs.smapFun ->
+                    case fromIndex (Just 1) 0 of
+                        NTSeq t -> [t, NTScalar $ InternalColumn n 1, NTScalar $ InternalColumn n 2 {- is this really necessary? -}]
+                        _ -> invalidArgs
+                | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 0]
+                | QualifiedBinding ["ohua", "lang"] b <- bnd ->
+                  case b of
+                      "(,)"  -> argTypes
+                      _ | b `elem` ( ["lt", "gt", "eq", "and", "or", "leq", "geq"] :: Vector Binding ) -> likeUdf
+                | QualifiedBinding ["ohua", "lang", "field"] _ <- bnd -> likeUdf
+                | !_ <- udfs bnd -> likeUdf
+            _ ->
+                error $
+                "Could not determine return type of operator " <> quickRender o
+      where
+        likeUdf = [NTScalar $ InternalColumn n 0]
+        unexpectedOp op =
+            error $ op <> "not expected here, got " <> quickRender o
+        invalidArgs :: a
+        invalidArgs =
+            error $
+            "Invalid argument types " <>
+            quickRender argTypes <> " for operator " <> quickRender o
+        fromIndex l i
+            | Just el <- l
+            , let al = length argTypes
+            , el /= al =
+                error $
+                "Wrong number of arguments for operator " <>
+                quickRender o <>
+                " expected " <>
+                show l <>
+                " got " <> show al <> " arguments: " <> quickRender argTypes
+            | Just t' <- argTypes ^? ix i = t'
+            | otherwise = invalidArgs
+    m =
+        IM.fromList
+            [ (n, (argTypes, mkRetType n argTypes l))
+            | (n, l) <- GR.labNodes g
+            , let argTypes =
+                      map snd $
+                      sortOn
+                          fst
+                          [ ( inIdx
+                            , let retTypes = snd (getType p)
+                               in if outIdx == (-1)
+                                      then NTTup retTypes
+                                      else fromMaybe (error $ "Index too large " <> show outIdx <> " in " <> quickRender retTypes <> " in " <> quickRender (GR.lab g p) <> " from input " <> show inIdx <> " of operator " <> quickRender l) $ retTypes ^? ix outIdx)
+                          | (p, (outIdx, inIdx)) <- GR.lpre g n
+                          ]
+            ]
+
+handleSuperfluousEdgesAndCtrl ::
+       (GR.DynGraph g, MonadLogger m) => (a -> Bool) -> g a () -> m (g a ())
+handleSuperfluousEdgesAndCtrl isCtrl
     -- fmap (\g -> GR.labnfilter
     --          (\case (n, l) | isCtrl l -> if length (GR.pre g n) > 1 then error "Not yet implemented" else False
     --                 _ -> True ) g) .
+ =
     \g ->
-    let tc = GR.tc g
-        g' = remSuperfluousEdges tc g
-        ctrlWithTooManyParents =
-            [ n
-            | (n, l) <- GR.labNodes g'
-            , isCtrl l
-            , length (GR.pre g' n) > 1
-            ]
-    in
-        if null ctrlWithTooManyParents
-        then pure g'
-        else do
-            logErrorN $ "Too many parents for ctrl nodes " <> show ctrlWithTooManyParents
-            error "abort"
+        let tc = GR.tc g
+            g' = remSuperfluousEdges tc g
+            ctrlWithTooManyParents =
+                [ n
+                | (n, l) <- GR.labNodes g'
+                , isCtrl l
+                , length (GR.pre g' n) > 1
+                ]
+         in if null ctrlWithTooManyParents
+                then pure g'
+                else do
+                    logErrorN $
+                        "Too many parents for ctrl nodes " <>
+                        show ctrlWithTooManyParents
+                    error "abort"
   where
-    remSuperfluousEdges tc g = foldr' GR.delLEdge g
-        [ (p, n, ())
-        | n <- GR.nodes g
-        , let pre = GR.pre g n
-        , (p:other) <- tails pre
-        , o <- other
-        , r <- if GR.hasEdge tc (p, o) then [p]
-            else if GR.hasEdge tc (o, p) then [o]
-            else if o == p then [p]
-            else []
+    remSuperfluousEdges tc g =
+        foldr'
+            GR.delLEdge
+            g
+            [ (p, n, ())
+            | n <- GR.nodes g
+            , let pre = GR.pre g n
+            , (p:other) <- tails pre
+            , o <- other
+            , r <-
+                  if GR.hasEdge tc (p, o)
+                      then [p]
+                      else if GR.hasEdge tc (o, p)
+                               then [o]
+                               else if o == p
+                                        then [p]
+                                        else []
         -- This condition excludes cases where `n` is the first node after
         -- `smap` and also receives other input. In such cases this would sever
         -- the collection to `smap` which we rely on to later simply drop all
         -- ctrl nodes
         -- , not (isCtrl $ fromMaybe "node not found" $ GR.lab g o)
-        ]
+            ]
 
-sequentializeScalars :: (GR.DynGraph gr, gr Operator () ~ g) => (Operator -> ExecSemantic) -> g -> g
+sequentializeScalars ::
+       (GR.DynGraph gr, gr Operator () ~ g)
+    => (Operator -> ExecSemantic)
+    -> g
+    -> g
 sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
   where
     tc = GR.tc g0
@@ -200,7 +311,8 @@ sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
         , [(_, p)] <- ins
         , (Just (pins, _, plab, pouts), g'') <- GR.match p g'
         , One <- snd (getSem plab) =
-                (ins, n, l, prune $ pouts ++ outs) GR.& ((pins, p, plab, []) GR.& g'')
+            (ins, n, l, prune $ pouts ++ outs) GR.&
+            ((pins, p, plab, []) GR.& g'')
         | (_, Many) <- getSem l = g
         | null prunedOuts = g
         | otherwise = (ins, n, l, prunedOuts) GR.& g'
@@ -208,60 +320,80 @@ sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
         prunedOuts = prune outs
         reachable p i = i /= p && GR.hasEdge tc (p, i)
         (Just (ins, _, l, outs), g') = GR.match n g
-        prune stuff = hashNub $ [o | o@(_, o') <- stuff, not (any (flip reachable o' . snd) stuff)]
-
+        prune stuff =
+            hashNub $
+            [o | o@(_, o') <- stuff, not (any (flip reachable o' . snd) stuff)]
 
 execSemOf :: (QualifiedBinding -> UDFDescription) -> Operator -> ExecSemantic
-execSemOf nodes = \case
-    Join {} -> (Many, Many)
-    CustomOp op _
-        | op == Refs.collect -> (One, Many)
-        | op == Refs.smapFun -> (Many, One)
-        | op == Refs.ctrl -> (One, Many)
-        | QualifiedBinding ["ohua", "lang"] b <- op
-        , b `elem` (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) -> (One, One)
-        | otherwise -> execSemantic $ nodes op
-    Filter {} -> (Many, Many)
-    Identity -> undefined
-    Project {} -> (One, One)
-    Source _ -> (Many, Many)
-    Sink -> (Many, Many)
+execSemOf nodes =
+    \case
+        Join {} -> (Many, Many)
+        CustomOp op _
+            | op == Refs.collect -> (One, Many)
+            | op == Refs.smapFun -> (Many, One)
+            | op == Refs.ctrl -> (One, Many)
+            | QualifiedBinding ["ohua", "lang"] b <- op
+            , b `elem`
+                  (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
+                (One, One)
+            | otherwise -> execSemantic $ nodes op
+        Filter {} -> (Many, Many)
+        Identity -> undefined
+        Project {} -> (One, One)
+        Source _ -> (Many, Many)
+        Sink -> (Many, Many)
 
 -- TODO
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
 annotateAndRewriteQuery ::
-       ( MonadLogger m, MonadIO m )
+       (MonadLogger m, MonadIO m)
     => GeneratedMirNodes
     -> [UDFDescription]
     -> DFGraph.OutGraph
     -> m (Gr Operator ())
 annotateAndRewriteQuery gMirNodes udfs graph = do
+    quickDumpGrAsDot "graph-with-edge-indices.dot" $
+        GR.nemap (either quickRender quickRender) (\i -> show i :: Text) iGr00
     debugLogGR "Initial Graph" iGr
-    quickDumpGrAsDot "initial-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) iGr
+    quickDumpGrAsDot "initial-graph.dot" $
+        GR.gmap (\(ins, n, l, outs) ->
+                     let strip = map $ first $ const ( "" :: Text)
+                         (int, outt) = getType n
+                     in (strip ins, n, show n <> " " <> quickRender l <> "\n" <> quickRender int <> " -> " <> quickRender outt, strip outs)
+                      ) iGr
     let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
-    s1@(gr1, _) <- flip execStateT s0 $ inlineFieldAccess envInputs
+    s1@(gr1, _) <- flip execStateT s0 $ inlineFieldAccess envInputs getType
     debugLogGR "Graph with nth collapsed" gr1
-    quickDumpGrAsDot "nth-collapsed.dot" $ GR.nemap quickRender (const ("" :: Text)) gr1
+    quickDumpGrAsDot "nth-collapsed.dot" $
+        GR.nemap quickRender (const ("" :: Text)) gr1
     -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
     -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) ctrlRemoved
-    let udfSequentialized =
-            sequentializeScalars
-            (execSemOf $
-             \o -> fromMaybe (error $ "Operator " <> quickRender o <> " not found in operator dictionary")
-                $ HashMap.lookup o (HashMap.fromList $ map (\d -> (udfName d, d)) udfs))
-            gr1
+    let udfSequentialized = sequentializeScalars (execSemOf getUdf) gr1
             --ctrlRemoved
-    quickDumpGrAsDot "scalars-sequentialized.dot" $ GR.nemap quickRender (const ("" :: Text)) udfSequentialized
+    quickDumpGrAsDot "scalars-sequentialized.dot" $
+        GR.nemap quickRender (const ("" :: Text)) udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
-    quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) gr3
+    quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $
+        GR.nemap quickRender (const ("" :: Text)) gr3
     let gr2 = removeSuperfluousOperators gr3
-    quickDumpGrAsDot "superf-removed.dot" $ GR.nemap quickRender (const ("" :: Text)) gr2
+    quickDumpGrAsDot "superf-removed.dot" $
+        GR.nemap quickRender (const ("" :: Text)) gr2
     pure gr2
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
   where
+    getUdf :: HasCallStack => QualifiedBinding -> UDFDescription
+    getUdf =
+        \o ->
+            fromMaybe
+                (error $
+                 "Operator " <>
+                 quickRender o <> " not found in operator dictionary") $
+            HashMap.lookup
+                o
+                (HashMap.fromList $ map (\d -> (udfName d, d)) udfs)
     sinkId =
         maximum (0 : [unwrap operatorId | DFGraph.Operator {..} <- operators]) +
         1
@@ -273,35 +405,40 @@ annotateAndRewriteQuery gMirNodes udfs graph = do
                  | DFGraph.Arc _ (DFGraph.EnvSource (EnvRefLit i)) <- arcs
                  ])
             [succ sinkId ..]
+    typeMap = typeGraph (execSemantic . getUdf) envInputs iGr0
+    getType = (typeMap IM.!)
     iGr :: GR.Gr Operator ()
-    iGr =
+    iGr = GR.emap (const ()) iGr0
+    iGr0 =
         GR.gmap
-        (\ctx@(in_, n, lab, out) ->
-             let strip = hashNub . map (first (const ()))
-                 withLabel = (strip in_, n, , strip out)
-             in
-             withLabel $ either (retype3 gMirNodes in_) id lab
-             )
-        $ GR.mkGraph
+            (\ctx@(in_, n, lab, out) ->
+                 let withLabel = (in_, n, , out)
+                  in withLabel $
+                     either (retype3 gMirNodes (fst $ getType n)) id lab)
+            iGr00
+    iGr00 =
+        GR.mkGraph
             ((sinkId, Right Sink) :
-             map (second (Right . Source . fromIntegral) . swap) (IM.toList sourceNodes) ++
+             map
+                 (second (Right . Source . fromIntegral) . swap)
+                 (IM.toList sourceNodes) ++
              map
                  (\DFGraph.Operator {..} ->
                       (unwrap operatorId, Left operatorType))
                  operators) $
-          ( unwrap $ DFGraph.operator $ DFGraph.returnArc graph
-          , sinkId
-          , (DFGraph.index $ DFGraph.returnArc graph, 0)) :
-          [ (from, unwrap $ DFGraph.operator t, (outIdx, DFGraph.index t))
-          | DFGraph.Arc t s' <- arcs
-          , (from, outIdx) <-
-                case s' of
-                    DFGraph.LocalSource s ->
-                        [(unwrap $ DFGraph.operator s, DFGraph.index s)]
-                    DFGraph.EnvSource (EnvRefLit l) ->
-                        [(sourceNodes IM.! unwrap l, 0)]
-                    _ -> []
-          ]
+        ( unwrap $ DFGraph.operator $ DFGraph.returnArc graph
+        , sinkId
+        , (DFGraph.index $ DFGraph.returnArc graph, 0)) :
+        [ (from, unwrap $ DFGraph.operator t, (outIdx, DFGraph.index t))
+        | DFGraph.Arc t s' <- arcs
+        , (from, outIdx) <-
+              case s' of
+                  DFGraph.LocalSource s ->
+                      [(unwrap $ DFGraph.operator s, DFGraph.index s)]
+                  DFGraph.EnvSource (EnvRefLit l) ->
+                      [(sourceNodes IM.! unwrap l, 0)]
+                  _ -> []
+        ]
     envInputs = mkLitMap arcs
     operators = DFGraph.operators graph
     arcs = DFGraph.direct $ DFGraph.arcs graph
@@ -321,92 +458,116 @@ sGetContext node = use $ _1 . to (flip GR.context node)
 sInsEdge :: GetGraph g a b s m => GR.LEdge b -> m ()
 sInsEdge edge = _1 %= GR.insEdge edge
 
-collapseMultiArcs :: GR.DynGraph gr => gr opLabel edgeLabel -> gr opLabel [edgeLabel]
+collapseMultiArcs ::
+       GR.DynGraph gr => gr opLabel edgeLabel -> gr opLabel [edgeLabel]
 collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
 
 alterLabel :: GR.DynGraph gr => GR.Node -> (l -> l) -> gr l x -> gr l x
 alterLabel n f gr =
     let (Just (a, b, c, d), gr0) = GR.match n gr
-    in (a, b, f c, d) GR.& gr0
+     in (a, b, f c, d) GR.& gr0
 
-inlineFieldAccess :: GetGraph g Operator () s m => LitMap -> m ()
-inlineFieldAccess envInputs = do
+inlineFieldAccess ::
+       GetGraph g Operator () s m
+    => LitMap
+    -> (Int -> ([NType], [NType]))
+    -> m ()
+inlineFieldAccess envInputs getType =
     forNodes_
         (\case
-             CustomOp op fields
-                 | op == Refs.nth ->
-                   case fields of
-                       [(0, Left f)] -> Just $ Left f
-                       s -> error $ "Nth should only have one graph input, found " <> show s
+             CustomOp op _
+                 | op == Refs.nth -> Just Nothing
                  | op ^. namespace == ["ohua", "lang", "field"] ->
-                   Just $ Right $ unwrap $ op ^. name
+                     Just $ Just $ unwrap $ op ^. name
              _ -> Nothing) $ \node dat -> do
         [inOp] <- use $ _1 . to (flip GR.pre node)
-        field <- case dat of
-            Right n -> do
-                pure $ Right Mir.Column { table = Just (show inOp), name = n }
-            Left f ->
-                let Just (0, NumericLit (fromIntegral -> idx)) =
-                        find ((== 0) . view _1) $ envInputs `getLit` node in
-                    pure $ Left f { outputIndex = idx }
+        gr <- use _1
+        let mfield =
+                flip fmap dat $ \n -> do
+                    case fst $ getType node of
+                        [NTRecFromTable b] ->
+                            Right Mir.Column {table = Just $ unwrap b, name = n}
+                        [NTAnonRec r fields]
+                            | Just (NTScalar s) <-
+                                 List.lookup (unsafeMake n) fields -> Left s
+                        t ->
+                            error $
+                            "Invalid input type " <>
+                            quickRender t <> ") for acessing field " <> n <> " for operator " <> show node
         outs <- use $ _1 . to (flip GR.suc node)
         sDelNode node
-        for_ outs $ \tOp ->
-            let alteration = \case
-                    Left (InternalColumn {..})
-                        | producingOperator == node ->
-                          if outputIndex /= 0
-                          then error ("Weird index " <> show outputIndex)
-                          else Just field
-                    _ -> Nothing
-            in do
-                sInsEdge (inOp, tOp, ())
-                _1 %= alterLabel tOp (alterColumns alteration)
+        for_ outs $ \tOp -> do
+            sInsEdge (inOp, tOp, ())
+            case mfield of
+                Just field -> _1 %= alterLabel tOp (alterColumns alteration)
+                    where alteration =
+                              \case
+                                  Left (InternalColumn {..})
+                                      | producingOperator == node ->
+                                          if outputIndex /= 0
+                                              then error
+                                                       ("Weird index " <>
+                                                        show outputIndex)
+                                              else Just field
+                                  _ -> Nothing
+                _ -> pure ()
 
 alterColumns :: (SomeColumn -> Maybe SomeColumn) -> Operator -> Operator
-alterColumns f = \case
-    CustomOp b fields -> CustomOp b (map (second $ \i -> fromMaybe i $ f i) fields)
-    Join j -> Join j
-    Project cols -> Project (map (\i -> fromMaybe i $ f i) cols)
-    Identity -> Identity
-    Sink -> Sink
-    Source s -> Source s
-    Filter conds -> Filter $ foldr' (\(k, v) m -> maybe m (\k' -> HashMap.insert k' v $ HashMap.delete k m) $ f k) conds (HashMap.toList conds)
+alterColumns f =
+    \case
+        CustomOp b fields -> CustomOp b (map (\i -> fromMaybe i $ f i) fields)
+        Join j -> Join j
+        Project cols -> Project (map (\i -> fromMaybe i $ f i) cols)
+        Identity -> Identity
+        Sink -> Sink
+        Source s -> Source s
+        Filter conds fields ->
+            Filter
+                (foldr'
+                     (\(k, v) m ->
+                          maybe
+                              m
+                              (\k' -> HashMap.insert k' v $ HashMap.delete k m) $
+                          f k)
+                     conds
+                     (HashMap.toList conds))
+                fields
 
-
-dropNodesRelink :: (GR.DynGraph gr, g ~ gr Operator ()) => (Operator -> Maybe GR.Node) -> g -> g
-dropNodesRelink p g = foldr'
-    (\(n, l) g ->
-         case p l of
-             Nothing -> g
-             Just newNode ->
-                 flip (foldr'  (\(n, f) -> alterLabel n f))
-                 [ (n', alterColumns
-                       (\case Left c
-                                  | producingOperator c == n ->
-                                    Just $ Left c {producingOperator = newNode}
-                              _ -> Nothing)
-                   )
-                 | n' <- GR.suc g n
-                 ]
-                 $ GR.insEdges (map (newNode, , ()) $ GR.suc g n)
-                 $ GR.delNode n g
-    ) g (GR.labNodes g)
+dropNodesRelink ::
+       (GR.DynGraph gr, g ~ gr Operator ())
+    => (Operator -> Maybe GR.Node)
+    -> g
+    -> g
+dropNodesRelink p g =
+    foldr'
+        (\(n, l) g ->
+             case p l of
+                 Nothing -> g
+                 Just newNode ->
+                     GR.insEdges (map (newNode, , ()) $ GR.suc g n) $
+                     GR.delNode n g)
+        g
+        (GR.labNodes g)
 
 removeSuperfluousOperators :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
-removeSuperfluousOperators =
-    dropNodesRelink $ \case
-        CustomOp o f ->
-            let fromFirstInput =
-                    let [(0, Left InternalColumn {..})] = f in Just producingOperator
-            in
-            case o of
-                "ohua.lang/smapFun" -> fromFirstInput
-                "ohua.lang/collect" ->
-                    let Just (Left InternalColumn {..}) = Prelude.lookup 1 f in Just producingOperator
-                "ohua.sql.query/group_by" -> fromFirstInput
-                _ -> Nothing
-        _ -> Nothing
+removeSuperfluousOperators g =
+    foldr'
+        (\(n, l) g ->
+             let rem =
+                     case l of
+                         CustomOp c _
+                             | QualifiedBinding ["ohua", "lang"] b <- c
+                               -> b `elem` (["smapFun", "collect"] :: Vector Binding)
+                             | c == "ohua.sql.query/group_by" -> True
+                         _ -> False
+             in if rem then
+                 let [newNode] = GR.pre g n in
+                     GR.insEdges (map (newNode, , ()) $ GR.suc g n) $
+                     GR.delNode n g
+                 else g
+        )
+        g
+        (GR.labNodes g)
 
 -- mkScopeMap :: LitMap -> Gr Operator Column -> ScopeMap
 -- mkScopeMap lm gr = m
@@ -459,10 +620,8 @@ removeSuperfluousOperators =
 --                                   xs
 --                           _ -> id
 --             ]
-
 -- retype :: GeneratedMirNodes -> Gr QualifiedBinding b -> Gr Operator b
 -- retype = GR.nmap . retype2
-
 -- retype2 :: GeneratedMirNodes -> QualifiedBinding -> Operator
 -- retype2 m other@(QualifiedBinding namespace name) =
 --     case namespace of
@@ -474,9 +633,8 @@ removeSuperfluousOperators =
 --         ["ohua", "lang"]
 --             | name == "(,)" -> Identity -- Needs to become a project instead
 --         _ -> fromMaybe (CustomOp other []) $ HashMap.lookup other m
-
-retype3 :: GeneratedMirNodes -> GR.Adj (Int, Int) -> QualifiedBinding -> Operator
-retype3 m pre other@(QualifiedBinding namespace name) =
+retype3 :: GeneratedMirNodes -> [NType] -> QualifiedBinding -> Operator
+retype3 m ty other@(QualifiedBinding namespace name) =
     case namespace of
         ["intrinsic"] ->
             case name of
@@ -484,15 +642,71 @@ retype3 m pre other@(QualifiedBinding namespace name) =
                 "source" -> error "sources now need table names"
                 _ -> error $ "Unknown intrinsic " <> showT name
         ["ohua", "lang"]
-            | name == "(,)" -> Project (map (snd . toCol) pre)
-        _ -> fromMaybe (CustomOp other (map toCol pre)) $ HashMap.lookup other m
+            | name == "(,)" -> Project (map toCol ty)
+            | name `elem`
+                  (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
+                  CustomOp other (map toCol ty)
+            | otherwise -> CustomOp other []
+        ["ohua", "lang", "field"] -> CustomOp other []
+        _ ->
+            fromMaybe (CustomOp other (map toCol ty)) $
+            fmap rewriteFilter $ HashMap.lookup other m
   where
-    toCol ((outIdx, inIdx), op) = (inIdx ,) $ Left
-        InternalColumn
-        { producingOperator = op
-        , outputIndex = outIdx
-        }
-
+    rewriteFilter a@(Filter conds vars@(st, free)) = Filter newConds vars
+      where
+        varnames = map unwrap $ st : free
+        varmap =
+            case ty of
+                NTSeq stTy:rest ->
+                    HashMap.fromList $ zip varnames (map handle $ stTy : rest)
+                _ ->
+                    error $
+                    "weird type for operator " <>
+                    quickRender a <> " type: " <> quickRender ty
+        newConds =
+            HashMap.fromList $
+            map
+                (\(c, cond) ->
+                     ( fmap matchTable c
+                     , case cond of
+                           Mir.Comparison op (Mir.ColumnValue c) ->
+                               Mir.Comparison
+                                   op
+                                   (Mir.ColumnValue $ matchTable c)
+                           other -> other)) $
+            HashMap.toList conds
+        matchTable c@Mir.Column {..} =
+            Mir.Column
+                { table =
+                      Just $
+                      fromMaybe
+                          (error $
+                           "Binding " <>
+                           t0 <>
+                           " not found in varmap " <>
+                           show varnames <> " for operator " <> quickRender a) $
+                      HashMap.lookup t0 varmap
+                , name
+                }
+          where
+            t0 =
+                fromMaybe
+                    (error $
+                     "Table missing in " <>
+                     quickRender c <> " in " <> quickRender a)
+                    table
+        handle =
+            \case
+                NTRecFromTable t -> unwrap t
+                _ ->
+                    error $
+                    "Expected table when treating " <>
+                    quickRender a <> " found " <> quickRender ty
+    rewriteFilter a = a
+    toCol =
+        \case
+            NTScalar s -> Left s
+            t -> error $ "Expected scalar type, got " <> quickRender t <> " in operator " <> quickRender other
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
@@ -502,9 +716,17 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
         case GR.pre g n of
             [] -> g
             [_] -> g
-            [x, y] -> ([((), x), ((), y)], Prelude.head $ GR.newNodes 1 g, Join FullJoin, [((), n)]) GR.& GR.delEdges [(x,n), (y,n)] g
-            other -> error $ "Multiple ancestors for " <> show n <> " (" <> show lab <> ") a bit unexpected " <> show other
-
+            [x, y] ->
+                ( [((), x), ((), y)]
+                , Prelude.head $ GR.newNodes 1 g
+                , Join FullJoin
+                , [((), n)]) GR.&
+                GR.delEdges [(x, n), (y, n)] g
+            other ->
+                error $
+                "Multiple ancestors for " <>
+                show n <>
+                " (" <> show lab <> ") a bit unexpected " <> show other
     -- UDF {
     --     function_name: String,
     --     //Do I need this?
@@ -616,7 +838,11 @@ completeOutputColsFor i = i ^. _2 <> i ^. _3
 
 someColToMirCol :: SomeColumn -> Mir.Column
 someColToMirCol =
-    either (\InternalColumn {..} -> toMirCol $ DFGraph.Target (unsafeMake producingOperator) outputIndex) id
+    either
+        (\InternalColumn {..} ->
+             toMirCol $
+             DFGraph.Target (unsafeMake producingOperator) outputIndex)
+        id
 
 toMirCol :: DFGraph.Target -> Mir.Column
 toMirCol DFGraph.Target {..} =
@@ -626,7 +852,10 @@ toMirCol DFGraph.Target {..} =
         }
 
 calcColumns ::
-       MonadLogger m => ScopeMap -> OperatorGraph -> m (IntMap [Either (Int, Int) Mir.Column])
+       MonadLogger m
+    => ScopeMap
+    -> OperatorGraph
+    -> m (IntMap [Either (Int, Int) Mir.Column])
 calcColumns cm gr = undefined
   --   m0 <-
   --       flip execStateT initial $ for_ (GR.topsort gr) $ \self -> do
@@ -752,242 +981,238 @@ calcColumns cm gr = undefined
   --           , let (_, _, _, outs) = GR.context gr node
   --           ]
 
-toSerializableGraph2 ::
-       MonadLogger m
-    => [UDFDescription]
-    -> ScopeMap
-    -> OperatorGraph
-    -> m SerializableGraph
-toSerializableGraph2 udfs cm mg = do
-    actualColumn <- calcColumns cm mg
-    $(logDebug) "Calculated Columns"
-    $(logDebug) $ showT actualColumn
-    let completeOutputColsFor = map someColToMirCol . (actualColumn IM.!)
-        sources =
-            [ (idx, s, completeOutputColsFor s)
-            | (s, Source idx) <- GR.labNodes mg
-            ]
-        indexMapping :: [(Word, Int)]
-        indexMapping =
-            zip
-                [0 ..] -- new indices corresponding to index in this list
-                (fst sink : -- sink node will be inserted first from noria
-                 map (^. _2) (sortOn (^. _1) sources) -- then follow all base tables
-                  ++
-                 nonSinkSourceNodes)
-        toNIdx :: Int -> Word
-        toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
-    adjacencies <-
-        sequence
-            [ (, map someColToMirCol cols, map (toNIdx . snd) ins) <$>
-            case op of
-                CustomOp o _ ->
-                    pure $
-                    Mir.Regular
-                        { nodeFunction = o
-                        , indices =
-                              case ins of
-                                  [] -> []
-                                  [(edges, n)] ->
-                                      map (colFrom n . fst) $ sortOn snd edges
-                                  _ ->
-                                      error $ "Too many ancestors for " <>
-                                      showT o <>
-                                      " (" <>
-                                      showT ins <>
-                                      ")"
-                        , executionType =
-                              let ctx = cm IM.! n
-                               in case execSem of
-                                      ReductionSem ->
-                                          Mir.Reduction $ flattenCtx ctx
-                                      SimpleSem ->
-                                          Mir.Simple $ fromIntegral $
-                                          length (flattenCtx ctx)
-                                      _ -> unimplemented
-                        }
-                    where Just execSem = execSemMap o
-                Join _ -> unimplemented
-                Project _ -> unimplemented
-                Identity -> pure $ Mir.Identity $ completeOutputColsFor p
-                    where [(_, p)] = ins
-                Sink -> error "impossible"
-                Source {} -> error "impossible"
-                Filter f -> do
-                    conds <- traverse getCondition cols
-                    pure $ Mir.Filter {conditions = conds}
-                    where getCondition c =
-                              case HashMap.lookup c f of
-                                  Nothing
-                                      | Right c <- c
-                                      , cond@(Just _) <-
-                                           HashMap.lookup
-                                               (Right c {Mir.table = Nothing})
-                                               f -> do
-                                          $(logWarn) $
-                                              "Condition lookup with inexact table for " <>
-                                              showT c
-                                          pure cond
-                                  res -> pure res
-            | n <- nonSinkSourceNodes
-            , let (ins, _, op, _) = GR.context mg n
-                  cols = actualColumn IM.! n
-            ]
-    let sgr =
-            SerializableGraph
-                { adjacencyList = adjacencies
-                , sink =
-                      let [(s, _, l)] = GR.inn mg $ fst sink
-                       in (toNIdx s, completeOutputColsFor s)
-                , sources = sources
-                }
-    $(logDebug) "Serializable Graph:"
-    $(logDebug) $ showT sgr
-    pure sgr
-  where
-    execSemMap :: QualifiedBinding -> Maybe ExecSemantic
-    execSemMap =
-        flip HashMap.lookup $ HashMap.fromList $
-        map (\UDFDescription {..} -> (udfName, execSemantic)) udfs
-    nonSinkSourceNodes :: [Int]
-    nonSinkSourceNodes =
-        [ n
-        | (n, op) <- GR.labNodes mg
-        , case op -- and on this end we must filter all those nodes
-                          -- we've already explicitly inserted before
-                of
-              Sink -> False
-              Source {} -> False
-              _ -> True
-        ]
-    [sink] = filter (isSink . snd) (GR.labNodes mg)
-    colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
-
-toSerializableGraph ::
-       [UDFDescription] -> ScopeMap -> OperatorGraph -> SerializableGraph
-toSerializableGraph udfs cm mg =
-    SerializableGraph
-        { adjacencyList =
-              [ (entry ^. _1, completeOutputColsFor entry, map toNIdx ins)
-              | (_, n) <- drop 2 indexMapping
-              , let entry = opMap IM.! n
-                    ins = GR.pre mg n
-              ]
-        , sink =
-              let [(s, _, l)] = GR.inn mg $ fst sink
-               in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s)
-        , sources = sources
-        }
-  where
-    execSemMap :: QualifiedBinding -> Maybe ExecSemantic
-    execSemMap =
-        flip HashMap.lookup $ HashMap.fromList $
-        map (\UDFDescription {..} -> (udfName, execSemantic)) udfs
-    opMap :: OpMap
-    opMap =
-        IM.fromList
-            [ (n, (newOp, flattenCtx ctx, cols))
-            | n <- nonSinkSourceNodes
-            , let (ins, _, op, outs) = GR.context mg n
-                  ctx = cm IM.! n
-                  indices =
-                      case ins of
-                          [] -> []
-                          [(edges, n)] ->
-                              map (colFrom n . fst) $ sortOn snd edges
-                          _ -> error $ "Too many ancestors for " <> show op
-                  cols =
-                      case op of
-                          Join {} -> cols1 <> flattenCtx ctx <> cols2 -- dirty hack
-                          _
-                              | null outs -> []
-                              | otherwise -> normalCols
-                    where
-                      normalCols =
-                          map
-                              (colFrom n)
-                              [0 .. maximum
-                                        [ outIdx
-                                        | out <- outs
-                                        , (outIdx, _) <- fst out
-                                        ]]
-                      -- For dirty hack
-                      [(e1, _), (e2, _)] = ins
-                      (cols1, cols2) = splitAt (length e1) normalCols
-                  newOp =
-                      case op of
-                          CustomOp o _ ->
-                              Mir.Regular
-                                  { nodeFunction = o
-                                  , indices = indices
-                                  , executionType =
-                                        case execSem of
-                                            ReductionSem ->
-                                                Mir.Reduction $ flattenCtx ctx
-                                            SimpleSem ->
-                                                Mir.Simple $ fromIntegral $
-                                                length (flattenCtx ctx)
-                                  }
-                              where Just execSem = execSemMap o
-                          Join _ ->
-                              Mir.Join
-                                  { mirJoinProject =
-                                        flattenCtx ctx <> adjToProduced p1 <>
-                                        adjToProduced p2
-                                  , left = flattenCtx ctx
-                                  , right = flattenCtx ctx
-                                  }
-                              where [p1, p2] = ins
-                          Project _ -> unimplemented
-                          Identity -> Mir.Identity $ opMap ^?! ix p . _3
-                              where [(_, p)] = ins
-                          Sink -> error "impossible"
-                          Source {} -> error "impossible"
-                          Filter f ->
-                              let elems = HashMap.toList f
-                               in Mir.Filter
-                                      {conditions = map (Just . snd) elems}
-            ]
-    adjToProduced (edges, opid) = map (\(out, _) -> colFrom opid out) edges
-    colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
-    [sink] = filter (isSink . snd) (GR.labNodes mg)
-    sources =
-        [ ( idx
-          , s
-          , map (Mir.Column (Just name) . showT) [0 .. maximum (map fst labels)])
-        | (s, Source idx) <- GR.labNodes mg
-        , let labels = concatMap (^. _3) $ GR.out mg s
-              name = "&tables[" <> showT idx <> "].copy()" -- jikes this is dirty
-        ]
-    indexMapping :: [(Word, Int)]
-    indexMapping =
-        zip
-            [0 ..] -- new indices corresponding to index in this list
-            (fst sink : -- sink node will be inserted first from noria
-             map (^. _2) (sortOn (^. _1) sources) -- then follow all base tables
-              ++
-             nonSinkSourceNodes)
-    nonSinkSourceNodes :: [Int]
-    nonSinkSourceNodes =
-        [ n
-        | (n, op) <- GR.labNodes mg
-        , case op -- and on this end we must filter all those nodes
-                          -- we've already explicitly inserted before
-                of
-              Sink -> False
-              Source {} -> False
-              _ -> True
-        ]
-    toNIdx :: Int -> Word
-    toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
-    scopeSize = fromIntegral . length . flattenCtx
-
-flattenCtx :: [Scope] -> [Mir.Column]
-flattenCtx = (>>= \(GroupBy l) -> map someColToMirCol l)
-
-unimplemented :: HasCallStack => a
-unimplemented = error "Function or branch not yet implemented"
-
+-- toSerializableGraph2 ::
+--        MonadLogger m
+--     => [UDFDescription]
+--     -> ScopeMap
+--     -> OperatorGraph
+--     -> m SerializableGraph
+-- toSerializableGraph2 udfs cm mg = do
+--     actualColumn <- calcColumns cm mg
+--     $(logDebug) "Calculated Columns"
+--     $(logDebug) $ showT actualColumn
+--     let completeOutputColsFor = map someColToMirCol . (actualColumn IM.!)
+--         sources =
+--             [ (idx, s, completeOutputColsFor s)
+--             | (s, Source idx) <- GR.labNodes mg
+--             ]
+--         indexMapping :: [(Word, Int)]
+--         indexMapping =
+--             zip
+--                 [0 ..] -- new indices corresponding to index in this list
+--                 (fst sink : -- sink node will be inserted first from noria
+--                  map (^. _2) (sortOn (^. _1) sources) -- then follow all base tables
+--                   ++
+--                  nonSinkSourceNodes)
+--         toNIdx :: Int -> Word
+--         toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
+--     adjacencies <-
+--         sequence
+--             [ (, map someColToMirCol cols, map (toNIdx . snd) ins) <$>
+--             case op of
+--                 CustomOp o _ ->
+--                     pure $
+--                     Mir.Regular
+--                         { nodeFunction = o
+--                         , indices =
+--                               case ins of
+--                                   [] -> []
+--                                   [(edges, n)] ->
+--                                       map (colFrom n . fst) $ sortOn snd edges
+--                                   _ ->
+--                                       error $ "Too many ancestors for " <>
+--                                       showT o <>
+--                                       " (" <>
+--                                       showT ins <>
+--                                       ")"
+--                         , executionType =
+--                               let ctx = cm IM.! n
+--                                in case execSem of
+--                                       ReductionSem ->
+--                                           Mir.Reduction $ flattenCtx ctx
+--                                       SimpleSem ->
+--                                           Mir.Simple $ fromIntegral $
+--                                           length (flattenCtx ctx)
+--                                       _ -> unimplemented
+--                         }
+--                     where Just execSem = execSemMap o
+--                 Join _ -> unimplemented
+--                 Project _ -> unimplemented
+--                 Identity -> pure $ Mir.Identity $ completeOutputColsFor p
+--                     where [(_, p)] = ins
+--                 Sink -> error "impossible"
+--                 Source {} -> error "impossible"
+--                 Filter f -> do
+--                     conds <- traverse getCondition cols
+--                     pure $ Mir.Filter {conditions = conds}
+--                     where getCondition c =
+--                               case HashMap.lookup c f of
+--                                   Nothing
+--                                       | Right c <- c
+--                                       , cond@(Just _) <-
+--                                            HashMap.lookup
+--                                                (Right c {Mir.table = Nothing})
+--                                                f -> do
+--                                           $(logWarn) $
+--                                               "Condition lookup with inexact table for " <>
+--                                               showT c
+--                                           pure cond
+--                                   res -> pure res
+--             | n <- nonSinkSourceNodes
+--             , let (ins, _, op, _) = GR.context mg n
+--                   cols = actualColumn IM.! n
+--             ]
+--     let sgr =
+--             SerializableGraph
+--                 { adjacencyList = adjacencies
+--                 , sink =
+--                       let [(s, _, l)] = GR.inn mg $ fst sink
+--                        in (toNIdx s, completeOutputColsFor s)
+--                 , sources = sources
+--                 }
+--     $(logDebug) "Serializable Graph:"
+--     $(logDebug) $ showT sgr
+--     pure sgr
+--   where
+--     execSemMap :: QualifiedBinding -> Maybe ExecSemantic
+--     execSemMap =
+--         flip HashMap.lookup $ HashMap.fromList $
+--         map (\UDFDescription {..} -> (udfName, execSemantic)) udfs
+--     nonSinkSourceNodes :: [Int]
+--     nonSinkSourceNodes =
+--         [ n
+--         | (n, op) <- GR.labNodes mg
+--         , case op -- and on this end we must filter all those nodes
+--                           -- we've already explicitly inserted before
+--                 of
+--               Sink -> False
+--               Source {} -> False
+--               _ -> True
+--         ]
+--     [sink] = filter (isSink . snd) (GR.labNodes mg)
+--     colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
+-- toSerializableGraph ::
+--        [UDFDescription] -> ScopeMap -> OperatorGraph -> SerializableGraph
+-- toSerializableGraph udfs cm mg =
+--     SerializableGraph
+--         { adjacencyList =
+--               [ (entry ^. _1, completeOutputColsFor entry, map toNIdx ins)
+--               | (_, n) <- drop 2 indexMapping
+--               , let entry = opMap IM.! n
+--                     ins = GR.pre mg n
+--               ]
+--         , sink =
+--               let [(s, _, l)] = GR.inn mg $ fst sink
+--                in (toNIdx s, completeOutputColsFor $ opMap ^?! ix s)
+--         , sources = sources
+--         }
+--   where
+--     execSemMap :: QualifiedBinding -> Maybe ExecSemantic
+--     execSemMap =
+--         flip HashMap.lookup $ HashMap.fromList $
+--         map (\UDFDescription {..} -> (udfName, execSemantic)) udfs
+--     opMap :: OpMap
+--     opMap =
+--         IM.fromList
+--             [ (n, (newOp, flattenCtx ctx, cols))
+--             | n <- nonSinkSourceNodes
+--             , let (ins, _, op, outs) = GR.context mg n
+--                   ctx = cm IM.! n
+--                   indices =
+--                       case ins of
+--                           [] -> []
+--                           [(edges, n)] ->
+--                               map (colFrom n . fst) $ sortOn snd edges
+--                           _ -> error $ "Too many ancestors for " <> show op
+--                   cols =
+--                       case op of
+--                           Join {} -> cols1 <> flattenCtx ctx <> cols2 -- dirty hack
+--                           _
+--                               | null outs -> []
+--                               | otherwise -> normalCols
+--                     where
+--                       normalCols =
+--                           map
+--                               (colFrom n)
+--                               [0 .. maximum
+--                                         [ outIdx
+--                                         | out <- outs
+--                                         , (outIdx, _) <- fst out
+--                                         ]]
+--                       -- For dirty hack
+--                       [(e1, _), (e2, _)] = ins
+--                       (cols1, cols2) = splitAt (length e1) normalCols
+--                   newOp =
+--                       case op of
+--                           CustomOp o _ ->
+--                               Mir.Regular
+--                                   { nodeFunction = o
+--                                   , indices = indices
+--                                   , executionType =
+--                                         case execSem of
+--                                             ReductionSem ->
+--                                                 Mir.Reduction $ flattenCtx ctx
+--                                             SimpleSem ->
+--                                                 Mir.Simple $ fromIntegral $
+--                                                 length (flattenCtx ctx)
+--                                   }
+--                               where Just execSem = execSemMap o
+--                           Join _ ->
+--                               Mir.Join
+--                                   { mirJoinProject =
+--                                         flattenCtx ctx <> adjToProduced p1 <>
+--                                         adjToProduced p2
+--                                   , left = flattenCtx ctx
+--                                   , right = flattenCtx ctx
+--                                   }
+--                               where [p1, p2] = ins
+--                           Project _ -> unimplemented
+--                           Identity -> Mir.Identity $ opMap ^?! ix p . _3
+--                               where [(_, p)] = ins
+--                           Sink -> error "impossible"
+--                           Source {} -> error "impossible"
+--                           Filter f ->
+--                               let elems = HashMap.toList f
+--                                in Mir.Filter
+--                                       {conditions = map (Just . snd) elems}
+--             ]
+--     adjToProduced (edges, opid) = map (\(out, _) -> colFrom opid out) edges
+--     colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
+--     [sink] = filter (isSink . snd) (GR.labNodes mg)
+--     sources =
+--         [ ( idx
+--           , s
+--           , map (Mir.Column (Just name) . showT) [0 .. maximum (map fst labels)])
+--         | (s, Source idx) <- GR.labNodes mg
+--         , let labels = concatMap (^. _3) $ GR.out mg s
+--               name = "&tables[" <> showT idx <> "].copy()" -- jikes this is dirty
+--         ]
+--     indexMapping :: [(Word, Int)]
+--     indexMapping =
+--         zip
+--             [0 ..] -- new indices corresponding to index in this list
+--             (fst sink : -- sink node will be inserted first from noria
+--              map (^. _2) (sortOn (^. _1) sources) -- then follow all base tables
+--               ++
+--              nonSinkSourceNodes)
+--     nonSinkSourceNodes :: [Int]
+--     nonSinkSourceNodes =
+--         [ n
+--         | (n, op) <- GR.labNodes mg
+--         , case op -- and on this end we must filter all those nodes
+--                           -- we've already explicitly inserted before
+--                 of
+--               Sink -> False
+--               Source {} -> False
+--               _ -> True
+--         ]
+--     toNIdx :: Int -> Word
+--     toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
+--     scopeSize = fromIntegral . length . flattenCtx
+-- flattenCtx :: [Scope] -> [Mir.Column]
+-- flattenCtx = (>>= \(GroupBy l) -> map someColToMirCol l)
+-- unimplemented :: HasCallStack => a
+-- unimplemented = error "Function or branch not yet implemented"
 noriaMirSourceDir :: IsString s => s
 noriaMirSourceDir = "noria-server/mir/src"
 
@@ -1005,12 +1230,16 @@ generate compiledNodes CodeGenData {..} = do
                      Op_UDF u -> Right u)
                 compiledNodes
     iGr <- annotateAndRewriteQuery (HashMap.fromList mirNodes) udfs graph
-    let ctxMap = undefined
-    let iGr = undefined
-    debugLogGR "Annotated graph:" iGr
+    -- let ctxMap = undefined
+    -- let iGr = undefined
+    -- debugLogGR "Annotated graph:" iGr
     tpl <- loadNoriaTemplate "udf_graph.rs"
-    serializableGraph <- toSerializableGraph2 udfs ctxMap iGr
-    let subs = ["graph" ~> [renderDoc $ asRust $ serializableGraph]]
+    -- serializableGraph <- toSerializableGraph2 udfs ctxMap iGr
+    let subs =
+            [ "graph" ~>
+                       -- renderDoc $ asRust $ serializableGraph
+              []
+            ]
     tpl' <-
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
     patchFile
@@ -1018,8 +1247,9 @@ generate compiledNodes CodeGenData {..} = do
         (noriaMirSourceDir <> "/udfs/mod.rs")
         [ "graph-mods" ~> ["mod " <> entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
-          [ "\"" <> entryPointName <> "\" => Some(Box::new(" <> entryPointName <>
-            "_graph::mk_graph)),"
+          [ "\"" <>
+            entryPointName <>
+            "\" => Some(Box::new(" <> entryPointName <> "_graph::mk_graph)),"
           ]
         ]
     pure $ LT.encodeUtf8 $ LT.fromStrict tpl'

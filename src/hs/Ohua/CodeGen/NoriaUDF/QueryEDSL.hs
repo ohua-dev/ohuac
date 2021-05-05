@@ -27,19 +27,19 @@ instance Plated.Plated Condition where
     plate = Plated.gplate
 
 exprToMirCondition ::
-       Expr
+    Binding
+    -> Expr
     -> OhuaM env (HashMap.HashMap (Either Column Mir.Column) Mir.FilterCondition, [Binding])
-exprToMirCondition (Lambda table body) =
+exprToMirCondition tab (Lambda table body) =
     pure $ first HashMap.fromList $ runWriter $ fmap andToList $ f body
   where
     mkE :: (HasCallStack , Pretty a) => a -> b
     mkE t = error $ "Cannot convert \"" <> quickRender t <> "\" in " <> quickRender body
-    toVal (t `BindState` Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] n) _))) =
-        case t of
-            Var v -> do
-                unless (v == table) $ tell [v]
-                pure $ Mir.ColumnValue (Mir.Column Nothing (unwrap n))
-            _ -> mkE t
+    toVal (Var v `BindState` Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] n) _))) = do
+        v' <- if (v == table)
+            then pure tab
+            else tell [v] >> pure v
+        pure $ Mir.ColumnValue (Mir.Column (Just $ unwrap v') (unwrap n))
     toVal (Lit l) = pure $ Mir.ConstantValue l
     toVal other = mkE other
     flipOp =
@@ -86,7 +86,7 @@ exprToMirCondition (Lambda table body) =
             | op == Or = error $ "Disjunction not supported like this " <> quickRender body
             | otherwise = concat sub
         f' (Comp v) [] = [v]
-exprToMirCondition other = error $ "can't convert " <> quickRender other
+exprToMirCondition _ other = error $ "can't convert " <> quickRender other
 
 type EDSLRewrite env = (RegisterOperator -> Expr -> [Expr] -> OhuaM env Expr)
 
@@ -100,16 +100,16 @@ queryEDSL = flip HashMap.lookup table
           ((\_ state args -> assertM (null args) >> pure state) :: EDSLRewrite env)
          -- eventually this should insert a remapping and field selection node
         , fn "filter" ~>
-          ((\register state args -> do
+          ((\register (Var state) args -> do
                 let arg = case args of
                         [arg] -> arg
                         other -> error $ "too many argument " <> quickRender other
-                (conditionMap, free)  <- exprToMirCondition arg
+                (conditionMap, free)  <- exprToMirCondition state arg
                 name <- generateBindingWith "where_"
                 let newFnName =
                         QualifiedBinding ["ohua", "generated", "sql_ops"] name
-                liftIO $ register $ Op_MIR (newFnName, Filter conditionMap)
-                pure $ fromListToApply (FunRef newFnName Nothing) (state : map Var free)) :: EDSLRewrite env)
+                liftIO $ register $ Op_MIR (newFnName, Filter conditionMap (state, free))
+                pure $ fromListToApply (FunRef newFnName Nothing) (Var state : map Var free)) :: EDSLRewrite env)
          -- should resolve to the base state to figure out the table this references
         ]
 

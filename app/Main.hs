@@ -222,7 +222,8 @@ runBuild BuildOpts { outputFormat
             (def & stageHandling .~ stageHandlingOpt &
              transformRecursiveFunctions .~
              ("tail-recursion" `elem` extraFeatures)
-            & skipCtrlTransformation .~ ( outputFormat == NoriaUDF))
+            & skipCtrlTransformation .~ False -- ( outputFormat == NoriaUDF)
+            )
             passes
             completeExpr
     code <-

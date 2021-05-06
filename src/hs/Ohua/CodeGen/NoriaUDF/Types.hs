@@ -14,7 +14,7 @@ data NType
     | NTTup [NType]
     | NTRecFromTable Binding
     | NTAnonRec Binding [(Binding, NType)]
-    | NTScalar InternalColumn
+    | NTScalar SomeColumn
   deriving (Show, Eq, Ord, Generic)
 
 instance Hashable NType
@@ -28,7 +28,8 @@ instance PP.Pretty NType where
         NTAnonRec b rs -> pretty b <>
             PP.encloseSep PP.lbracket PP.rbracket PP.comma
             (map (\(f, t) -> pretty f <+> PP.colon <+> pretty t) rs)
-        NTScalar InternalColumn {..} -> "FromOp<" <> pretty producingOperator <> PP.comma <+> pretty outputIndex <> ">"
+        NTScalar (Left InternalColumn {..}) -> "FromOp<" <> pretty producingOperator <> PP.comma <+> pretty outputIndex <> ">"
+        NTScalar (Right c) -> pretty c
 
 data GenerationType
     = TemplateSubstitution Template

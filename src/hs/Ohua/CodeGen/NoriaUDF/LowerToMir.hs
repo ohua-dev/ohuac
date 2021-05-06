@@ -22,6 +22,9 @@ import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import Prelude ((!!))
 import qualified Prelude
 import Text.Printf (printf)
+import qualified System.Directory as FS
+import qualified System.FilePath as FS
+import System.IO.Unsafe (unsafePerformIO)
 
 import qualified Ohua.ALang.Refs as Refs
 import Ohua.CodeGen.Iface
@@ -87,16 +90,25 @@ type Field3' a b = Simple Field3 a b
 
 type Field4' a b = Simple Field4 a b
 
+
 quickDumpGrAsDot ::
-       (GraphViz.Labellable a, GraphViz.Labellable b, GR.Graph g, MonadIO m)
+       (GraphViz.Labellable a, GraphViz.Labellable b, GR.Graph g, MonadIO m, MonadLogger m)
     => FilePath
     -> g a b
     -> m ()
-quickDumpGrAsDot f =
-    liftIO .
-    LT.writeFile f .
-    GraphViz.renderDot .
-    GraphViz.toDot . GraphViz.graphToDot GraphViz.quickParams
+quickDumpGrAsDot = \f g -> do
+    let dir = ".graphs"
+    i <- atomicModifyIORef' graphDumpIndex (\i -> (succ i, i))
+    let file = ".graphs" FS.</> show i <> "-" <> f
+    liftIO $ do
+        FS.createDirectoryIfMissing False dir
+        LT.writeFile file .
+            GraphViz.renderDot .
+            GraphViz.toDot . GraphViz.graphToDot GraphViz.quickParams $ g
+    logDebugN $ "Wrote graph " <> toText file
+  where
+    graphDumpIndex = unsafePerformIO $ newIORef 1
+    {-# NOINLINE graphDumpIndex #-}
 
 expectNumLit :: HasCallStack => Lit -> Integer
 expectNumLit (NumericLit n) = n
@@ -178,9 +190,9 @@ typeGraph udfs envInputs g = m
                     show i <> " " <> quickRender t
             NTTup ts
                 | Just t' <- ts ^? ix i -> t'
-            NTScalar InternalColumn {..}
+            NTScalar (Left InternalColumn {..})
                 | outputIndex == -1 ->
-                    NTScalar InternalColumn {producingOperator, outputIndex = i}
+                    NTScalar $ Left InternalColumn {producingOperator, outputIndex = i}
             _ ->
                 error $
                 "Cannot take index " <> show i <> " of type " <> quickRender t
@@ -200,20 +212,25 @@ typeGraph udfs envInputs g = m
                      in [fromIndex Nothing idx]
                 | bnd == Refs.smapFun ->
                     case fromIndex (Just 1) 0 of
-                        NTSeq t -> [t, NTScalar $ InternalColumn n 1, NTScalar $ InternalColumn n 2 {- is this really necessary? -}]
+                        NTSeq t -> [t, NTScalar $ Left $ InternalColumn n 1, NTScalar $ Left $ InternalColumn n 2 {- is this really necessary? -}]
                         _ -> invalidArgs
                 | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 0]
                 | QualifiedBinding ["ohua", "lang"] b <- bnd ->
                   case b of
                       "(,)"  -> argTypes
+                      "ctrl" -> Prelude.tail argTypes
                       _ | b `elem` ( ["lt", "gt", "eq", "and", "or", "leq", "geq"] :: Vector Binding ) -> likeUdf
-                | QualifiedBinding ["ohua", "lang", "field"] _ <- bnd -> likeUdf
+                | QualifiedBinding ["ohua", "lang", "field"] f <- bnd ->
+                  pure $
+                  case fromIndex (Just 1) 0 of
+                      NTRecFromTable t -> NTScalar $ Right $ Mir.Column (Just $ unwrap t) $ unwrap f
+                      r@(NTAnonRec _ fields) -> fromMaybe (error $ "Field " <> unwrap f <> " not found in record " <> quickRender r) $ List.lookup f fields
                 | !_ <- udfs bnd -> likeUdf
             _ ->
                 error $
                 "Could not determine return type of operator " <> quickRender o
       where
-        likeUdf = [NTScalar $ InternalColumn n 0]
+        likeUdf = [NTScalar $ Left $ InternalColumn n 0]
         unexpectedOp op =
             error $ op <> "not expected here, got " <> quickRender o
         invalidArgs :: a
@@ -250,63 +267,39 @@ typeGraph udfs envInputs g = m
                           ]
             ]
 
-handleSuperfluousEdgesAndCtrl ::
-       (GR.DynGraph g, MonadLogger m) => (a -> Bool) -> g a () -> m (g a ())
-handleSuperfluousEdgesAndCtrl isCtrl
-    -- fmap (\g -> GR.labnfilter
-    --          (\case (n, l) | isCtrl l -> if length (GR.pre g n) > 1 then error "Not yet implemented" else False
-    --                 _ -> True ) g) .
- =
-    \g ->
-        let tc = GR.tc g
-            g' = remSuperfluousEdges tc g
-            ctrlWithTooManyParents =
-                [ n
-                | (n, l) <- GR.labNodes g'
-                , isCtrl l
-                , length (GR.pre g' n) > 1
-                ]
-         in if null ctrlWithTooManyParents
-                then pure g'
-                else do
-                    logErrorN $
-                        "Too many parents for ctrl nodes " <>
-                        show ctrlWithTooManyParents
-                    error "abort"
-  where
-    remSuperfluousEdges tc g =
-        foldr'
-            GR.delLEdge
-            g
-            [ (p, n, ())
-            | n <- GR.nodes g
-            , let pre = GR.pre g n
-            , (p:other) <- tails pre
-            , o <- other
-            , r <-
-                  if GR.hasEdge tc (p, o)
-                      then [p]
-                      else if GR.hasEdge tc (o, p)
-                               then [o]
-                               else if o == p
-                                        then [p]
-                                        else []
-        -- This condition excludes cases where `n` is the first node after
-        -- `smap` and also receives other input. In such cases this would sever
-        -- the collection to `smap` which we rely on to later simply drop all
-        -- ctrl nodes
-        -- , not (isCtrl $ fromMaybe "node not found" $ GR.lab g o)
-            ]
+
+-- | Note that this calculates the node order once and does not update it during the fold
+gFoldTopSort :: GR.Graph gr => (gr a b -> GR.Context a b -> gr a b) -> gr a b -> gr a b
+gFoldTopSort f g = foldl' (\g' n -> let (Just ctx , g'') = GR.match n g' in f g'' ctx) g (GR.topsort g)
+
+inlineCtrl ::
+       (GR.DynGraph gr)
+    => (GR.Node -> [NType])
+    -> gr Operator (Int, Int)
+    -> gr Operator (Int, Int)
+inlineCtrl getType = gFoldTopSort $ \g -> \case
+    (ins , n, CustomOp l _, outs)
+        | l == Refs.ctrl ->
+          let ts = getType n
+              idxmap = IM.fromList [(idx, (p, out, ts Prelude.!! idx)) | ((out, pred -> idx), p) <- ins ]
+              (ctxSource, _, _) = idxmap IM.! (-1)
+          in
+          flip GR.insEdges g $ outs >>= \((out, in_), j) ->
+              let (np, nout, t) = idxmap IM.! out in
+              case t of
+                  NTSeq _ -> [(np, j, (nout, in_))]
+                  _ -> [(np, ctxSource, (nout, minBound)), (ctxSource, j, (maxBound, in_))]
+    ctx -> ctx GR.& g
 
 sequentializeScalars ::
        (GR.DynGraph gr, gr Operator () ~ g)
     => (Operator -> ExecSemantic)
     -> g
     -> g
-sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
+sequentializeScalars getSem g0 = gFoldTopSort f g0
   where
     tc = GR.tc g0
-    f g n
+    f g' ctx@(ins, n, l, outs)
         | (One, One) <- getSem l
         , [(_, p)] <- ins
         , (Just (pins, _, plab, pouts), g'') <- GR.match p g'
@@ -319,7 +312,7 @@ sequentializeScalars getSem g0 = foldl' f g0 (GR.topsort g0)
       where
         prunedOuts = prune outs
         reachable p i = i /= p && GR.hasEdge tc (p, i)
-        (Just (ins, _, l, outs), g') = GR.match n g
+        g = ctx GR.& g'
         prune stuff =
             hashNub $
             [o | o@(_, o') <- stuff, not (any (flip reachable o' . snd) stuff)]
@@ -332,6 +325,7 @@ execSemOf nodes =
             | op == Refs.collect -> (One, Many)
             | op == Refs.smapFun -> (Many, One)
             | op == Refs.ctrl -> (One, Many)
+            | op ^. namespace == ["ohua", "lang", "field"] -> (One, One)
             | QualifiedBinding ["ohua", "lang"] b <- op
             , b `elem`
                   (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
@@ -354,25 +348,18 @@ annotateAndRewriteQuery ::
     -> m (Gr Operator ())
 annotateAndRewriteQuery gMirNodes udfs graph = do
     quickDumpGrAsDot "graph-with-edge-indices.dot" $
-        GR.nemap (either quickRender quickRender) (\i -> show i :: Text) iGr00
+            flip GR.gmap iGr00 $ \(ins, n, l, outs) ->
+                        let strip = map $ first $ quickRender
+                        in (strip ins, n, show n <> " " <> either quickRender quickRender l, strip outs)
+    quickDumpGrAsDot "ctrl-removed.dot" $ printableLabelWithTypes ctrlRemoved
     debugLogGR "Initial Graph" iGr
-    quickDumpGrAsDot "initial-graph.dot" $
-        GR.gmap (\(ins, n, l, outs) ->
-                     let strip = map $ first $ const ( "" :: Text)
-                         (int, outt) = getType n
-                     in (strip ins, n, show n <> " " <> quickRender l <> "\n" <> quickRender int <> " -> " <> quickRender outt, strip outs)
-                      ) iGr
-    let s0 = (iGr, succ $ snd $ GR.nodeRange iGr)
-    s1@(gr1, _) <- flip execStateT s0 $ inlineFieldAccess envInputs getType
-    debugLogGR "Graph with nth collapsed" gr1
-    quickDumpGrAsDot "nth-collapsed.dot" $
-        GR.nemap quickRender (const ("" :: Text)) gr1
+    quickDumpGrAsDot "initial-graph.dot" $ printableLabelWithTypes iGr
     -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
     -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) ctrlRemoved
-    let udfSequentialized = sequentializeScalars (execSemOf getUdf) gr1
+    let udfSequentialized = sequentializeScalars (execSemOf getUdf) iGr
             --ctrlRemoved
     quickDumpGrAsDot "scalars-sequentialized.dot" $
-        GR.nemap quickRender (const ("" :: Text)) udfSequentialized
+        printableLabelWithTypes udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
     quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $
         GR.nemap quickRender (const ("" :: Text)) gr3
@@ -384,6 +371,14 @@ annotateAndRewriteQuery gMirNodes udfs graph = do
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
   where
+    mkLabelsPrintable :: (GR.DynGraph gr, PP.Pretty a) => gr a b -> gr Text Text
+    mkLabelsPrintable = GR.nemap quickRender $ const ""
+    printableLabelWithTypes :: (GR.DynGraph gr, PP.Pretty a) => gr a b -> gr Text Text
+    printableLabelWithTypes =
+            GR.gmap $ \(ins, n, l, outs) ->
+                        let strip = map $ first $ const ""
+                            (int, outt) = getType n
+                        in (strip ins, n, show n <> " " <> quickRender l <> "\n" <> quickRender int <> " -> " <> quickRender outt, strip outs)
     getUdf :: HasCallStack => QualifiedBinding -> UDFDescription
     getUdf =
         \o ->
@@ -408,7 +403,8 @@ annotateAndRewriteQuery gMirNodes udfs graph = do
     typeMap = typeGraph (execSemantic . getUdf) envInputs iGr0
     getType = (typeMap IM.!)
     iGr :: GR.Gr Operator ()
-    iGr = GR.emap (const ()) iGr0
+    iGr = GR.emap (const ()) ctrlRemoved
+    ctrlRemoved = inlineCtrl (snd . getType) iGr0
     iGr0 =
         GR.gmap
             (\ctx@(in_, n, lab, out) ->
@@ -489,7 +485,7 @@ inlineFieldAccess envInputs getType =
                             Right Mir.Column {table = Just $ unwrap b, name = n}
                         [NTAnonRec r fields]
                             | Just (NTScalar s) <-
-                                 List.lookup (unsafeMake n) fields -> Left s
+                                 List.lookup (unsafeMake n) fields -> s
                         t ->
                             error $
                             "Invalid input type " <>
@@ -557,8 +553,10 @@ removeSuperfluousOperators g =
                      case l of
                          CustomOp c _
                              | QualifiedBinding ["ohua", "lang"] b <- c
-                               -> b `elem` (["smapFun", "collect"] :: Vector Binding)
-                             | c == "ohua.sql.query/group_by" -> True
+                               -> b `elem` (["smapFun", "collect", "nth"] :: Vector Binding)
+                             | otherwise ->
+                                   c ^. namespace == ["ohua", "lang", "field"]
+                                   || c == "ohua.sql.query/group_by"
                          _ -> False
              in if rem then
                  let [newNode] = GR.pre g n in
@@ -705,7 +703,7 @@ retype3 m ty other@(QualifiedBinding namespace name) =
     rewriteFilter a = a
     toCol =
         \case
-            NTScalar s -> Left s
+            NTScalar s -> s
             t -> error $ "Expected scalar type, got " <> quickRender t <> " in operator " <> quickRender other
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g

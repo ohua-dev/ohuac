@@ -70,8 +70,9 @@ instance Hashable a => Hashable (GScope a)
 instance NFData a => NFData (GScope a)
 
 data JoinType
-    = FullJoin
-    | InnerJoin [SomeColumn]
+    = FullOuterJoin
+    | LeftOuterJoin
+    | InnerJoin
     deriving (Show, Eq, Generic)
 
 instance NFData JoinType
@@ -79,7 +80,7 @@ instance Hashable JoinType
 
 data Operator
     = CustomOp QualifiedBinding [SomeColumn]
-    | Join JoinType
+    | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
     | Project [SomeColumn]
     | Identity
     | Sink
@@ -98,10 +99,7 @@ instance PP.Pretty Operator where
             PP.list
             [ showCol col <+> PP.pretty cond
             | (col, cond) <- HashMap.toList conds]
-        Join t ->
-            case t of
-                FullJoin -> "><"
-                InnerJoin c -> "⋈" <+> PP.list (map showCol c)
+        Join t on -> pretty t <+> PP.list (map (\(c1, c2) -> showCol c1 <+> "=" <+> showCol c2) on)
         Identity -> "≡"
         Sink -> "Sink"
         Source s -> "B" <+> PP.pretty s
@@ -111,6 +109,12 @@ instance PP.Pretty Operator where
           showCol = \case
               Left InternalColumn{..} -> PP.pretty producingOperator <> ":" <> PP.pretty outputIndex
               Right c -> PP.pretty c
+
+instance PP.Pretty JoinType where
+    pretty = \case
+        FullOuterJoin -> "><"
+        LeftOuterJoin -> "⋊"
+        InnerJoin -> "⋈"
 
 data OperatorDescription
     = Op_MIR (QualifiedBinding, Operator)

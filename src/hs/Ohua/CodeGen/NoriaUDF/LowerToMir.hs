@@ -21,10 +21,10 @@ import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import Prelude ((!!))
 import qualified Prelude
-import Text.Printf (printf)
 import qualified System.Directory as FS
 import qualified System.FilePath as FS
 import System.IO.Unsafe (unsafePerformIO)
+import Text.Printf (printf)
 
 import qualified Ohua.ALang.Refs as Refs
 import Ohua.CodeGen.Iface
@@ -90,22 +90,28 @@ type Field3' a b = Simple Field3 a b
 
 type Field4' a b = Simple Field4 a b
 
-
 quickDumpGrAsDot ::
-       (GraphViz.Labellable a, GraphViz.Labellable b, GR.Graph g, MonadIO m, MonadLogger m)
+       ( GraphViz.Labellable a
+       , GraphViz.Labellable b
+       , GR.Graph g
+       , MonadIO m
+       , MonadLogger m
+       )
     => FilePath
     -> g a b
     -> m ()
-quickDumpGrAsDot = \f g -> do
-    let dir = ".graphs"
-    i <- atomicModifyIORef' graphDumpIndex (\i -> (succ i, i))
-    let file = ".graphs" FS.</> show i <> "-" <> f
-    liftIO $ do
-        FS.createDirectoryIfMissing False dir
-        LT.writeFile file .
-            GraphViz.renderDot .
-            GraphViz.toDot . GraphViz.graphToDot GraphViz.quickParams $ g
-    logDebugN $ "Wrote graph " <> toText file
+quickDumpGrAsDot =
+    \f g -> do
+        let dir = ".graphs"
+        i <- atomicModifyIORef' graphDumpIndex (\i -> (succ i, i))
+        let file = ".graphs" FS.</> show i <> "-" <> f
+        liftIO $ do
+            FS.createDirectoryIfMissing False dir
+            LT.writeFile file .
+                GraphViz.renderDot .
+                GraphViz.toDot . GraphViz.graphToDot GraphViz.quickParams $
+                g
+        logDebugN $ "Wrote graph " <> toText file
   where
     graphDumpIndex = unsafePerformIO $ newIORef 1
     {-# NOINLINE graphDumpIndex #-}
@@ -192,7 +198,8 @@ typeGraph udfs envInputs g = m
                 | Just t' <- ts ^? ix i -> t'
             NTScalar (Left InternalColumn {..})
                 | outputIndex == -1 ->
-                    NTScalar $ Left InternalColumn {producingOperator, outputIndex = i}
+                    NTScalar $
+                    Left InternalColumn {producingOperator, outputIndex = i}
             _ ->
                 error $
                 "Cannot take index " <> show i <> " of type " <> quickRender t
@@ -212,19 +219,34 @@ typeGraph udfs envInputs g = m
                      in [fromIndex Nothing idx]
                 | bnd == Refs.smapFun ->
                     case fromIndex (Just 1) 0 of
-                        NTSeq t -> [t, NTScalar $ Left $ InternalColumn n 1, NTScalar $ Left $ InternalColumn n 2 {- is this really necessary? -}]
+                        NTSeq t ->
+                            [ t
+                            , NTScalar $ Left $ InternalColumn n 1
+                            , NTScalar $ Left $ InternalColumn n 2
+                            ] {- is this really necessary? -}
                         _ -> invalidArgs
                 | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 0]
                 | QualifiedBinding ["ohua", "lang"] b <- bnd ->
-                  case b of
-                      "(,)"  -> argTypes
-                      "ctrl" -> Prelude.tail argTypes
-                      _ | b `elem` ( ["lt", "gt", "eq", "and", "or", "leq", "geq"] :: Vector Binding ) -> likeUdf
+                    case b of
+                        "(,)" -> argTypes
+                        "ctrl" -> Prelude.tail argTypes
+                        _
+                            | b `elem`
+                                  (["lt", "gt", "eq", "and", "or", "leq", "geq"] :: Vector Binding) ->
+                                likeUdf
                 | QualifiedBinding ["ohua", "lang", "field"] f <- bnd ->
-                  pure $
-                  case fromIndex (Just 1) 0 of
-                      NTRecFromTable t -> NTScalar $ Right $ Mir.Column (Just $ unwrap t) $ unwrap f
-                      r@(NTAnonRec _ fields) -> fromMaybe (error $ "Field " <> unwrap f <> " not found in record " <> quickRender r) $ List.lookup f fields
+                    pure $
+                    case fromIndex (Just 1) 0 of
+                        NTRecFromTable t ->
+                            NTScalar $
+                            Right $ Mir.Column (Just $ unwrap t) $ unwrap f
+                        r@(NTAnonRec _ fields) ->
+                            fromMaybe
+                                (error $
+                                 "Field " <>
+                                 unwrap f <>
+                                 " not found in record " <> quickRender r) $
+                            List.lookup f fields
                 | !_ <- udfs bnd -> likeUdf
             _ ->
                 error $
@@ -262,34 +284,60 @@ typeGraph udfs envInputs g = m
                             , let retTypes = snd (getType p)
                                in if outIdx == (-1)
                                       then NTTup retTypes
-                                      else fromMaybe (error $ "Index too large " <> show outIdx <> " in " <> quickRender retTypes <> " in " <> quickRender (GR.lab g p) <> " from input " <> show inIdx <> " of operator " <> quickRender l) $ retTypes ^? ix outIdx)
+                                      else fromMaybe
+                                               (error $
+                                                "Index too large " <>
+                                                show outIdx <>
+                                                " in " <>
+                                                quickRender retTypes <>
+                                                " in " <>
+                                                quickRender (GR.lab g p) <>
+                                                " from input " <>
+                                                show inIdx <>
+                                                " of operator " <> quickRender l) $
+                                           retTypes ^? ix outIdx)
                           | (p, (outIdx, inIdx)) <- GR.lpre g n
                           ]
             ]
 
-
 -- | Note that this calculates the node order once and does not update it during the fold
-gFoldTopSort :: GR.Graph gr => (gr a b -> GR.Context a b -> gr a b) -> gr a b -> gr a b
-gFoldTopSort f g = foldl' (\g' n -> let (Just ctx , g'') = GR.match n g' in f g'' ctx) g (GR.topsort g)
+gFoldTopSort ::
+       GR.Graph gr => (gr a b -> GR.Context a b -> gr a b) -> gr a b -> gr a b
+gFoldTopSort f g =
+    foldl'
+        (\g' n ->
+             let (Just ctx, g'') = GR.match n g'
+              in f g'' ctx)
+        g
+        (GR.topsort g)
 
 inlineCtrl ::
        (GR.DynGraph gr)
     => (GR.Node -> [NType])
     -> gr Operator (Int, Int)
     -> gr Operator (Int, Int)
-inlineCtrl getType = gFoldTopSort $ \g -> \case
-    (ins , n, CustomOp l _, outs)
-        | l == Refs.ctrl ->
-          let ts = getType n
-              idxmap = IM.fromList [(idx, (p, out, ts Prelude.!! idx)) | ((out, pred -> idx), p) <- ins ]
-              (ctxSource, _, _) = idxmap IM.! (-1)
-          in
-          flip GR.insEdges g $ outs >>= \((out, in_), j) ->
-              let (np, nout, t) = idxmap IM.! out in
-              case t of
-                  NTSeq _ -> [(np, j, (nout, in_))]
-                  _ -> [(np, ctxSource, (nout, minBound)), (ctxSource, j, (maxBound, in_))]
-    ctx -> ctx GR.& g
+inlineCtrl getType =
+    gFoldTopSort $ \g ->
+        \case
+            (ins, n, CustomOp l _, outs)
+                | l == Refs.ctrl ->
+                    let ts = getType n
+                        idxmap =
+                            IM.fromList
+                                [ (idx, (p, out, ts Prelude.!! idx))
+                                | ((out, pred -> idx), p) <- ins
+                                ]
+                        (ctxSource, _, _) = idxmap IM.! (-1)
+                     in flip GR.insEdges g $
+                        outs >>= \((out, in_), j) ->
+                            let (np, nout, t) = idxmap IM.! out
+                             in case t of
+                                    NTSeq _ -> [(np, j, (nout, in_))]
+                                    _ ->
+                                        [ (np, ctxSource, (nout, minBound))
+                                        , (ctxSource, j, (maxBound, in_))
+                                        ]
+            ctx -> ctx GR.& g
 
 sequentializeScalars ::
        (GR.DynGraph gr, gr Operator () ~ g)
@@ -337,6 +385,52 @@ execSemOf nodes =
         Source _ -> (Many, Many)
         Sink -> (Many, Many)
 
+joinWhereMerge ::
+       (GR.DynGraph gr, gr Operator () ~ g) => (GR.Node -> [NType]) -> g -> g
+joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
+  where
+    f g =
+        \case
+            (n, Join jt []) ->
+                let (Just (ins, _, _, [((), suc)]), g') = GR.match n g
+                    (Just (fins, _, filterlab@(Filter conds filterfields), fsuc), g'') =
+                        GR.match suc g'
+                    filtert@(NTSeq (NTRecFromTable (unwrap -> t)):_) =
+                        getType suc
+                    colIsFromTable =
+                        \case
+                            Right c -> Mir.table c == Just t
+                            _ -> False
+                    (rem, cols) =
+                        unzip
+                            [ (sc1, (c1, c2))
+                            | (sc1, Mir.Comparison Mir.Equal (Mir.ColumnValue (Right -> v))) <-
+                                  HashMap.toList conds
+                            , (c1, c2) <-
+                                  case (colIsFromTable sc1, colIsFromTable v) of
+                                      (True, False) -> [(sc1, v)]
+                                      (False, True) -> [(v, sc1)]
+                                      _ -> []
+                            ]
+                    (ng, nsuc) =
+                        if length cols == HashMap.size conds
+                            then (g'', fsuc)
+                            else ( ( fins
+                                   , suc
+                                   , Filter
+                                         (foldr' HashMap.delete conds rem)
+                                         filterfields
+                                   , fsuc) GR.&
+                                   g''
+                                 , [((), suc)])
+                 in if length cols < 1
+                        then error $
+                             "No matching filters found in " <>
+                             quickRender filterlab <>
+                             " with type " <> quickRender filtert
+                        else (ins, n, Join jt cols, nsuc) GR.& ng
+            _ -> g
+
 -- TODO
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
@@ -348,9 +442,12 @@ annotateAndRewriteQuery ::
     -> m (Gr Operator ())
 annotateAndRewriteQuery gMirNodes udfs graph = do
     quickDumpGrAsDot "graph-with-edge-indices.dot" $
-            flip GR.gmap iGr00 $ \(ins, n, l, outs) ->
-                        let strip = map $ first $ quickRender
-                        in (strip ins, n, show n <> " " <> either quickRender quickRender l, strip outs)
+        flip GR.gmap iGr00 $ \(ins, n, l, outs) ->
+            let strip = map $ first $ quickRender
+             in ( strip ins
+                , n
+                , show n <> " " <> either quickRender quickRender l
+                , strip outs)
     quickDumpGrAsDot "ctrl-removed.dot" $ printableLabelWithTypes ctrlRemoved
     debugLogGR "Initial Graph" iGr
     quickDumpGrAsDot "initial-graph.dot" $ printableLabelWithTypes iGr
@@ -366,19 +463,29 @@ annotateAndRewriteQuery gMirNodes udfs graph = do
     let gr2 = removeSuperfluousOperators gr3
     quickDumpGrAsDot "superf-removed.dot" $
         GR.nemap quickRender (const ("" :: Text)) gr2
-    pure gr2
+    let whereMerged = joinWhereMerge (fst . getType) gr2
+    quickDumpGrAsDot "join-where-merged.dot" $
+        printableLabelWithTypes whereMerged
+    pure whereMerged
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
   where
     mkLabelsPrintable :: (GR.DynGraph gr, PP.Pretty a) => gr a b -> gr Text Text
     mkLabelsPrintable = GR.nemap quickRender $ const ""
-    printableLabelWithTypes :: (GR.DynGraph gr, PP.Pretty a) => gr a b -> gr Text Text
+    printableLabelWithTypes ::
+           (GR.DynGraph gr, PP.Pretty a) => gr a b -> gr Text Text
     printableLabelWithTypes =
-            GR.gmap $ \(ins, n, l, outs) ->
-                        let strip = map $ first $ const ""
-                            (int, outt) = getType n
-                        in (strip ins, n, show n <> " " <> quickRender l <> "\n" <> quickRender int <> " -> " <> quickRender outt, strip outs)
+        GR.gmap $ \(ins, n, l, outs) ->
+            let strip = map $ first $ const ""
+                (int, outt) = getType n
+             in ( strip ins
+                , n
+                , show n <>
+                  " " <>
+                  quickRender l <>
+                  "\n" <> quickRender int <> " -> " <> quickRender outt
+                , strip outs)
     getUdf :: HasCallStack => QualifiedBinding -> UDFDescription
     getUdf =
         \o ->
@@ -458,93 +565,6 @@ collapseMultiArcs ::
        GR.DynGraph gr => gr opLabel edgeLabel -> gr opLabel [edgeLabel]
 collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
 
-alterLabel :: GR.DynGraph gr => GR.Node -> (l -> l) -> gr l x -> gr l x
-alterLabel n f gr =
-    let (Just (a, b, c, d), gr0) = GR.match n gr
-     in (a, b, f c, d) GR.& gr0
-
-inlineFieldAccess ::
-       GetGraph g Operator () s m
-    => LitMap
-    -> (Int -> ([NType], [NType]))
-    -> m ()
-inlineFieldAccess envInputs getType =
-    forNodes_
-        (\case
-             CustomOp op _
-                 | op == Refs.nth -> Just Nothing
-                 | op ^. namespace == ["ohua", "lang", "field"] ->
-                     Just $ Just $ unwrap $ op ^. name
-             _ -> Nothing) $ \node dat -> do
-        [inOp] <- use $ _1 . to (flip GR.pre node)
-        gr <- use _1
-        let mfield =
-                flip fmap dat $ \n -> do
-                    case fst $ getType node of
-                        [NTRecFromTable b] ->
-                            Right Mir.Column {table = Just $ unwrap b, name = n}
-                        [NTAnonRec r fields]
-                            | Just (NTScalar s) <-
-                                 List.lookup (unsafeMake n) fields -> s
-                        t ->
-                            error $
-                            "Invalid input type " <>
-                            quickRender t <> ") for acessing field " <> n <> " for operator " <> show node
-        outs <- use $ _1 . to (flip GR.suc node)
-        sDelNode node
-        for_ outs $ \tOp -> do
-            sInsEdge (inOp, tOp, ())
-            case mfield of
-                Just field -> _1 %= alterLabel tOp (alterColumns alteration)
-                    where alteration =
-                              \case
-                                  Left (InternalColumn {..})
-                                      | producingOperator == node ->
-                                          if outputIndex /= 0
-                                              then error
-                                                       ("Weird index " <>
-                                                        show outputIndex)
-                                              else Just field
-                                  _ -> Nothing
-                _ -> pure ()
-
-alterColumns :: (SomeColumn -> Maybe SomeColumn) -> Operator -> Operator
-alterColumns f =
-    \case
-        CustomOp b fields -> CustomOp b (map (\i -> fromMaybe i $ f i) fields)
-        Join j -> Join j
-        Project cols -> Project (map (\i -> fromMaybe i $ f i) cols)
-        Identity -> Identity
-        Sink -> Sink
-        Source s -> Source s
-        Filter conds fields ->
-            Filter
-                (foldr'
-                     (\(k, v) m ->
-                          maybe
-                              m
-                              (\k' -> HashMap.insert k' v $ HashMap.delete k m) $
-                          f k)
-                     conds
-                     (HashMap.toList conds))
-                fields
-
-dropNodesRelink ::
-       (GR.DynGraph gr, g ~ gr Operator ())
-    => (Operator -> Maybe GR.Node)
-    -> g
-    -> g
-dropNodesRelink p g =
-    foldr'
-        (\(n, l) g ->
-             case p l of
-                 Nothing -> g
-                 Just newNode ->
-                     GR.insEdges (map (newNode, , ()) $ GR.suc g n) $
-                     GR.delNode n g)
-        g
-        (GR.labNodes g)
-
 removeSuperfluousOperators :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 removeSuperfluousOperators g =
     foldr'
@@ -552,18 +572,18 @@ removeSuperfluousOperators g =
              let rem =
                      case l of
                          CustomOp c _
-                             | QualifiedBinding ["ohua", "lang"] b <- c
-                               -> b `elem` (["smapFun", "collect", "nth"] :: Vector Binding)
+                             | QualifiedBinding ["ohua", "lang"] b <- c ->
+                                 b `elem`
+                                 (["smapFun", "collect", "nth"] :: Vector Binding)
                              | otherwise ->
-                                   c ^. namespace == ["ohua", "lang", "field"]
-                                   || c == "ohua.sql.query/group_by"
+                                 c ^. namespace == ["ohua", "lang", "field"] ||
+                                 c == "ohua.sql.query/group_by"
                          _ -> False
-             in if rem then
-                 let [newNode] = GR.pre g n in
-                     GR.insEdges (map (newNode, , ()) $ GR.suc g n) $
-                     GR.delNode n g
-                 else g
-        )
+              in if rem
+                     then let [newNode] = GR.pre g n
+                           in GR.insEdges (map (newNode, , ()) $ GR.suc g n) $
+                              GR.delNode n g
+                     else g)
         g
         (GR.labNodes g)
 
@@ -643,7 +663,7 @@ retype3 m ty other@(QualifiedBinding namespace name) =
             | name == "(,)" -> Project (map toCol ty)
             | name `elem`
                   (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
-                  CustomOp other (map toCol ty)
+                CustomOp other (map toCol ty)
             | otherwise -> CustomOp other []
         ["ohua", "lang", "field"] -> CustomOp other []
         _ ->
@@ -704,12 +724,15 @@ retype3 m ty other@(QualifiedBinding namespace name) =
     toCol =
         \case
             NTScalar s -> s
-            t -> error $ "Expected scalar type, got " <> quickRender t <> " in operator " <> quickRender other
+            t ->
+                error $
+                "Expected scalar type, got " <>
+                quickRender t <> " in operator " <> quickRender other
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
   where
-    f g (_, Join _) = g
+    f g (_, Join {}) = g
     f g (n, lab) =
         case GR.pre g n of
             [] -> g
@@ -717,7 +740,7 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
             [x, y] ->
                 ( [((), x), ((), y)]
                 , Prelude.head $ GR.newNodes 1 g
-                , Join FullJoin
+                , Join InnerJoin []
                 , [((), n)]) GR.&
                 GR.delEdges [(x, n), (y, n)] g
             other ->

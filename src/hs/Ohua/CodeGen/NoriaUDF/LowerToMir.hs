@@ -73,7 +73,7 @@ data SerializableGraph =
     SerializableGraph
         { adjacencyList :: AdjList Mir.Node
         , sink :: (Word, [Mir.Column])
-        , sources :: [(Word, Int, [Mir.Column])]
+        , sources :: [[Mir.Column]]
         }
     deriving (Show)
 
@@ -98,14 +98,15 @@ quickDumpGrAsDot ::
        , MonadIO m
        , MonadLogger m
        )
-    => FilePath
+    => Binding
+    -> FilePath
     -> g a b
     -> m ()
 quickDumpGrAsDot =
-    \f g -> do
-        let dir = ".graphs"
+    \entrypoint f g -> do
+        let dir = "." <> toString (unwrap entrypoint) <> "-graphs"
         i <- atomicModifyIORef' graphDumpIndex (\i -> (succ i, i))
-        let file = ".graphs" FS.</> show i <> "-" <> f
+        let file = dir FS.</> show i <> "-" <> f
         liftIO $ do
             FS.createDirectoryIfMissing False dir
             LT.writeFile file .
@@ -438,40 +439,42 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
 -- - Incorporate indices from previously compiled udfs
 annotateAndRewriteQuery ::
        (MonadLogger m, MonadIO m)
-    => GeneratedMirNodes
+    => Binding
+    -> GeneratedMirNodes
     -> (Operator -> Maybe ExecSemantic)
     -> DFGraph.OutGraph
     -> m (TypeMap, Gr Operator ())
-annotateAndRewriteQuery gMirNodes getExecSemantic graph = do
-    quickDumpGrAsDot "graph-with-edge-indices.dot" $
+annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
+    quickDumpGr "graph-with-edge-indices.dot" $
         flip GR.gmap iGr00 $ \(ins, n, l, outs) ->
             let strip = map $ first $ quickRender
              in ( strip ins
                 , n
                 , show n <> " " <> either quickRender quickRender l
                 , strip outs)
-    quickDumpGrAsDot "ctrl-removed.dot" $ printableLabelWithTypes ctrlRemoved
+    quickDumpGr "ctrl-removed.dot" $ printableLabelWithTypes ctrlRemoved
     debugLogGR "Initial Graph" iGr
-    quickDumpGrAsDot "initial-graph.dot" $ printableLabelWithTypes iGr
+    quickDumpGr "initial-graph.dot" $ printableLabelWithTypes iGr
     -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
     -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) ctrlRemoved
     let udfSequentialized = sequentializeScalars getExecSemantic iGr
     --ctrlRemoved
-    quickDumpGrAsDot "scalars-sequentialized.dot" $
+    quickDumpGr "scalars-sequentialized.dot" $
         printableLabelWithTypes udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
-    quickDumpGrAsDot "annotated-and-reduced-ohua-graph.dot" $
+    quickDumpGr "annotated-and-reduced-ohua-graph.dot" $
         mkLabelsPrintable gr3
     let gr2 = removeSuperfluousOperators gr3
-    quickDumpGrAsDot "superf-removed.dot" $ printableLabelWithIndices gr2
+    quickDumpGr "superf-removed.dot" $ printableLabelWithIndices gr2
     let whereMerged = joinWhereMerge (fst . getType) gr2
-    quickDumpGrAsDot "join-where-merged.dot" $
+    quickDumpGr "join-where-merged.dot" $
         printableLabelWithTypes whereMerged
     pure (typeMap, whereMerged)
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
   where
+    quickDumpGr = quickDumpGrAsDot entrypoint
     printableLabelWithIndices ::
            (GR.DynGraph gr, PP.Pretty a) => gr a b -> gr Text Text
     printableLabelWithIndices =
@@ -719,12 +722,7 @@ instance ToRust SerializableGraph where
                in PP.tupled [pretty n, "vec!" <> PP.list (encodeCols idxs)]
             , "sources" ~> "vec!" <>
               PP.list
-                  (map (\(i, i2, s) ->
-                            PP.tupled
-                                [ pretty i
-                                , pretty i2
-                                , "vec!" <> PP.list (encodeCols s)
-                                ]) $
+                  (map (\s -> "vec!" <> PP.list (encodeCols s)) $
                    sources graph)
             ]
       where
@@ -744,7 +742,7 @@ instance ToRust SerializableGraph where
             \case
                 Mir.ConstantValue v ->
                     "Value::Constant" <> PP.parens (encodeValueConstant v)
-                Mir.ColumnValue c -> "Value::Column" <> PP.parens (encodeCol c)
+                Mir.ColumnValue c -> "Value::Column" <> PP.parens (pretty c)
         encodeValueConstant =
             ("DataType::" <>) . \case
                 NumericLit n -> "Int" <> PP.parens (pretty n)
@@ -789,7 +787,7 @@ instance ToRust SerializableGraph where
         ppVec l = "vec!" <> PP.list l
         encodeCol Mir.Column {..} =
             "Column::new" <>
-            PP.tupled [encodeOpt pretty table, PP.dquotes $ pretty name]
+            PP.tupled [encodeOpt (\t -> "&tables" <> PP.brackets (pretty t)) table, PP.dquotes $ pretty name]
         encodeCols = map encodeCol
 
 completeOutputColsFor :: OpMapEntry -> [Mir.Column]
@@ -860,10 +858,14 @@ calcColumns cOpOut gr = colmap
             ]
 
 toSerializableGraph ::
-       MonadLogger m => (Operator -> Maybe ExecSemantic) -> TypeMap -> OperatorGraph -> m SerializableGraph
-toSerializableGraph execSemMap tm mg = do
+       ( MonadLogger m, MonadIO m ) => Binding -> (Operator -> Maybe ExecSemantic) -> TypeMap -> OperatorGraph -> m SerializableGraph
+toSerializableGraph entrypoint execSemMap tm mg = do
     $(logDebug) "Calculated Columns"
     $(logDebug) $ showT actualColumn
+    quickDumpGrAsDot entrypoint "serializable.dot" $
+        flip GR.gmap mg $ \(ins, n, l, outs) ->
+            let strip = map $ first $ const ( "" :: Text )
+             in (strip ins, n, show n <> " " <> quickRender l <> "\n" <> quickRender (map someColToMirCol $ actualColumn IM.! n), strip outs)
     adjacencies <-
         sequence
             [ (, map someColToMirCol cols, map (toNIdx . snd) ins) <$>
@@ -885,7 +887,21 @@ toSerializableGraph execSemMap tm mg = do
                 Join {joinType, joinOn }
                     | joinType /= InnerJoin -> unimplemented
                     | otherwise ->
-                    let (map someColToMirCol -> left, map someColToMirCol -> right) = unzip joinOn in
+                    let containsCols n cols = all (`elem` (actualColumn IM.! n)) cols
+                        (l, r) = unzip joinOn
+                        [lp, rp] = map snd ins
+                        lpHasL = containsCols lp l
+                        rpHasL = containsCols rp l
+                        lpHasR = containsCols lp r
+                        rpHasR = containsCols rp r
+                        (map someColToMirCol -> left, map someColToMirCol -> right) = if
+                            | lpHasL && lpHasR && rpHasR && rpHasL -> error $ "Ambiguous columns in join " <> quickRender op
+                            | lpHasL && rpHasR -> (l, r)
+                            | lpHasR && rpHasL -> (r, l)
+                            | not (lpHasL || rpHasL) -> error $ "Left join columns not found"
+                            | not (rpHasR || lpHasR) -> error $ "Right join columns not found"
+                            | otherwise -> error $ "impossible " <> show (lpHasL, rpHasL, lpHasR, rpHasR)
+                    in
                         pure Mir.Join { mirJoinProject = mirCols, left , right }
                 Project _ -> pure $ Mir.Identity mirCols
                 Identity -> pure $ Mir.Identity mirCols
@@ -893,7 +909,12 @@ toSerializableGraph execSemMap tm mg = do
                 Source {} -> error "impossible"
                 Filter f _ -> do
                     conds <- traverse getCondition cols
-                    pure $ Mir.Filter {conditions = conds}
+                    pure $ Mir.Filter { conditions = map (fmap $ \(Mir.Comparison op val) -> Mir.Comparison op $ case val of
+                                                                 Mir.ColumnValue v ->
+                                                                     let Just c = List.elemIndex (Right v) cols
+                                                                     in Mir.ColumnValue (fromIntegral c)
+                                                                 Mir.ConstantValue v -> Mir.ConstantValue v
+                                                         ) conds }
                     where getCondition c =
                               case HashMap.lookup c f of
                                   Nothing
@@ -918,14 +939,14 @@ toSerializableGraph execSemMap tm mg = do
                 , sink =
                       let [(s, _, l)] = GR.inn mg $ fst sink
                        in (toNIdx s, completeOutputColsFor s)
-                , sources = sources
+                , sources = map (^. _3) sources
                 }
     $(logDebug) "Serializable Graph:"
     $(logDebug) $ showT sgr
     pure sgr
   where
     completeOutputColsFor = map someColToMirCol . (actualColumn IM.!)
-    sources =
+    sources = sortOn (^. _1)
         [ (idx, s, completeOutputColsFor s)
         | (s, Source idx) <- GR.labNodes mg
         ]
@@ -934,7 +955,7 @@ toSerializableGraph execSemMap tm mg = do
         zip
             [0 ..] -- new indices corresponding to index in this list
             (fst sink : -- sink node will be inserted first from noria
-              map (^. _2) (sortOn (^. _1) sources) -- then follow all base tables
+              map (^. _2) sources -- then follow all base tables
               ++
               nonSinkSourceNodes)
     toNIdx :: Int -> Word
@@ -978,9 +999,9 @@ generate compiledNodes CodeGenData {..} = do
     let udfMap = HashMap.fromList $ map (\d -> (udfName d, d)) udfs
         getUdf b = HashMap.lookup b udfMap
         getExecSemantic = execSemOf getUdf
-    (typeMap, iGr) <- annotateAndRewriteQuery (HashMap.fromList mirNodes) getExecSemantic graph
+    (typeMap, iGr) <- annotateAndRewriteQuery (entryPoint ^. name) (HashMap.fromList mirNodes) getExecSemantic graph
     tpl <- loadNoriaTemplate "udf_graph.rs"
-    serializableGraph <- toSerializableGraph getExecSemantic typeMap iGr
+    serializableGraph <- toSerializableGraph (entryPoint ^. name) getExecSemantic typeMap iGr
     let subs = ["graph" ~> [renderDoc $ asRust $ serializableGraph]]
     tpl' <-
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs

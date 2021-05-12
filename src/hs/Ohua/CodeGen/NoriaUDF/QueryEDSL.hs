@@ -20,7 +20,7 @@ pattern BuiltinFunE b <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang
 
 data Conjunction = And | Or deriving (Show, Eq, Ord)
 
-data Condition = Comp (Either Column Mir.Column, Mir.FilterCondition ) | Conj Conjunction Condition Condition
+data Condition = Comp (Either Column Mir.Column, Mir.FilterCondition Mir.Column) | Conj Conjunction Condition Condition
     deriving (Show, Eq, Generic)
 
 instance Plated.Plated Condition where
@@ -29,7 +29,7 @@ instance Plated.Plated Condition where
 exprToMirCondition ::
     Binding
     -> Expr
-    -> OhuaM env (HashMap.HashMap (Either Column Mir.Column) Mir.FilterCondition, [Binding])
+    -> OhuaM env (HashMap.HashMap (Either Column Mir.Column) ( Mir.FilterCondition Mir.Column), [Binding])
 exprToMirCondition tab (Lambda table body) =
     pure $ first HashMap.fromList $ runWriter $ fmap andToList $ f body
   where

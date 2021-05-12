@@ -85,7 +85,7 @@ data Operator
     | Identity
     | Sink
     | Source Word
-    | Filter { conditions :: HashMap SomeColumn Mir.FilterCondition, arguments :: (Binding, [Binding]) }
+    | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
     deriving (Show, Eq, Generic)
 
 -- instance Hashable Operator

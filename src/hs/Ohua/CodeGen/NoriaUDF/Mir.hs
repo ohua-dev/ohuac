@@ -59,31 +59,31 @@ deMorganOp = \case
     GreaterOrEqual -> Less
 
 
-data Value
-    = ColumnValue Column
+data Value col
+    = ColumnValue col
     | ConstantValue Lit
     deriving (Show, Eq, Generic)
 
-instance Pretty Value where
+instance Pretty col => Pretty ( Value col) where
     pretty = \case
         ColumnValue c -> pretty c
         ConstantValue v -> pretty v
 
-instance Hashable Value
+instance Hashable col => Hashable ( Value col )
 
-instance NFData Value
+instance NFData col => NFData ( Value col )
 
-data FilterCondition =
-    Comparison Operator Value
+data FilterCondition col =
+    Comparison Operator ( Value col)
     deriving (Show, Eq, Generic)
 
-instance Pretty FilterCondition where
+instance Pretty col => Pretty ( FilterCondition col ) where
     pretty (Comparison op v) =
         pretty op <+> pretty v
 
-instance Hashable FilterCondition
+instance Hashable col => Hashable (FilterCondition col)
 
-instance NFData FilterCondition
+instance NFData col => NFData ( FilterCondition col )
 
 data Node
     = Regular
@@ -98,6 +98,6 @@ data Node
           }
     | Identity [Column]
     | Filter
-          { conditions :: [Maybe FilterCondition]
+          { conditions :: [Maybe ( FilterCondition Word )]
           }
   deriving (Show)

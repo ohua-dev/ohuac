@@ -18,6 +18,7 @@ import qualified Data.HashSet as HashSet
 import qualified Data.IntMap as IM
 import qualified Data.List as List
 import Data.Maybe (fromJust)
+import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LT
 import qualified Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Lazy.IO as LT
@@ -392,6 +393,10 @@ joinWhereMerge ::
        (GR.DynGraph gr, gr Operator () ~ g) => (GR.Node -> [NType]) -> g -> g
 joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
   where
+    -- | If there are multiple join columns choose one, because Noria does not yet support multi condition join.
+    -- This choice is ... well it looks if one of the columns mentions an `id`. Yeah, its stupid and fragile but hey...
+    chooseAJoinCol = pure . maximumBy (compare `on` \(_, (c1, c2) ) -> hasId c1 $ hasId c2 0)
+      where hasId = \case Right r | "id" `Text.isSuffixOf` Mir.name r -> succ; _ -> id
     f g =
         \case
             (n, Join jt []) ->
@@ -405,7 +410,8 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
                             Right c -> Mir.table c == Just t
                             _ -> False
                     (rem, cols) =
-                        unzip
+                        unzip $
+                        chooseAJoinCol
                             [ (sc1, (c1, c2))
                             | (sc1, Mir.Comparison Mir.Equal (Mir.ColumnValue (Right -> v))) <-
                                   HashMap.toList conds

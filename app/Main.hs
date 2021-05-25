@@ -4,7 +4,7 @@ module Main where
 
 import Ohua.Prelude
 
-import Control.Lens (Index, IxValue, Ixed, (^?), (^?!), _Just, ix, view)
+import Control.Lens (Index, IxValue, Ixed, (^?), (^?!), _Just, ix, view, each)
 import Data.Aeson as A
 import qualified Data.ByteString.Lazy.Char8 as L (writeFile)
 import qualified Data.Char as C (toLower)
@@ -158,27 +158,71 @@ getNameSuggest = \case
     JsonGraph -> JSONGen.suggestName
     SimpleJavaClass -> JavaGen.suggestName
 
+data PackageHook = PackageHook PreResolveHook
+data PackageCodeGen = PackageCodeGen CodeGen
+
+configureForBackend ::
+    (?copts :: CommonCmdOpts, MonadIO m, MonadLogger m, Ixed map, Index map ~ Binding, IxValue map ~ FunAnn (TyExpr SomeBinding), Monad f)
+    => BuildOpts
+    -> Maybe map
+    -> CodeGenSelection
+    -> m (PackageHook, CustomPasses env, Expr -> f (Int, Expr), PackageCodeGen)
+configureForBackend BuildOpts {..} mainAnns = \case
+    NoriaUDF -> do
+        udfs <- newIORef []
+        let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
+        let (streamAnn:_) =
+                argTypes $ mainAnns ^?! _Just . ix entrypoint
+            (ftys, constr) =
+                RS.para
+                    (\case
+                          TyAppF (_, (tys, f)) (ty, _) -> (ty : tys, f)
+                          TyRefF r -> ([], r))
+                    streamAnn
+            Just formatter = Prelude.lookup "rust" langs
+            fields =
+                IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
+        pure ( PackageHook $ NoriaUDFGen.preResolveHook addUdf
+              , defWithCleanUnit
+                { passBeforeNormalize = NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
+                , passAfterNormalize =
+                  NoriaUDFGen.generateOperators fields addUdf
+                }
+              , pure . mainToEnv
+              , PackageCodeGen $ \dat -> do
+                      udfs' <- readIORef udfs
+                      NoriaUDFGen.extraOperatorProcessing sandbox udfs'
+                      NoriaUDFGen.generate udfs' dat)
+    JsonGraph -> pure (PackageHook pure, defWithCleanUnit, pure . mainToEnv, PackageCodeGen JSONGen.generate )
+    SimpleJavaClass -> pure (PackageHook pure, defWithCleanUnit, pure . mainToEnv, PackageCodeGen JavaGen.generate )
+  where
+    defWithCleanUnit = def { passAfterDFLowering = cleanUnits }
+    CommonCmdOpts {..} = ?copts
+
 runBuild ::
        (?copts :: CommonCmdOpts)
     => BuildOpts
     -> ProcFun (HashMap Binding Expr) ()
-runBuild BuildOpts { outputFormat
-                   , useStdlib
-                   , stageHandlingOpt
-                   , extraFeatures
-                   , sandbox
-                   } modTracker mainAnns rawMainMod getMain = do
+runBuild bo@BuildOpts { outputFormat
+                      , useStdlib
+                      , stageHandlingOpt
+                      , extraFeatures
+                      , sandbox
+                      } modTracker mainAnns rawMainMod getMain = do
     abortIfUnchanged inputModuleFile outputPath0
     when useStdlib $ void $ insertDirectly modTracker stdlib
     let present =
             map (\(ns, i) -> show $ PP.pretty ns <> PP.tupled (map PP.pretty i))
      in do logDebugN $ unlines $ "Algos:" : present (rawMainMod ^. algoImports)
            logDebugN $ unlines $ "Sfs:" : present (rawMainMod ^. sfImports)
+    (preResHook, passes, handleMainArgs, PackageCodeGen gen) <- configureForBackend bo mainAnns outputFormat
     mainMod <-
-        let ?env = ResolutionEnv
-                {modTracker = modTracker, preResolveHook = pure}
+        let ?env = case preResHook of
+                       PackageHook h -> ResolutionEnv
+                           {modTracker = modTracker, preResolveHook = h}
          in registerAnd (rawMainMod ^. name) $ loadDepsAndResolve rawMainMod
-    expr' <- getMain $ mainMod ^. decls
+    modMap <- readIORef modTracker
+    expr' <- inlineAlgos modMap =<< getMain (each %~ view Ohua.Prelude.value $ mainMod ^. decls)
     let expr =
             case expr'
                                -- FIXME this is technically not correct for edge cases
@@ -186,36 +230,6 @@ runBuild BuildOpts { outputFormat
                 Lambda "_" body -> body
                 e -> e
     let sfDeps = gatherSFDeps expr
-    let defWithCleanUnit = def { passAfterDFLowering = cleanUnits }
-    (passes, handleMainArgs, gen) <-
-        case outputFormat of
-            NoriaUDF -> do
-                udfs <- newIORef []
-                let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
-                let (streamAnn:_) =
-                        argTypes $ mainAnns ^?! _Just . ix entrypoint
-                    (ftys, constr) =
-                        RS.para
-                            (\case
-                                 TyAppF (_, (tys, f)) (ty, _) -> (ty : tys, f)
-                                 TyRefF r -> ([], r))
-                            streamAnn
-                    Just formatter = Prelude.lookup "rust" langs
-                    fields =
-                        IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
-                pure ( defWithCleanUnit
-                       { passBeforeNormalize = NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
-                       , passAfterNormalize =
-                         NoriaUDFGen.generateOperators fields addUdf
-                       }
-                     , pure . mainToEnv
-                     , \dat -> do
-                             udfs' <- readIORef udfs
-                             liftIO . L.writeFile (toString $ unwrap entrypoint <> ".json") =<< JSONGen.generate dat
-                             NoriaUDFGen.extraOperatorProcessing sandbox udfs'
-                             NoriaUDFGen.generate udfs' dat)
-            JsonGraph -> pure (defWithCleanUnit, pure . mainToEnv, JSONGen.generate )
-            SimpleJavaClass -> pure (defWithCleanUnit, pure . mainToEnv, JavaGen.generate )
     (mainArity, completeExpr) <- handleMainArgs expr
     gr <-
         compile
@@ -261,7 +275,10 @@ withCommonSetup ::
 withCommonSetup f =
     runCompM logLevel $ do
         modTracker <- newIORef mempty
-        (mainAnns, rawMainMod) <- readAndParse inputModuleFile
+        rawMainMod <- readAndParse inputModuleFile
+        let mainAnns =
+                let m = HashMap.mapMaybe (typeAnn . view Ohua.Prelude.annotation) ( rawMainMod ^. decls ) in
+                    if HashMap.null m then Nothing else Just m
         let getMain ::
                    (Ixed m, Index m ~ Binding, MonadError Error mo)
                 => m

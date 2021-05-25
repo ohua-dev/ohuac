@@ -237,6 +237,7 @@ typeGraph udfs envInputs g = m
                             | b `elem`
                                   (["lt", "gt", "eq", "and", "or", "leq", "geq"] :: Vector Binding) ->
                                 likeUdf
+                            | otherwise -> error $ "Unknown builtin function " <> quickRender bnd
                 | QualifiedBinding ["ohua", "lang", "field"] f <- bnd ->
                     pure $
                     case fromIndex (Just 1) 0 of
@@ -349,16 +350,16 @@ sequentializeScalars ::
     -> g
 sequentializeScalars mGetSem g0 = gFoldTopSort f g0
   where
-    getSem l = fromMaybe (error $ "No semantic for " <> quickRender l) $ mGetSem l
+    getSem = mGetSem
     tc = GR.tc g0
     f g' ctx@(ins, n, l, outs)
-        | (One, One) <- getSem l
+        | Just (One, One) <- getSem l
         , [(_, p)] <- ins
         , (Just (pins, _, plab, pouts), g'') <- GR.match p g'
-        , One <- snd (getSem plab) =
+        , Just (_, One) <- getSem plab =
             (ins, n, l, prune $ pouts ++ outs) GR.&
             ((pins, p, plab, []) GR.& g'')
-        | (_, Many) <-  getSem l = g
+        | Just (_, Many) <-  getSem l = g
         | null prunedOuts = g
         | otherwise = (ins, n, l, prunedOuts) GR.& g'
       where
@@ -611,6 +612,7 @@ retype3 m ty other@(QualifiedBinding namespace name) =
             | name `elem`
                   (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
                 CustomOp other (map toCol ty)
+            | name == "id" -> Identity
             | otherwise -> CustomOp other []
         ["ohua", "lang", "field"] -> CustomOp other []
         _ ->

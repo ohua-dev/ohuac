@@ -304,7 +304,7 @@ generate CodeGenData {..} =
     className = Ident classNameStr
     retId = succ $ maximum $ map operatorId $ operators graph
     enumerateArgs = map unsafeMake [0 .. entryPointArity - 1]
-    entryPointAnnotations = annotations >>= HM.lookup (entryPoint ^. name)
+    entryPointAnnotations = annotations >>= HM.lookup ( entryPoint ^. name)
     returnType =
         case entryPointAnnotations of
             Nothing -> Just objectType

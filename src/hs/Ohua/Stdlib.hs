@@ -21,7 +21,7 @@ import Ohua.Compat.ML.Parser (parseMod)
 
 #if WITH_STDLIB
 #if WITH_ML_PARSER
-stdlib :: Namespace Expression
+stdlib :: ResolvedNamespace
 stdlib =
     $(let ifacem = mempty -- TODO check this is correct
           stdlibFileName = "src/ohuac/ohua/std.ohuaml"
@@ -31,7 +31,7 @@ stdlib =
              let flang = parseMod bytes
              ns <- fmap (either error id) $ runExceptT $ do
                  alang <- runGenBndT (foldMapOf (decls . traverse) definedBindings flang) $ (decls . traverse) toAlang flang
-                 resolveNS ifacem alang
+                 resolveNS ifacem $ unannotatedNS alang
              TH.lift  ns)
 #else
 stdlib ::

@@ -22,6 +22,7 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , rewriteQueryExpressions
     , mainArgsToTableRefs
     , rewriteFieldAccess
+    , preResolveHook
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -29,7 +30,7 @@ import Ohua.Prelude hiding (First, Identity)
 import Control.Arrow ((***))
 import Control.Category ((>>>))
 import Control.Comonad (extract)
-import Control.Lens (Simple, (%=), (<>=), (^..), (^?!), ix, to, use)
+import Control.Lens (Simple, (%=), (<>=), (^..), (^?!), ix, to, use, non, at, _Just, cons, itraverse, each, _3)
 import Control.Monad.RWS (runRWST)
 import Control.Monad.Writer (runWriterT, tell)
 import qualified Data.Foldable
@@ -46,15 +47,17 @@ import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 import Data.Traversable (for)
-import Ohua.Standalone (PreResolveHook)
 import Prelude ((!!))
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
 import System.Directory (makeAbsolute)
 import qualified System.IO.Temp as Temp
 
+import Ohua.Standalone (RawDecl,PreResolveHook, CombinedAnn(..), RawNamespace)
 import Ohua.ALang.Lang
+import qualified Ohua.Frontend.Lang as Fr
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
+import Ohua.Compat.Clike.Types
 import qualified Ohua.ALang.Passes as ALang (normalize)
 import qualified Ohua.ALang.Refs as ALang
 import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply)
@@ -657,6 +660,62 @@ pattern GenFuncsNamespace :: NSRef
 pattern GenFuncsNamespace <- ["ohua", "generated"]
   where GenFuncsNamespace = ["ohua", "generated"]
 
+toSQLType :: TyExpr SomeBinding -> Text
+toSQLType (TyRef (Unqual b)) | b == "i32" = "Int(32)"
+                             | b == "i64" = "Int(64)"
+                             | b == "bool" = "Tinyint"
+toSQLType t = error $ "No SQL equivalent known for type " <> show t
+
+preResolveHook :: (MonadIO m, MonadError Error m, MonadLogger m) => RegisterOperator -> RawNamespace -> m RawNamespace
+preResolveHook registerOp r = runGenBndT mempty $ do
+    logDebugN $ "Hook is running for " <> quickRender ( r ^. name )
+    (newDecls, toTransform) <- runWriterT $ itraverse finder (r^.decls)
+    forM_ toTransform $ \(source, oldName, udfName) -> do
+        let function = QualifiedBinding (r^.name) oldName
+            Fr.LamE pats fbody = source ^. value
+            args = map (\(Fr.VarP v) -> v) pats
+        let fieldIndices = [0 .. length args - 1]
+            accessedFields = map ("none", ) fieldIndices
+            opGen =
+                TemplateSubstitution
+                "pure/op.rs"
+                (generatedOpSourcePath udfName) $
+                baseUdfSubMap udfName "r" accessedFields <>
+                [ "function" ~>
+                    [ renderDoc $ pretty $
+                        foldr' (\(t, a, i) -> Fr.LetE ( Fr.VarP a ) $ Fr.VarE $ unsafeMake $ renderDoc $
+                                   maybe (<> ".into()") (\t' o -> "Into::<" <> pretty (Annotated False t') <> ">::into" <> PP.parens o) t $
+                                   "r[self." <> pretty (idxPropFromName i) <>
+                                   "].clone()")
+                        fbody
+                        $ reverse $ zip3 (maybe (repeat Nothing) (map Just . NS.argTypes) $ typeAnn $ source ^. annotation) args accessedFields
+                    ]
+                , "udf-ret-type" ~> [("SqlType::" <>) $ toSQLType $ fromMaybe (error $ "type for " <> unwrap oldName <> " unknown") (source ^? annotation . to typeAnn . _Just . to NS.retType)]
+                ]
+        lift $ liftIO $ registerOp $
+                  Op_UDF $ UDFDescription
+                      { udfName = udfName
+                      , inputBindings = args
+                      , udfState = Nothing
+                      , referencedFields = fieldIndices
+                      , generations = [opGen]
+                      , execSemantic = SimpleSem
+                      }
+    logDebugN $ "New declared functions " <> T.unlines (map (\(k, v) -> unwrap k <> " = " <> quickRender (v ^. value)) $ HashMap.toList newDecls)
+    pure $ r & NS.sfImports %~ cons (GenFuncsNamespace, toTransform & each %~ view (_3 . name)) & NS.decls .~ newDecls
+  where
+    finder nam a | any (\case Fr.LitE (FunRefLit (FunRef (QualifiedBinding ["ohua", "noria_integration"] "make_udf") _)) -> True; _ -> False) (genericAnn ann) = do
+                       let newFnName = unsafeMake $ T.intercalate "_" (map unwrap $ unwrap $ r^.name) <> "_" <> unwrap nam
+                           newName = QualifiedBinding GenFuncsNamespace newFnName
+                       logDebugN $ "Found candidate " <> unwrap nam
+                       tell $ asList [(a, nam, newName)]
+                       pure $ a & annotation .~ ann { genericAnn = [] } & value .~ Fr.LitE (FunRefLit (FunRef newName Nothing))
+                 | otherwise = pure a
+      where ann = a ^. annotation
+
+
+asList :: [a] -> [a]
+asList = id
 
 rewriteQueryExpressions :: RegisterOperator -> Expr -> OhuaM env Expr
 rewriteQueryExpressions register e = do

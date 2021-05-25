@@ -315,15 +315,16 @@ gFoldTopSort f g =
         g
         (GR.topsort g)
 
+
 inlineCtrl ::
        (GR.DynGraph gr)
     => (GR.Node -> [NType])
     -> gr Operator (Int, Int)
     -> gr Operator (Int, Int)
 inlineCtrl getType =
-    gFoldTopSort $ \g ->
-        \case
-            (ins, n, CustomOp l _, outs)
+    gFoldTopSort $ \g ctx@(ins, n, lab, outs) ->
+        case lab of
+            CustomOp l _
                 | l == Refs.ctrl ->
                     let ts = getType n
                         idxmap =
@@ -331,17 +332,45 @@ inlineCtrl getType =
                                 [ (idx, (p, out, ts Prelude.!! idx))
                                 | ((out, pred -> idx), p) <- ins
                                 ]
-                        (ctxSource, _, _) = idxmap IM.! (-1)
-                     in flip GR.insEdges g $
-                        outs >>= \((out, in_), j) ->
-                            let (np, nout, t) = idxmap IM.! out
-                             in case t of
-                                    NTSeq _ -> [(np, j, (nout, in_))]
-                                    _ ->
-                                        [ (np, ctxSource, (nout, minBound))
-                                        , (ctxSource, j, (maxBound, in_))
-                                        ]
-            ctx -> ctx GR.& g
+                        (ctxSource, ctxSourceOutIdx, _) = idxmap IM.! (-1)
+                        Just ctxSourceLab = GR.lab g ctxSource in
+                     case ctxSourceLab of
+                         CustomOp ctxL _
+                             | ctxL == Refs.smap ->
+                                 flip GR.insEdges g $
+                                 outs >>= \((out, in_), j) ->
+                                              let (np, nout, t) = idxmap IM.! out
+                                              in case t of
+                                                  NTSeq _ -> [(np, j, (nout, in_))]
+                                                  _ ->
+                                                      [ (np, ctxSource, (nout, minBound))
+                                                      , (ctxSource, j, (maxBound, in_))
+                                                      ]
+                             | ctxL == Refs.ifThenElse ->
+                               let theCol = InternalColumn {producingOperator = ctxSource, outputIndex = ctxSourceOutIdx}
+                                   theVal = case ctxSourceOutIdx of
+                                                0 -> 1
+                                                1 -> 0
+                                                other -> error $ "Unexpected if output column for node " <> show ctxSource <> " expected 0 or 1, got " <> show other
+                               in
+                                   (ins, n, Filter {conditions = [(Left theCol, Mir.Comparison Mir.Equal (Mir.ConstantValue $ NumericLit theVal))]} , outs ) GR.& g
+            _ -> ctx GR.& g
+
+selectToUnion ::
+       (GR.DynGraph gr, gr Operator () ~ g)
+    => (Operator -> Maybe ExecSemantic)
+    -> g
+    -> g
+selectToUnion = GR.gmap $ \(ins, n, l, outs) ->
+    case l of
+        CustomOp o _
+            | o == Refs.select ->
+                  ( filter (\(l, op) -> snd l == 0) ins
+                  , n
+                  , Union
+                  , outs
+                  )
+        _ -> (ins, n, l, outs)
 
 sequentializeScalars ::
        (GR.DynGraph gr, gr Operator () ~ g)
@@ -464,18 +493,28 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     quickDumpGr "initial-graph.dot" $ printableLabelWithTypes iGr
     -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
     -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) ctrlRemoved
+
     let udfSequentialized = sequentializeScalars getExecSemantic iGr
-    --ctrlRemoved
     quickDumpGr "scalars-sequentialized.dot" $
         printableLabelWithTypes udfSequentialized
-    let gr3 = multiArcToJoin2 udfSequentialized
+
+    let selectRemoved = selectToUnion udfSequentialized
+    quickDumpGr "select-removed.dot" $
+        mkLabelsPrintable selectRemoved
+
+    let gr3 = multiArcToJoin2 selectRemoved
     quickDumpGr "annotated-and-reduced-ohua-graph.dot" $
         mkLabelsPrintable gr3
+
     let gr2 = removeSuperfluousOperators gr3
     quickDumpGr "superf-removed.dot" $ printableLabelWithIndices gr2
+
     let whereMerged = joinWhereMerge (fst . getType) gr2
-    quickDumpGr "join-where-merged.dot" $
+    quickDumpGr "join-where-merged-with-types.dot" $
         printableLabelWithTypes whereMerged
+    quickDumpGr "join-where-merged.dot" $
+        mkLabelsPrintable whereMerged
+
     pure (typeMap, whereMerged)
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
@@ -582,12 +621,9 @@ removeSuperfluousOperators g =
              let rem =
                      case l of
                          CustomOp c _
-                             | QualifiedBinding ["ohua", "lang"] b <- c ->
-                                 b `elem`
-                                 (["smapFun", "collect", "nth"] :: Vector Binding)
-                             | otherwise ->
-                                 c ^. namespace == ["ohua", "lang", "field"] ||
-                                 c == "ohua.sql.query/group_by"
+                             c ^. namespace == ["ohua", "lang", "field"] ||
+                             c == "ohua.sql.query/group_by" ||
+                             c `elem` ([Refs.smapFun, Refs.collect, Refs.nth, Refs.ifThenElse] :: Vector Binding)
                          _ -> False
               in if rem
                      then let [newNode] = GR.pre g n
@@ -681,22 +717,25 @@ retype3 m ty other@(QualifiedBinding namespace name) =
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
   where
-    f g (_, Join {}) = g
     f g (n, lab) =
-        case GR.pre g n of
-            [] -> g
-            [_] -> g
-            [x, y] ->
-                ( [((), x), ((), y)]
-                , Prelude.head $ GR.newNodes 1 g
-                , Join InnerJoin []
-                , [((), n)]) GR.&
-                GR.delEdges [(x, n), (y, n)] g
-            other ->
-                error $
-                "Multiple ancestors for " <>
-                show n <>
-                " (" <> show lab <> ") a bit unexpected " <> show other
+        case lab of
+            Join {} -> g
+            Union -> g
+            _ ->
+                case GR.pre g n of
+                    [] -> g
+                    [_] -> g
+                    [x, y] ->
+                        ( [((), x), ((), y)]
+                        , Prelude.head $ GR.newNodes 1 g
+                        , Join InnerJoin []
+                        , [((), n)]) GR.&
+                        GR.delEdges [(x, n), (y, n)] g
+                    other ->
+                        error $
+                        "Multiple ancestors for " <>
+                        show n <>
+                        " (" <> show lab <> ") a bit unexpected " <> show other
 
 -- UDF {
 --     function_name: String,

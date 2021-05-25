@@ -2,9 +2,10 @@ resolver: lts-12.10
 packages:
 - .
 - ../ohua-core/core/
+- ../alang-clike-parser
 extra-deps:
-- github: ohua-dev/alang-clike-parser
-  commit: 8d46028ce8c697f7fd8bb2b7bfc9259c961effd7
+# - github: ohua-dev/alang-clike-parser
+#   commit: 8d46028ce8c697f7fd8bb2b7bfc9259c961effd7
 - github: ohua-dev/alang-sexpr-parser
   commit: fdc81f8c8c2fef63e7a306c2a323e3919b0d88ca
 - github: ohua-dev/alang-ml-parser

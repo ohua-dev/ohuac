@@ -83,6 +83,7 @@ data Operator
     | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
     | Project [SomeColumn]
     | Identity
+    | Union
     | Sink
     | Source Word
     | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
@@ -94,6 +95,7 @@ instance NFData Operator
 
 instance PP.Pretty Operator where
     pretty = \case
+        Union -> "⋃"
         Filter conds _ ->
             "σ" <+>
             PP.list

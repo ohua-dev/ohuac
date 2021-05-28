@@ -17,6 +17,7 @@ import Control.Monad.Writer
 import qualified Control.Lens.Plated as Plated
 
 pattern BuiltinFunE b <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang"] b) _))
+pattern FieldE f <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] f) _))
 
 data Conjunction = And | Or deriving (Show, Eq, Ord)
 
@@ -35,22 +36,21 @@ exprToMirCondition tab (Lambda table body) =
   where
     mkE :: (HasCallStack , Pretty a) => a -> b
     mkE t = error $ "Cannot convert \"" <> quickRender t <> "\" in " <> quickRender body
-    toVal (Var v `BindState` Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] n) _))) = do
+    toVal (Var v `BindState` FieldE n) = do
         v' <- if (v == table)
             then pure tab
             else tell [v] >> pure v
-        pure $ Mir.ColumnValue (Mir.Column (Just $ unwrap v') (unwrap n))
+        pure $ Mir.ColumnValue (Mir.Column (Just $ Mir.TableByName $ unwrap v') (unwrap n))
     toVal (Lit l) = pure $ Mir.ConstantValue l
     toVal other = mkE other
     flipOp =
         \case
             Mir.Equal -> Mir.Equal
+            Mir.NotEqual -> Mir.NotEqual
             other -> Mir.deMorganOp other -- Not sure this is actually true, I'm just lazy
     f (BuiltinFunE b `Apply` left `Apply` right)
-        | b == "and" = do
-              l <- f left
-              r <- f right
-              pure $ Conj And l r
+        | Just conj <- (case b of "and" -> Just And; "or" -> Just Or; _ -> Nothing) =
+              Conj conj <$> f left <*> f right
         | otherwise = do
               vl <- toVal left
               vr <- toVal right
@@ -68,6 +68,7 @@ exprToMirCondition tab (Lambda table body) =
                           "eq" -> Mir.Equal
                           "neq" -> Mir.NotEqual
                           "geq" -> Mir.GreaterOrEqual
+                          "gt" -> Mir.Greater
                           "lt" -> Mir.Less
                           "leq" -> Mir.LessOrEqual
                           other -> error $ "Unknown operator " <> quickRender other
@@ -117,6 +118,6 @@ rewriteFieldAccess :: Expr -> OhuaM env Expr
 rewriteFieldAccess = pure . t
   where
     t = rewrite $ \case
-        BindState s f@(Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] _) Nothing))) ->
+        BindState s f@(FieldE _) ->
             Just $ f `Apply` s
         _ -> Nothing

@@ -12,7 +12,7 @@ import qualified Data.HashMap.Strict as HashMap
 data NType
     = NTSeq NType
     | NTTup [NType]
-    | NTRecFromTable Binding
+    | NTRecFromTable Mir.Table
     | NTAnonRec Binding [(Binding, NType)]
     | NTScalar SomeColumn
   deriving (Show, Eq, Ord, Generic)
@@ -85,7 +85,7 @@ data Operator
     | Identity
     | Union
     | Sink
-    | Source Word
+    | Source Mir.Table
     | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
     deriving (Show, Eq, Generic)
 

@@ -174,7 +174,7 @@ resolveNS ifacem ns = do
 inlineAlgos :: MonadIO m => ModMap -> Expr -> m Expr
 inlineAlgos m = rewriteM $ \case
     Lit (FunRefLit (FunRef r _)) | Just modVar <- m ^? ix (r^.namespace) -> do
-                                       mod <- maybe (error $ "Namespaces must be loaded at this point " <> show (r^.namespace)) pure =<< tryTakeMVar modVar
+                                       mod <- maybe (error $ "Namespaces must be loaded at this point " <> show (r^.namespace)) pure =<< tryReadMVar modVar
                                        pure $ mod ^? decls . ix (r^.name) . value
     _ -> pure Nothing
 

@@ -6,10 +6,21 @@ import Ohua.Prelude
 import Data.Text.Prettyprint.Doc as P
 import Ohua.ALang.PPrint ()
 
+data Table = TableByIndex Word | TableByName Text
+    deriving (Show, Eq, Ord, Generic)
+
+instance Hashable Table
+instance NFData Table
+
+instance Pretty Table where
+    pretty = \case
+        TableByIndex i -> pretty i
+        TableByName t -> pretty t
+
 -- | (isFromMain, Index)
 data Column =
     Column
-        { table :: Maybe Text
+        { table :: Maybe Table
         , name :: Text
         }
     deriving (Show, Eq, Ord, Generic)
@@ -100,4 +111,6 @@ data Node
     | Filter
           { conditions :: [Maybe ( FilterCondition Word )]
           }
+    | Union
+      { mirUnionEmit :: [[Column]] }
   deriving (Show)

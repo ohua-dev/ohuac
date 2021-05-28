@@ -222,6 +222,7 @@ runBuild bo@BuildOpts { outputFormat
                            {modTracker = modTracker, preResolveHook = h}
          in registerAnd (rawMainMod ^. name) $ loadDepsAndResolve rawMainMod
     modMap <- readIORef modTracker
+    logDebugN $ show $ HashMap.keys modMap
     expr' <- inlineAlgos modMap =<< getMain (each %~ view Ohua.Prelude.value $ mainMod ^. decls)
     let expr =
             case expr'

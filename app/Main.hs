@@ -184,9 +184,8 @@ configureForBackend BuildOpts {..} mainAnns = \case
                 IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
         pure ( PackageHook $ NoriaUDFGen.preResolveHook addUdf
               , defWithCleanUnit
-                { passBeforeNormalize = NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
-                , passAfterNormalize =
-                  NoriaUDFGen.generateOperators fields addUdf
+                { passAfterNormalize =
+                  NoriaUDFGen.generateOperators fields addUdf <=< NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
                 }
               , pure . mainToEnv
               , PackageCodeGen $ \dat -> do
@@ -238,6 +237,7 @@ runBuild bo@BuildOpts { outputFormat
              transformRecursiveFunctions .~
              ("tail-recursion" `elem` extraFeatures)
             & skipCtrlTransformation .~ False -- ( outputFormat == NoriaUDF)
+            & higherOrderFunctions .~ ["ohua.sql.query/filter"]
             )
             passes
             completeExpr

@@ -15,6 +15,7 @@ import Ohua.Prelude
 import Ohua.Unit
 import Control.Monad.Writer
 import qualified Control.Lens.Plated as Plated
+import Control.Lens (at, ix)
 
 pattern BuiltinFunE b <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang"] b) _))
 pattern FieldE f <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] f) _))
@@ -32,7 +33,7 @@ exprToMirCondition ::
     -> Expr
     -> OhuaM env (HashMap.HashMap (Either Column Mir.Column) ( Mir.FilterCondition Mir.Column), [Binding])
 exprToMirCondition tab (Lambda table body) =
-    pure $ first HashMap.fromList $ runWriter $ fmap andToList $ f body
+    pure $ first HashMap.fromList $ runWriter $ flip runReaderT HashMap.empty $ fmap andToList $ f body
   where
     mkE :: (HasCallStack , Pretty a) => a -> b
     mkE t = error $ "Cannot convert \"" <> quickRender t <> "\" in " <> quickRender body
@@ -48,6 +49,11 @@ exprToMirCondition tab (Lambda table body) =
             Mir.Equal -> Mir.Equal
             Mir.NotEqual -> Mir.NotEqual
             other -> Mir.deMorganOp other -- Not sure this is actually true, I'm just lazy
+    f (Let bnd mexp mbod) = do
+        exp <- f mexp
+        local (at bnd .~ Just exp) $ f mbod
+    f (Var v) = fromMaybe (error $ "Variable " <> quickRender v <> " not found locally. Variables from scope are not yet supported.")  <$>
+        asks (^? ix v)
     f (BuiltinFunE b `Apply` left `Apply` right)
         | Just conj <- (case b of "and" -> Just And; "or" -> Just Or; _ -> Nothing) =
               Conj conj <$> f left <*> f right
@@ -101,7 +107,8 @@ queryEDSL = flip HashMap.lookup table
           ((\_ state args -> assertM (null args) >> pure state) :: EDSLRewrite env)
          -- eventually this should insert a remapping and field selection node
         , fn "filter" ~>
-          ((\register (Var state) args -> do
+          ((\register stArg args -> do
+                state <- generateBindingWith "where_state"
                 let arg = case args of
                         [arg] -> arg
                         other -> error $ "too many argument " <> quickRender other
@@ -110,7 +117,7 @@ queryEDSL = flip HashMap.lookup table
                 let newFnName =
                         QualifiedBinding ["ohua", "generated", "sql_ops"] name
                 liftIO $ register $ Op_MIR (newFnName, Filter conditionMap (state, free))
-                pure $ fromListToApply (FunRef newFnName Nothing) (Var state : map Var free)) :: EDSLRewrite env)
+                pure $ Let state stArg $ fromListToApply (FunRef newFnName Nothing) (Var state : map Var free)) :: EDSLRewrite env)
          -- should resolve to the base state to figure out the table this references
         ]
 

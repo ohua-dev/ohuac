@@ -994,6 +994,9 @@ calcColumns cOpOut gr = colmap
                       _ -> []
             ]
 
+instance PP.Pretty SomeColumn where
+    pretty = either pretty pretty
+
 toSerializableGraph ::
        (MonadLogger m, MonadIO m)
     => Binding
@@ -1017,7 +1020,7 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 , strip outs)
     adjacencies <-
         sequence
-            [ (, map someColToMirCol cols, map (toNIdx . snd) ins) <$>
+            [ (, mirCols, map (toNIdx . snd) ins) <$>
             case op of
                 CustomOp o ccols ->
                     pure $
@@ -1038,14 +1041,16 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 Join {joinType, joinOn}
                     | joinType /= InnerJoin -> unimplemented
                     | otherwise ->
-                        let containsCols n cols =
-                                all (`elem` (actualColumn IM.! n)) cols
+                        let containsCols actual =
+                                all (`elem` actual)
                             (l, r) = unzip joinOn
                             [lp, rp] = map snd ins
-                            lpHasL = containsCols lp l
-                            rpHasL = containsCols rp l
-                            lpHasR = containsCols lp r
-                            rpHasR = containsCols rp r
+                            lc = actualColumn IM.! lp
+                            rc = actualColumn IM.! rp
+                            lpHasL = containsCols lc l
+                            rpHasL = containsCols rc l
+                            lpHasR = containsCols lc r
+                            rpHasR = containsCols rc r
                             (map someColToMirCol -> left, map someColToMirCol -> right) =
                                 if | lpHasL && lpHasR && rpHasR && rpHasL ->
                                        error $
@@ -1061,8 +1066,14 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                                        error $
                                        "impossible " <>
                                        show (lpHasL, rpHasL, lpHasR, rpHasR)
-                         in pure
-                                Mir.Join {mirJoinProject = mirCols, left, right}
+                         in do
+                            logDebugN $ quickRender op <> ":"
+                            logDebugN $ "Saw \n    left parent " <> show lp <> "(" <> show (toNIdx lp) <> ") with columns " <> quickRender lc <> "\n    right parent " <> show rp <> "(" <> show (toNIdx rp) <> ") with columns " <> quickRender rc
+                            let boolAsNot = \case True -> ""; _ -> "not "
+                            logDebugN $ "Demanded left columns " <> boolAsNot lpHasL <> "found in left parent, " <> boolAsNot rpHasL <> "found in right parent"
+                            logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
+                            logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
+                            pure Mir.Join {mirJoinProject = mirCols, left, right}
                 Union -> pure Mir.Union {mirUnionEmit = [mirCols]}
                 Project _ -> pure $ Mir.Identity mirCols
                 Identity -> pure $ Mir.Identity mirCols
@@ -1139,7 +1150,7 @@ toSerializableGraph entrypoint execSemMap tm mg = do
               ++
              nonSinkSourceNodes)
     toNIdx :: Int -> Word
-    toNIdx = ((IM.fromList $ map swap indexMapping) IM.!)
+    toNIdx = ((IM.fromListWith (\a _ -> error $ "Double index " <> show a) $ map swap indexMapping) IM.!)
     getUdfReturnCols n =
         maybe
             (error $ "No type for node " <> show n)

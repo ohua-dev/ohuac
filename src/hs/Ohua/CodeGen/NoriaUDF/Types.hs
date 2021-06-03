@@ -58,6 +58,9 @@ instance NFData InternalColumn
 
 type Column = InternalColumn
 
+instance PP.Pretty InternalColumn where
+    pretty InternalColumn{..} = pretty producingOperator <> ":" <> pretty outputIndex
+
 type SomeColumn = Either Column Mir.Column
 -- instance Hashable Column
 -- instance NFData Column

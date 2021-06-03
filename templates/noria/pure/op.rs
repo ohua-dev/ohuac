@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use itertools::Itertools;
 
 use super::super::att3::Typed;
 use nom_sql::SqlType;
@@ -130,8 +131,18 @@ impl Ingredient for
     }
 
     fn description(&self, detailed: bool) -> String {
-        // <insert(udf-name-str)>
-          .to_string()
+        if detailed {
+            format!("{} [{}]",
+                    // <insert(udf-name-str)>
+                    ,
+                    [
+                        // <insert(udf-arg-strs)>
+                    ].iter().map(usize::to_string).join(",")
+            )
+        } else {
+            // <insert(udf-name-str)>
+                .to_string()
+        }
     }
 
     fn parent_columns(&self, column: usize) -> Vec<(NodeIndex, Option<usize>)> {

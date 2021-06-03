@@ -411,6 +411,7 @@ baseUdfSubMap ::
 baseUdfSubMap udfName rowName accessedFields =
     [ "udf-name" ~> [T.toTitle $ unwrap $ udfName ^. name]
     , "udf-name-str" ~> ["\"" <> unwrap (udfName ^. name) <> "\""]
+    , "udf-arg-strs" ~> map (\e -> "self." <> unwrap (idxPropFromName e) <> ",") accessedFields
     , "row-name" ~> [unwrap rowName]
     , "special-state-coerce-call" ~>
       ["." <> mkSpecialStateCoerceName udfName <> "()"]

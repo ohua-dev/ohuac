@@ -10,7 +10,7 @@ use crate::ops::grouped::get_group_values;
 use crate::state::cstate::{ SpecialStateWrapper, MemoElem };
 
 //use crate::state::cstate::{MemoElem};
-use prelude::*;
+use crate::prelude::*;
 
 #[derive(Serialize, Deserialize,Clone)]
 pub struct
@@ -100,7 +100,6 @@ impl Ingredient for
         _: &mut dyn Executor,
         _: LocalNodeIndex,
         mut rs: Records,
-        _: &mut Tracer,
         _: Option<&[usize]>,
         _: &DomainNodes,
         _: &StateMap,

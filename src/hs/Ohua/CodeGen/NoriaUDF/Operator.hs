@@ -30,7 +30,23 @@ import Ohua.Prelude hiding (First, Identity)
 import Control.Arrow ((***))
 import Control.Category ((>>>))
 import Control.Comonad (extract)
-import Control.Lens (Simple, (%=), (<>=), (^..), (^?!), ix, to, use, non, at, _Just, cons, itraverse, each, _3)
+import Control.Lens
+    ( Simple
+    , (%=)
+    , (<>=)
+    , (^..)
+    , (^?!)
+    , _3
+    , _Just
+    , at
+    , cons
+    , each
+    , itraverse
+    , ix
+    , non
+    , to
+    , use
+    )
 import Control.Monad.RWS (runRWST)
 import Control.Monad.Writer (runWriterT, tell)
 import qualified Data.Foldable
@@ -49,36 +65,34 @@ import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 import Data.Traversable (for)
 import Prelude ((!!))
 import System.Directory (createDirectoryIfMissing)
-import qualified System.FilePath as FP
 import System.Directory (makeAbsolute)
+import qualified System.FilePath as FP
 import qualified System.IO.Temp as Temp
 
-import Ohua.Standalone (RawDecl,PreResolveHook, CombinedAnn(..), RawNamespace)
 import Ohua.ALang.Lang
-import qualified Ohua.Frontend.Lang as Fr
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
-import Ohua.Compat.Clike.Types
 import qualified Ohua.ALang.Passes as ALang (normalize)
 import qualified Ohua.ALang.Refs as ALang
 import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply)
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONObject
+import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
+import qualified Ohua.CodeGen.NoriaUDF.Paths as Path
+import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL, rewriteFieldAccess)
+import Ohua.CodeGen.NoriaUDF.Types
+import Ohua.CodeGen.NoriaUDF.Util
+import Ohua.Compat.Clike.Types
 import qualified Ohua.DFGraph as DFGraph
+import qualified Ohua.Frontend.Lang as Fr
 import qualified Ohua.Frontend.NS as NS
 import qualified Ohua.Helpers.Graph as GR
 import Ohua.Helpers.Template (Substitutions, Template)
 import qualified Ohua.Helpers.Template as TemplateHelper
-import Ohua.CodeGen.NoriaUDF.Util
-import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL, rewriteFieldAccess)
-import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
-import Ohua.CodeGen.NoriaUDF.Types
+import Ohua.Standalone (CombinedAnn(..), PreResolveHook, RawDecl, RawNamespace)
 
 import Paths_ohuac
 
-
 type Fields = IM.IntMap Text
-
-
 
 -- | TODO Should be `RustTyExpr` at some point
 type FieldSpec = (Binding, Text)
@@ -411,7 +425,8 @@ baseUdfSubMap ::
 baseUdfSubMap udfName rowName accessedFields =
     [ "udf-name" ~> [T.toTitle $ unwrap $ udfName ^. name]
     , "udf-name-str" ~> ["\"" <> unwrap (udfName ^. name) <> "\""]
-    , "udf-arg-strs" ~> map (\e -> "self." <> unwrap (idxPropFromName e) <> ",") accessedFields
+    , "udf-arg-strs" ~>
+      map (\e -> "self." <> unwrap (idxPropFromName e) <> ",") accessedFields
     , "row-name" ~> [unwrap rowName]
     , "special-state-coerce-call" ~>
       ["." <> mkSpecialStateCoerceName udfName <> "()"]
@@ -425,7 +440,7 @@ baseUdfSubMap udfName rowName accessedFields =
 
 generatedOpSourcePath :: QualifiedBinding -> FilePath
 generatedOpSourcePath udfName =
-    noriaDataflowSourceDir <> "/ops/ohua/generated/" <>
+    Path.dataflowSourceDir <> "/ops/ohua/generated/" <>
     toString (unwrap $ udfName ^. name) <>
     ".rs"
 
@@ -444,7 +459,9 @@ processStatefulUdf fields udfName program state initState =
                 (mapFn, rowName, fieldIndices) <- mkMapFn fields mapF state coll
                 reduceFn <- mkReduceFn fields state reduceF
                 let nodeSub =
-                        TemplateSubstitution "map-reduce/op.rs" (generatedOpSourcePath udfName) $
+                        TemplateSubstitution
+                            "map-reduce/op.rs"
+                            (generatedOpSourcePath udfName) $
                         baseUdfSubMap udfName rowName accessedFields <>
                         [ "map" ~> ["use " <> stateNSStr <> "::Action;", mapFn]
                         , "reduce" ~> [reduceFn]
@@ -462,7 +479,7 @@ processStatefulUdf fields udfName program state initState =
                     stateSub =
                         TemplateSubstitution
                             "map-reduce/state.rs"
-                            (noriaDataflowSourceDir <> "/state/ohua/generated/" <>
+                            (Path.dataflowSourceDir <> "/state/ohua/generated/" <>
                              toString (unwrap $ udfName ^. name) <>
                              ".rs")
                             [ "state-trait-coerce-impls" ~>
@@ -495,8 +512,8 @@ processStatefulUdf fields udfName program state initState =
                                 mkFieldDestrExpr
                                     (foldl' Apply udf $ map Var newBnds)
                 ie <- ALang.normalize $ mkInvokeExpr $ embedE udfName
-                pure $ (ie,) $
-                    Op_UDF $ UDFDescription
+                pure $ (ie, ) $ Op_UDF $
+                    UDFDescription
                         { generations = [nodeSub, stateSub]
                         , udfName = udfName
                         , inputBindings = []
@@ -558,9 +575,6 @@ mkOpStructName udfName = T.toTitle (unwrap $ udfName ^. name)
 
 mkNodePath udfName = udfFileToPathThing ModPath udfName [mkOpStructName udfName]
 
-noriaDataflowSourceDir :: IsString s => s
-noriaDataflowSourceDir = "noria-server/dataflow/src"
-
 patchFile ::
        (MonadIO m, MonadLogger m)
     => Maybe FilePath
@@ -577,12 +591,13 @@ patchFile mOutDir file subs = do
             liftIO $ outputFile (dir FP.</> filename) content
 
 -- TODO create the state impls in map-reduce/state.rs needs sub key "state-trait-coerce-impls"
-patchFiles :: (MonadIO m, MonadLogger m) => Maybe FilePath -> [UDFDescription] -> m ()
+patchFiles ::
+       (MonadIO m, MonadLogger m) => Maybe FilePath -> [UDFDescription] -> m ()
 patchFiles mOutDir udfs =
     mapM_ (uncurry $ patchFile mOutDir) (HashMap.toList fileMap)
   where
     toMap =
-        ([ noriaDataflowSourceDir <> "/ops/ohua/mod.rs" ~>
+        ([ Path.dataflowSourceDir <> "/ops/ohua/mod.rs" ~>
            ["link-generated-modules" ~> ["pub mod generated;"]]
          ] <>) .
         HashMap.fromListWith (HashMap.unionWith (<>))
@@ -590,16 +605,19 @@ patchFiles mOutDir udfs =
 
 mkPatchesFor :: UDFDescription -> [(FilePath, HashMap Text [Text])]
 mkPatchesFor UDFDescription {..} =
-      maybe []  (\st ->
-        [noriaDataflowSourceDir <> "/state/mod.rs" ~>
-          [ ("state-trait-method-def" :: Text) ~>
-            mkStateTraitCoercionFunc udfName st "Option::None"
+    maybe
+        []
+        (\st ->
+             [ Path.dataflowSourceDir <> "/state/mod.rs" ~>
+               [ ("state-trait-method-def" :: Text) ~>
+                 mkStateTraitCoercionFunc udfName st "Option::None"
                 -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
                 --     Option::None
                 -- }
-          ] ]) udfState
-        <>
-    [ noriaDataflowSourceDir <> "/ops/mod.rs" ~>
+               ]
+             ])
+        udfState <>
+    [ Path.dfOpsFile ~>
       [ "node-operator-enum" ~> [nodeOpConstr <> "(" <> nodePath <> "),"]
       , "nodeop-from-impl-macro-call" ~>
         [ "nodeop_from_impl!(NodeOperator::" <> nodeOpConstr <> ", " <> nodePath <>
@@ -613,7 +631,7 @@ mkPatchesFor UDFDescription {..} =
         ["NodeOperator::" <> nodeOpConstr <> "(ref i) => i.$fn($($arg),*),"]
              -- NodeOperator::ClickAnaUDF(ref i) => i.$fn($($arg),*),
       ]
-    , noriaDataflowSourceDir <> "/ops/ohua/att3.rs" ~>
+    , Path.opsInterfaceFile ~>
       [ let (replacementKey, extraNodeArg) =
                 case execSemantic of
                     ReductionSem ->
@@ -642,7 +660,7 @@ mkPatchesFor UDFDescription {..} =
               ","
             ]
       ]
-    , "noria-server/src/controller/schema.rs" ~>
+    , Path.schemaFile ~>
       [ "type-resolution-for-generated-nodes" ~>
         [ renderDoc $ "ops::NodeOperator::" <> pretty nodeOpConstr <>
           PP.parens "ref n" <+>
@@ -662,58 +680,104 @@ pattern GenFuncsNamespace <- ["ohua", "generated"]
   where GenFuncsNamespace = ["ohua", "generated"]
 
 toSQLType :: TyExpr SomeBinding -> Text
-toSQLType (TyRef (Unqual b)) | b == "i32" = "Int(32)"
-                             | b == "i64" = "Int(64)"
-                             | b == "bool" = "Tinyint"
+toSQLType (TyRef (Unqual b))
+    | b == "i32" = "Int(32)"
+    | b == "i64" = "Int(64)"
+    | b == "bool" = "Tinyint"
 toSQLType t = error $ "No SQL equivalent known for type " <> show t
 
-preResolveHook :: (MonadIO m, MonadError Error m, MonadLogger m) => RegisterOperator -> RawNamespace -> m RawNamespace
-preResolveHook registerOp r = runGenBndT mempty $ do
-    logDebugN $ "Hook is running for " <> quickRender ( r ^. name )
-    (newDecls, toTransform) <- runWriterT $ itraverse finder (r^.decls)
-    forM_ toTransform $ \(source, oldName, udfName) -> do
-        let function = QualifiedBinding (r^.name) oldName
-            Fr.LamE pats fbody = source ^. value
-            args = map (\(Fr.VarP v) -> v) pats
-        let fieldIndices = [0 .. length args - 1]
-            accessedFields = map ("none", ) fieldIndices
-            opGen =
-                TemplateSubstitution
-                "pure/op.rs"
-                (generatedOpSourcePath udfName) $
-                baseUdfSubMap udfName "r" accessedFields <>
-                [ "function" ~>
-                    [ renderDoc $ pretty $
-                        foldr' (\(t, a, i) -> Fr.LetE ( Fr.VarP a ) $ Fr.VarE $ unsafeMake $ renderDoc $
-                                   maybe (<> ".into()") (\t' o -> "Into::<" <> pretty (Annotated False t') <> ">::into" <> PP.parens o) t $
-                                   "r[self." <> pretty (idxPropFromName i) <>
-                                   "].clone()")
-                        fbody
-                        $ reverse $ zip3 (maybe (repeat Nothing) (map Just . NS.argTypes) $ typeAnn $ source ^. annotation) args accessedFields
+preResolveHook ::
+       (MonadIO m, MonadError Error m, MonadLogger m)
+    => RegisterOperator
+    -> RawNamespace
+    -> m RawNamespace
+preResolveHook registerOp r =
+    runGenBndT mempty $ do
+        logDebugN $ "Hook is running for " <> quickRender (r ^. name)
+        (newDecls, toTransform) <- runWriterT $ itraverse finder (r ^. decls)
+        forM_ toTransform $ \(source, oldName, udfName) -> do
+            let function = QualifiedBinding (r ^. name) oldName
+                Fr.LamE pats fbody = source ^. value
+                args = map (\(Fr.VarP v) -> v) pats
+            let fieldIndices = [0 .. length args - 1]
+                accessedFields = map ("none", ) fieldIndices
+                opGen =
+                    TemplateSubstitution
+                        "pure/op.rs"
+                        (generatedOpSourcePath udfName) $
+                    baseUdfSubMap udfName "r" accessedFields <>
+                    [ "function" ~>
+                      [ renderDoc $ pretty $
+                        foldr'
+                            (\(t, a, i) ->
+                                 Fr.LetE (Fr.VarP a) $ Fr.VarE $ unsafeMake $
+                                 renderDoc $
+                                 maybe
+                                     (<> ".into()")
+                                     (\t' o ->
+                                          "Into::<" <>
+                                          pretty (Annotated False t') <>
+                                          ">::into" <>
+                                          PP.parens o)
+                                     t $
+                                 "r[self." <>
+                                 pretty (idxPropFromName i) <>
+                                 "].clone()")
+                            fbody $
+                        reverse $
+                        zip3
+                            (maybe (repeat Nothing) (map Just . NS.argTypes) $
+                             typeAnn $
+                             source ^.
+                             annotation)
+                            args
+                            accessedFields
+                      ]
+                    , "udf-ret-type" ~>
+                      [ ("SqlType::" <>) $ toSQLType $
+                        fromMaybe
+                            (error $ "type for " <> unwrap oldName <> " unknown")
+                            (source ^? annotation . to typeAnn . _Just .
+                             to NS.retType)
+                      ]
                     ]
-                , "udf-ret-type" ~> [("SqlType::" <>) $ toSQLType $ fromMaybe (error $ "type for " <> unwrap oldName <> " unknown") (source ^? annotation . to typeAnn . _Just . to NS.retType)]
-                ]
-        lift $ liftIO $ registerOp $
-                  Op_UDF $ UDFDescription
-                      { udfName = udfName
-                      , inputBindings = args
-                      , udfState = Nothing
-                      , referencedFields = fieldIndices
-                      , generations = [opGen]
-                      , execSemantic = SimpleSem
-                      }
-    logDebugN $ "New declared functions " <> T.unlines (map (\(k, v) -> unwrap k <> " = " <> quickRender (v ^. value)) $ HashMap.toList newDecls)
-    pure $ r & NS.sfImports %~ cons (GenFuncsNamespace, toTransform & each %~ view (_3 . name)) & NS.decls .~ newDecls
+            lift $ liftIO $ registerOp $ Op_UDF $
+                UDFDescription
+                    { udfName = udfName
+                    , inputBindings = args
+                    , udfState = Nothing
+                    , referencedFields = fieldIndices
+                    , generations = [opGen]
+                    , execSemantic = SimpleSem
+                    }
+        logDebugN $ "New declared functions " <>
+            T.unlines
+                (map (\(k, v) -> unwrap k <> " = " <> quickRender (v ^. value)) $
+                 HashMap.toList newDecls)
+        pure $ r & NS.sfImports %~
+            cons (GenFuncsNamespace, toTransform & each %~ view (_3 . name)) &
+            NS.decls .~
+            newDecls
   where
-    finder nam a | any (\case Fr.LitE (FunRefLit (FunRef (QualifiedBinding ["ohua", "noria_integration"] "make_udf") _)) -> True; _ -> False) (genericAnn ann) = do
-                       let newFnName = unsafeMake $ T.intercalate "_" (map unwrap $ unwrap $ r^.name) <> "_" <> unwrap nam
-                           newName = QualifiedBinding GenFuncsNamespace newFnName
-                       logDebugN $ "Found candidate " <> unwrap nam
-                       tell $ asList [(a, nam, newName)]
-                       pure $ a & annotation .~ ann { genericAnn = [] } & value .~ Fr.LitE (FunRefLit (FunRef newName Nothing))
-                 | otherwise = pure a
-      where ann = a ^. annotation
-
+    finder nam a
+        | any (\case
+                   Fr.LitE (FunRefLit (FunRef (QualifiedBinding ["ohua", "noria_integration"] "make_udf") _)) ->
+                       True
+                   _ -> False)
+             (genericAnn ann) = do
+            let newFnName =
+                    unsafeMake $
+                    T.intercalate "_" (map unwrap $ unwrap $ r ^. name) <>
+                    "_" <>
+                    unwrap nam
+                newName = QualifiedBinding GenFuncsNamespace newFnName
+            logDebugN $ "Found candidate " <> unwrap nam
+            tell $ asList [(a, nam, newName)]
+            pure $ a & annotation .~ ann {genericAnn = []} & value .~
+                Fr.LitE (FunRefLit (FunRef newName Nothing))
+        | otherwise = pure a
+      where
+        ann = a ^. annotation
 
 asList :: [a] -> [a]
 asList = id
@@ -726,11 +790,11 @@ rewriteQueryExpressions register e = do
             | Just process <- queryEDSL f -> process register st [arg]
         other -> pure other
 
-generateOperators :: Fields -> RegisterOperator -> Expression -> OhuaM env Expression
+generateOperators ::
+       Fields -> RegisterOperator -> Expression -> OhuaM env Expression
 generateOperators fields registerOp program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
-    program' <- transformM genStatefulOps program
-        >>= transformM genPureOps
+    program' <- transformM genStatefulOps program >>= transformM genPureOps
     logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
@@ -747,7 +811,7 @@ generateOperators fields registerOp program = do
                     -- Its a bit of a hack to record the return binding. It's
                     -- necessary because this pass is still a bit unstable in general.
             case body' of
-                Var v -> _2 <>= [ v ]
+                Var v -> _2 <>= [v]
                 _ -> pure ()
             let contNormal e = _2 <>= eDeps >> pure (Let v e body')
             (udfDeps, exprDeps) <- get
@@ -780,7 +844,8 @@ generateOperators fields registerOp program = do
             logDebugN $ "Found operator function " <> quickRender udfName <>
                 "\n" <>
                 quickRender (Let st initExpr udf)
-            ( invokeExpr, fdata ) <- processStatefulUdf fields udfName udf st initExpr
+            (invokeExpr, fdata) <-
+                processStatefulUdf fields udfName udf st initExpr
             liftIO $ registerOp fdata
             pure $ handleReturn invokeExpr e'
     genStatefulOps e = pure e
@@ -808,15 +873,15 @@ generateOperators fields registerOp program = do
                     , "udf-ret-type" ~> ["SqlType::Double"]
                     ]
             argVars <- traverse expectVar args
-            liftIO $ registerOp $
-                    Op_UDF $ UDFDescription
-                        { udfName = udfName
-                        , inputBindings = argVars
-                        , udfState = Nothing
-                        , referencedFields = fieldIndices
-                        , generations = [opGen]
-                        , execSemantic = SimpleSem
-                        }
+            liftIO $ registerOp $ Op_UDF $
+                UDFDescription
+                    { udfName = udfName
+                    , inputBindings = argVars
+                    , udfState = Nothing
+                    , referencedFields = fieldIndices
+                    , generations = [opGen]
+                    , execSemantic = SimpleSem
+                    }
             pure $ Let bnd (fromListToApply (FunRef udfName Nothing) args) body
       where
         (FunRef function _, args) = fromApplyToList val
@@ -907,9 +972,17 @@ loadNoriaTemplate t =
         TemplateHelper.parseTemplate <$> readFile path
 
 extraOperatorProcessing ::
-       (MonadError Error m, MonadIO m, MonadLogger m) => Bool -> [OperatorDescription] -> m ()
+       (MonadError Error m, MonadIO m, MonadLogger m)
+    => Bool
+    -> [OperatorDescription]
+    -> m ()
 extraOperatorProcessing useSandbox ops = do
-    let udfs = mapMaybe (\case Op_UDF desc -> Just desc; _ -> Nothing) ops
+    let udfs =
+            mapMaybe
+                (\case
+                     Op_UDF desc -> Just desc
+                     _ -> Nothing)
+                ops
     outDir <-
         if useSandbox
             then do
@@ -919,19 +992,13 @@ extraOperatorProcessing useSandbox ops = do
                 pure $ Just fp
             else pure Nothing
     let scopePath = maybe id (FP.</>) outDir
-        mkPath d =
-            scopePath $
-            noriaDataflowSourceDir FP.</> d FP.</> "ohua/generated" FP.</>
-            "mod.rs"
     doTheGenerating scopePath (udfs >>= generations)
-    outputFile (mkPath "ops") $
-        T.unlines $
+    outputFile (scopePath Path.generatedOpsModFile) $ T.unlines $
         map (\u -> "pub mod " <> unwrap (udfName u ^. name) <> ";") udfs
-    outputFile (mkPath "state") $
-        T.unlines $
+    outputFile (scopePath Path.generatedStatesModFile) $ T.unlines $
         mapMaybe
             (\case
-                 u@(UDFDescription {udfState = Just _} ) ->
+                 u@(UDFDescription {udfState = Just _}) ->
                      Just $ "pub mod " <> unwrap (udfName u ^. name) <> ";"
                  _ -> Nothing)
             udfs
@@ -942,6 +1009,13 @@ extraOperatorProcessing useSandbox ops = do
             Temp.createTempDirectory sysd pat
 
 mainArgsToTableRefs :: Expr -> (Word, [(Binding, Word)], Expr)
-mainArgsToTableRefs = RS.para $ \case
-    LambdaF a (_,  (i, l, e) ) -> (i + 1, (a,i):l, Let a (embedE ( QualifiedBinding [ "ohua", "sql", "rel" ] a ) `Apply` embedE UnitLit) e)
-    other -> (0, [], RS.embed $ fmap fst other)
+mainArgsToTableRefs =
+    RS.para $ \case
+        LambdaF a (_, (i, l, e)) ->
+            ( i + 1
+            , (a, i) : l
+            , Let a
+                  (embedE (QualifiedBinding ["ohua", "sql", "rel"] a) `Apply`
+                   embedE UnitLit)
+                  e)
+        other -> (0, [], RS.embed $ fmap fst other)

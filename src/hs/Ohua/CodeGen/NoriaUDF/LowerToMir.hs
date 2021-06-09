@@ -27,6 +27,7 @@ import qualified Data.Text.Prettyprint.Doc as PP
 import qualified Ohua.ALang.Refs as Refs
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
+import qualified Ohua.CodeGen.NoriaUDF.Paths as Path
 import Ohua.CodeGen.NoriaUDF.Operator
     ( ExecSemantic
     , OperatorDescription(..)
@@ -50,6 +51,7 @@ import qualified System.Directory as FS
 import qualified System.FilePath as FS
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Printf (printf)
+
 
 -- data Column = InternalColumn (Int, Int) | NamedColumn Mir.Column
 --     deriving (Show, Eq, Ord, Generic)
@@ -872,7 +874,7 @@ instance ToRust SerializableGraph where
                     "Filter" <+>
                     recordSyn
                         [ "conditions" ~>
-                          ppVec (map (encodeOpt encodeCond) conditions)
+                          ppVec (map (\(a,b) -> PP.tupled [pretty a, encodeCond b] ) conditions)
                         ]
                 Mir.Regular {..} ->
                     "UDFBasic" <+>
@@ -1080,38 +1082,24 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 Sink -> error "impossible"
                 Source {} -> error "impossible"
                 Filter f _ -> do
-                    conds <- traverse getCondition cols
                     pure $
                         Mir.Filter
                             { conditions =
-                                  map
-                                      (fmap $ \(Mir.Comparison op val) ->
-                                           Mir.Comparison op $
-                                           case val of
-                                               Mir.ColumnValue v ->
-                                                   let Just c =
-                                                           List.elemIndex
-                                                               (Right v)
-                                                               cols
-                                                    in Mir.ColumnValue
-                                                           (fromIntegral c)
-                                               Mir.ConstantValue v ->
-                                                   Mir.ConstantValue v)
-                                      conds
+                              sortOn fst $ map (bimap colAsIndex reCond) $ HashMap.toList f
                             }
-                    where getCondition c =
-                              case HashMap.lookup c f of
-                                  Nothing
-                                      | Right c <- c
-                                      , cond@(Just _) <-
-                                           HashMap.lookup
-                                               (Right c {Mir.table = Nothing})
-                                               f -> do
-                                          $(logWarn) $
-                                              "Condition lookup with inexact table for " <>
-                                              showT c
-                                          pure cond
-                                  res -> pure res
+                    where
+                      colAsIndex :: SomeColumn -> Word
+                      colAsIndex c = fromIntegral $
+                          fromMaybe (error $ "Expected to find column " <> show c <> " in " <> show cols) $
+                          List.elemIndex c cols
+                      reCond (Mir.Comparison op val) =
+                          Mir.Comparison op $
+                          case val of
+                              Mir.ColumnValue v ->
+                                  Mir.ColumnValue
+                                  (fromIntegral $ colAsIndex $ Right v)
+                              Mir.ConstantValue v ->
+                                  Mir.ConstantValue v
             | n <- nonSinkSourceNodes
             , let (ins, _, op, _) = GR.context mg n
                   cols = actualColumn IM.! n
@@ -1253,12 +1241,9 @@ toSerializableGraph entrypoint execSemMap tm mg = do
 unimplemented :: HasCallStack => a
 unimplemented = error "Function or branch not yet implemented"
 
-noriaMirSourceDir :: IsString s => s
-noriaMirSourceDir = "noria-server/mir/src"
-
 suggestName :: NameSuggester
 suggestName entryPoint =
-    noriaMirSourceDir <> "/udfs/" <> unwrap (entryPoint ^. name) <> "_graph.rs"
+    Path.udfsDir <> "/" <> unwrap (entryPoint ^. name) <> "_graph.rs"
 
 type UdfMap = HashMap QualifiedBinding UDFDescription
 
@@ -1305,7 +1290,7 @@ generate compiledNodes CodeGenData {..} = do
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
     patchFile
         Nothing
-        (noriaMirSourceDir <> "/udfs/mod.rs")
+        Path.udfsModFile
         [ "graph-mods" ~> ["mod " <> entryPointName <> "_graph;"]
         , "graph-dispatch" ~>
           [ "\"" <>

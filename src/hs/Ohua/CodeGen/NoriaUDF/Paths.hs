@@ -5,7 +5,9 @@ import Ohua.Prelude
 type Path = forall s . (IsString s, Monoid s) => s
 
 serverDir :: Path
-serverDir = "server"
+serverDir =
+    -- "server" -- for version 0.7
+    "noria-server" -- for version 0.1.2
 
 
 mirSourceDir :: Path

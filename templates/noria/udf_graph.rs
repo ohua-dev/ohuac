@@ -1,5 +1,5 @@
 use crate::node::{ MirNodeType };
-use column::Column;
+use crate::column::Column;
 use super::{ExecutionType, UDFGraph};
 use nom_sql::Operator;
 use dataflow::ops::filter::{Value, FilterCondition };

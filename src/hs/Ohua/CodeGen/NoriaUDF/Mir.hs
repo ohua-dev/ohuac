@@ -109,7 +109,8 @@ data Node
           }
     | Identity [Column]
     | Filter
-          { conditions :: [(Word, FilterCondition Word)]
+          { -- conditions :: [(Word, FilterCondition Word)] -- in 0.7
+            conditions :: [Maybe (FilterCondition Word)] -- in 0.1.2
           }
     | Union
       { mirUnionEmit :: [[Column]] }

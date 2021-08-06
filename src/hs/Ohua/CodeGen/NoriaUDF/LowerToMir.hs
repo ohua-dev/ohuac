@@ -522,7 +522,7 @@ annotateAndRewriteQuery ::
     -> GeneratedMirNodes
     -> (Operator -> Maybe ExecSemantic)
     -> DFGraph.OutGraph
-    -> m (TypeMap, Gr Operator (), [ SomeColumn ])
+    -> m (TypeMap, Gr Operator ())
 annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     quickDumpGr "graph-with-edge-indices.dot" $
         flip GR.gmap iGr00 $ \(ins, n, l, outs) ->
@@ -542,7 +542,6 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
         printableLabelWithTypes udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
     quickDumpGr "annotated-and-reduced-ohua-graph.dot" $ mkLabelsPrintable gr3
-    let projectedCols = [ c | (_,  Project cols ) <- GR.labNodes gr3, c <- cols ]
     let gr2 =
             removeSuperfluousOperators
                 (\ctx ->
@@ -561,7 +560,6 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                                      "Unexpected number of ancestors for node " <>
                                      show ctx
                          Identity -> True
-                         Project _ -> True
                          _ -> False)
                 gr3
     quickDumpGr "superf-removed.dot" $ printableLabelWithIndices gr2
@@ -569,7 +567,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     quickDumpGr "join-where-merged-with-types.dot" $
         printableLabelWithTypes whereMerged
     quickDumpGr "join-where-merged.dot" $ mkLabelsPrintable whereMerged
-    pure (typeMap, whereMerged, projectedCols)
+    pure (typeMap, whereMerged)
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
@@ -1012,10 +1010,9 @@ toSerializableGraph ::
     => Binding
     -> (Operator -> Maybe ExecSemantic)
     -> TypeMap
-    -> [SomeColumn]
     -> OperatorGraph
     -> m SerializableGraph
-toSerializableGraph entrypoint execSemMap tm projectedCols mg = do
+toSerializableGraph entrypoint execSemMap tm mg = do
     $(logDebug) "Calculated Columns"
     $(logDebug) $ showT actualColumn
     quickDumpGrAsDot entrypoint "serializable.dot" $
@@ -1086,7 +1083,7 @@ toSerializableGraph entrypoint execSemMap tm projectedCols mg = do
                             logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
                             pure Mir.Join {mirJoinProject = mirCols, left, right}
                 Union -> pure Mir.Union {mirUnionEmit = [mirCols]}
-                Project _ -> unimplemented
+                Project _ ->  pure $ Mir.Identity mirCols
                 Identity -> pure $ Mir.Identity mirCols
                 Sink -> error "impossible"
                 Source {} -> error "impossible"
@@ -1118,6 +1115,9 @@ toSerializableGraph entrypoint execSemMap tm projectedCols mg = do
     sink0 <- do
         let [(s, _, l)] = GR.inn mg $ fst sink
             avail = HashSet.fromList $ completeOutputColsFor s
+            projectedCols = case GR.lab mg s of
+                                Just (Project p) -> p
+                                _ -> error "Node before sink should be project"
         (sinkIn, sinkOut) <-
             unzip . fst <$> foldM (\(cols, m) e ->
                                  let cname = Mir.name e in
@@ -1158,8 +1158,7 @@ toSerializableGraph entrypoint execSemMap tm projectedCols mg = do
     indexMapping =
         zip
             [0 ..] -- new indices corresponding to index in this list
-            (fst sink : -- sink node will be inserted first from noria
-             map (^. _2) sources -- then follow all base tables
+            (map (^. _2) sources -- base tables come first
               ++
              nonSinkSourceNodes)
     toNIdx :: Int -> Word
@@ -1286,6 +1285,12 @@ fromSerializableGraph SerializableGraph{..} =
         | (n, _, others) <- adjacencyList
         ]
 
+descriptiveCommentsForSerializableGraph :: SerializableGraph -> [Text]
+descriptiveCommentsForSerializableGraph g =
+    [ renderDoc $ "//" <+> pretty i <+> PP.brackets (PP.concatWith (PP.surround ", ") (map pretty t )) <+> pretty n
+    | (i, (n,_,t)) <- zip [(length $ sources g ^. _2)..] $ adjacencyList g
+    ]
+
 generate :: [OperatorDescription] -> CodeGen
 generate compiledNodes CodeGenData {..} = do
     let (mirNodes, udfs) =
@@ -1298,7 +1303,7 @@ generate compiledNodes CodeGenData {..} = do
     let udfMap = HashMap.fromList $ map (\d -> (udfName d, d)) udfs
         getUdf b = HashMap.lookup b udfMap
         getExecSemantic = execSemOf getUdf
-    (typeMap, iGr, projectedCols) <-
+    (typeMap, iGr) <-
         annotateAndRewriteQuery
             (entryPoint ^. name)
             (HashMap.fromList mirNodes)
@@ -1306,7 +1311,7 @@ generate compiledNodes CodeGenData {..} = do
             graph
     tpl <- loadNoriaTemplate "udf_graph.rs"
     serializableGraph <-
-        toSerializableGraph (entryPoint ^. name) getExecSemantic typeMap projectedCols iGr
+        toSerializableGraph (entryPoint ^. name) getExecSemantic typeMap iGr
     quickDumpGrAsDot (entryPoint ^. name) "reconstituted-serializable.dot"
         $ GR.gmap (\(ins, n, l, outs) ->
             let strip = map $ first $ const ( "" :: Text )
@@ -1315,7 +1320,7 @@ generate compiledNodes CodeGenData {..} = do
                 , show n <> " " <> either quickRender show l
                 , strip outs))
         $ fromSerializableGraph serializableGraph
-    let subs = ["graph" ~> [renderDoc $ asRust $ serializableGraph]]
+    let subs = ["graph" ~>  descriptiveCommentsForSerializableGraph serializableGraph <> [renderDoc $ asRust $ serializableGraph]]
     tpl' <-
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
     patchFile

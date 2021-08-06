@@ -2,9 +2,11 @@ module Ohua.CodeGen.NoriaUDF.Mir where
 
 import Data.Word
 import qualified Ohua.DFGraph as DFGraph
-import Ohua.Prelude
-import Data.Text.Prettyprint.Doc as P
+import Ohua.Prelude hiding (list, Identity)
+import Data.Text.Prettyprint.Doc as P hiding (list)
 import Ohua.ALang.PPrint ()
+
+list = brackets . concatWith (surround ", ")
 
 data Table = TableByIndex Word | TableByName Text
     deriving (Show, Eq, Ord, Generic)
@@ -115,3 +117,11 @@ data Node
     | Union
       { mirUnionEmit :: [[Column]] }
   deriving (Show)
+
+instance Pretty Node where
+    pretty = \case
+        Regular {..} -> pretty nodeFunction <+> list (map pretty indices)
+        Join {..} ->  list (map pretty left) <+> "⋈"  <+> list (map pretty right) <+> "→" <+> list (map pretty mirJoinProject)
+        Identity cols -> "≡" <+> list (map pretty cols)
+        Filter conds -> "σ" <+> list [pretty (idx :: Word) <+> pretty cond | (idx, Just cond) <- zip [0..] conds]
+        Union emit ->  "∪" <+> list [pretty c | lc <- emit, c <- lc]

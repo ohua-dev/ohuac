@@ -243,7 +243,7 @@ typeGraph udfs envInputs g = m
                         "(,)" -> argTypes
                         _
                             | b `elem`
-                                  (["lt", "gt", "eq", "and", "or", "leq", "geq"] :: Vector Binding) ->
+                                  (["lt", "gt", "eq", "and", "or", "leq", "geq", "<", ">", "<=", ">=", "==", "!=", "&&", "||"] :: Vector Binding) ->
                                 likeUdf
                             | otherwise ->
                                 error $
@@ -433,6 +433,9 @@ sequentializeScalars mGetSem g0 = gFoldTopSort f g0
             hashNub $
             [o | o@(_, o') <- stuff, not (any (flip reachable o' . snd) stuff)]
 
+builtinSimpleFuns :: Vector Binding
+builtinSimpleFuns = ["lt", "gt", "leq", "eq", "geq", "not", "and", "==", ">=", "<=", "!=", "<", ">", "&&", "||"]
+
 execSemOf ::
        (QualifiedBinding -> Maybe UDFDescription)
     -> Operator
@@ -446,8 +449,8 @@ execSemOf nodes =
             | op == Refs.ctrl -> Just (One, Many)
             | op ^. namespace == ["ohua", "lang", "field"] -> Just (One, One)
             | QualifiedBinding ["ohua", "lang"] b <- op
-            , b `elem`
-                  (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
+            , b `elem` builtinSimpleFuns
+                   ->
                 Just (One, One)
             | otherwise -> execSemantic <$> nodes op
         Filter {} -> Just (Many, Many)
@@ -718,8 +721,7 @@ retype3 m lits ty other@(QualifiedBinding namespace name) =
                 _ -> error $ "Unknown intrinsic " <> showT name
         ["ohua", "lang"]
             | name == "(,)" -> Project (map toCol ty)
-            | name `elem`
-                  (["lt", "gt", "leq", "eq", "geq", "not", "and"] :: Vector Binding) ->
+            | name `elem` builtinSimpleFuns ->
                 CustomOp other (map toCol ty)
             | name == "id" -> Identity
             | name == "unitFn" ->
@@ -1082,7 +1084,7 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                             logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
                             logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
                             pure Mir.Join {mirJoinProject = mirCols, left, right}
-                Union -> pure Mir.Union {mirUnionEmit = [mirCols]}
+                Union -> pure Mir.Union {mirUnionEmit = map (\(_, n) -> map someColToMirCol $ actualColumn IM.! n) ins}
                 Project _ ->  pure $ Mir.Identity mirCols
                 Identity -> pure $ Mir.Identity mirCols
                 Sink -> error "impossible"
@@ -1115,9 +1117,12 @@ toSerializableGraph entrypoint execSemMap tm mg = do
     sink0 <- do
         let [(s, _, l)] = GR.inn mg $ fst sink
             avail = HashSet.fromList $ completeOutputColsFor s
-            projectedCols = case GR.lab mg s of
-                                Just (Project p) -> p
-                                _ -> error "Node before sink should be project"
+            projectedCols = HashSet.toList $ findProjCols s
+            findProjCols s =
+                case GR.lab mg s of
+                    Just (Project p) -> HashSet.fromList p
+                    Just _ -> HashSet.unions $ map findProjCols $ GR.pre mg s
+                    Nothing -> error "Why no label?"
         (sinkIn, sinkOut) <-
             unzip . fst <$> foldM (\(cols, m) e ->
                                  let cname = Mir.name e in

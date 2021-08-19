@@ -6,8 +6,9 @@
 
 -- {-# OPTIONS_GHC -fdefer-type-errors #-}
 module Ohua.CodeGen.NoriaUDF.LowerToMir
-    ( generate
-    , suggestName
+    ( makeGraph
+    , graphToSubs
+    , SerializableGraph
     ) where
 
 import Control.Lens (Simple, (?~), (%=), (^?!), ix, to, use, at)
@@ -36,8 +37,6 @@ import Ohua.CodeGen.NoriaUDF.Operator
     , ToRust(..)
     , UDFDescription(UDFDescription, execSemantic, udfName)
     , (~>)
-    , loadNoriaTemplate
-    , patchFile
     , renderDoc
     )
 import Ohua.CodeGen.NoriaUDF.Types
@@ -78,7 +77,8 @@ data SerializableGraph =
         , sink :: (Word, [Mir.Column], [Mir.Column])
         , sources :: ([[Mir.Column]], [(Text, [Mir.Column])])
         }
-    deriving (Show)
+    deriving (Show, Eq, Generic)
+
 
 type OpMap = IntMap OpMapEntry
 
@@ -972,10 +972,12 @@ calcColumns cOpOut gr = colmap
                          Project {} -> fromAncestor
                          Identity -> fromAncestor
                          Filter {} -> fromAncestor
-                         Union ->
-                             let [a, b] = pre
-                                 ret = fromNode a
-                              in assert (ret == fromNode b) ret
+                         Union -> assert (take (length short) long == short) short
+                           where
+                             [a, b] = pre
+                             retA = fromNode a
+                             retB = fromNode b
+                             (long, short) = if length retA < length retB then (retB, retA) else (retA, retB)
                          Join {}
                              | length pre /= 2 ->
                                  error $
@@ -1272,10 +1274,6 @@ toSerializableGraph entrypoint execSemMap tm mg = do
 unimplemented :: HasCallStack => a
 unimplemented = error "Function or branch not yet implemented"
 
-suggestName :: NameSuggester
-suggestName entryPoint =
-    Path.udfsDir <> "/" <> unwrap (entryPoint ^. name) <> "_graph.rs"
-
 type UdfMap = HashMap QualifiedBinding UDFDescription
 
 fromSerializableGraph :: SerializableGraph -> Gr (Either Operator Mir.Node) ()
@@ -1298,8 +1296,8 @@ descriptiveCommentsForSerializableGraph g =
     | (i, (n,_,t)) <- zip [(length $ sources g ^. _2)..] $ adjacencyList g
     ]
 
-generate :: [OperatorDescription] -> CodeGen
-generate compiledNodes CodeGenData {..} = do
+makeGraph :: (MonadLogger m, MonadIO m ) => [OperatorDescription] -> CodeGenData -> m SerializableGraph
+makeGraph compiledNodes CodeGenData {..} = do
     let (mirNodes, udfs) =
             partitionEithers $
             map
@@ -1316,30 +1314,6 @@ generate compiledNodes CodeGenData {..} = do
             (HashMap.fromList mirNodes)
             getExecSemantic
             graph
-    tpl <- loadNoriaTemplate "udf_graph.rs"
-    serializableGraph <-
-        toSerializableGraph (entryPoint ^. name) getExecSemantic typeMap iGr
-    quickDumpGrAsDot (entryPoint ^. name) "reconstituted-serializable.dot"
-        $ GR.gmap (\(ins, n, l, outs) ->
-            let strip = map $ first $ const ( "" :: Text )
-             in ( strip ins
-                , n
-                , show n <> " " <> either quickRender show l
-                , strip outs))
-        $ fromSerializableGraph serializableGraph
-    let subs = ["graph" ~>  descriptiveCommentsForSerializableGraph serializableGraph <> [renderDoc $ asRust $ serializableGraph]]
-    tpl' <-
-        TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
-    patchFile
-        Nothing
-        Path.udfsModFile
-        [ "graph-mods" ~> ["mod " <> entryPointName <> "_graph;"]
-        , "graph-dispatch" ~>
-          [ "\"" <>
-            entryPointName <>
-            "\" => Some(Box::new(" <> entryPointName <> "_graph::mk_graph)),"
-          ]
-        ]
-    pure $ LT.encodeUtf8 $ LT.fromStrict tpl'
-  where
-    entryPointName = unwrap $ entryPoint ^. name
+    toSerializableGraph (entryPoint ^. name) getExecSemantic typeMap iGr
+
+graphToSubs g = descriptiveCommentsForSerializableGraph g <> [renderDoc $ asRust $ g]

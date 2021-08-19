@@ -53,6 +53,8 @@ dependencies:
 - prettyprinter
 - recursion-schemes
 - containers
+- binary
+- vector
 library:
   source-dirs: src/hs
   dependencies:

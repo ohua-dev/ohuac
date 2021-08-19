@@ -1,5 +1,6 @@
 module Ohua.CodeGen.NoriaUDF.Types where
 
+import qualified Data.Binary as B
 import qualified Ohua.DFGraph as DFGraph
 import Ohua.Helpers.Template (Substitutions, Template)
 import Ohua.Prelude hiding (Identity)
@@ -37,10 +38,13 @@ data GenerationType
                            Substitutions
     | GenerateFile FilePath
                    Text
+    deriving (Eq, Generic)
+
 
 data ExecSem
     = One
     | Many
+    deriving (Eq, Generic)
 
 type ExecSemantic = (ExecSem, ExecSem)
 
@@ -53,8 +57,6 @@ data InternalColumn = InternalColumn
     , outputIndex :: Int
     } deriving (Show, Eq, Ord, Generic)
 
-instance Hashable InternalColumn
-instance NFData InternalColumn
 
 type Column = InternalColumn
 
@@ -69,17 +71,12 @@ data GScope col =
     GroupBy [col]
     deriving (Show, Eq, Generic)
 
-instance Hashable a => Hashable (GScope a)
-instance NFData a => NFData (GScope a)
-
 data JoinType
     = FullOuterJoin
     | LeftOuterJoin
     | InnerJoin
     deriving (Show, Eq, Generic)
 
-instance NFData JoinType
-instance Hashable JoinType
 
 data Operator
     = CustomOp QualifiedBinding [SomeColumn]
@@ -93,7 +90,6 @@ data Operator
     deriving (Show, Eq, Generic)
 
 -- instance Hashable Operator
-instance NFData Operator
 
 
 instance PP.Pretty Operator where
@@ -124,6 +120,7 @@ instance PP.Pretty JoinType where
 data OperatorDescription
     = Op_MIR (QualifiedBinding, Operator)
     | Op_UDF UDFDescription
+    deriving (Eq, Generic)
 
 data UDFDescription = UDFDescription
       { generations :: [GenerationType]
@@ -132,6 +129,26 @@ data UDFDescription = UDFDescription
       , udfState :: Maybe QualifiedBinding
       , referencedFields :: [Int]
       , execSemantic :: (ExecSem, ExecSem)
-      }
+      } deriving (Eq, Generic)
 
 type RegisterOperator = OperatorDescription -> IO ()
+
+
+instance B.Binary GenerationType
+instance B.Binary UDFDescription
+instance B.Binary Operator
+instance B.Binary OperatorDescription
+instance NFData Operator
+instance NFData JoinType
+instance Hashable JoinType
+instance Hashable a => Hashable (GScope a)
+instance NFData a => NFData (GScope a)
+instance Hashable InternalColumn
+instance NFData InternalColumn
+instance B.Binary JoinType
+instance B.Binary InternalColumn
+instance B.Binary ExecSem
+
+instance (Eq a, Hashable a, B.Binary a, B.Binary b) => B.Binary (HashMap a b) where
+    put = B.put . HashMap.toList
+    get = HashMap.fromList <$> B.get

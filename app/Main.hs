@@ -190,7 +190,6 @@ configureForBackend BuildOpts {..} mainAnns = \case
               , pure . mainToEnv
               , PackageCodeGen $ \dat -> do
                       udfs' <- readIORef udfs
-                      NoriaUDFGen.extraOperatorProcessing sandbox udfs'
                       NoriaUDFGen.generate udfs' dat)
     JsonGraph -> pure (PackageHook pure, defWithCleanUnit, pure . mainToEnv, PackageCodeGen JSONGen.generate )
     SimpleJavaClass -> pure (PackageHook pure, defWithCleanUnit, pure . mainToEnv, PackageCodeGen JavaGen.generate )

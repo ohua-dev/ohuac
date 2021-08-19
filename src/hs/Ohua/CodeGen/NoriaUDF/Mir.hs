@@ -1,5 +1,6 @@
 module Ohua.CodeGen.NoriaUDF.Mir where
 
+import qualified Data.Binary as B
 import Data.Word
 import qualified Ohua.DFGraph as DFGraph
 import Ohua.Prelude hiding (list, Identity)
@@ -39,7 +40,7 @@ data ExecutionType
           { groupBy :: [Column]
           }
     | Simple Word
-  deriving (Show)
+  deriving (Show, Eq, Generic)
 
 data Operator
     = Equal
@@ -116,7 +117,7 @@ data Node
           }
     | Union
       { mirUnionEmit :: [[Column]] }
-  deriving (Show)
+  deriving (Show, Eq, Generic)
 
 instance Pretty Node where
     pretty = \case
@@ -125,3 +126,22 @@ instance Pretty Node where
         Identity cols -> "≡" <+> list (map pretty cols)
         Filter conds -> "σ" <+> list [pretty (idx :: Word) <+> pretty cond | (idx, Just cond) <- zip [0..] conds]
         Union emit ->  "∪" <+> list [pretty c | lc <- emit, c <- lc]
+
+
+instance B.Binary a => B.Binary (Value a)
+instance B.Binary Operator
+instance B.Binary col => B.Binary (FilterCondition col)
+instance B.Binary ExecutionType
+instance B.Binary Node
+instance B.Binary Table
+instance B.Binary Column
+
+instance B.Binary HostExpr
+instance B.Binary FnId
+instance B.Binary FunRef
+instance B.Binary Lit
+instance B.Binary NSRef where
+    put = B.put . unwrap
+    get = makeThrow <$> B.get
+instance B.Binary Binding
+instance B.Binary QualifiedBinding

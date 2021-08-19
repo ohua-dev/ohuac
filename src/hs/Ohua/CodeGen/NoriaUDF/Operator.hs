@@ -6,15 +6,11 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , UDFDescription(..)
     , RegisterOperator
     , GenerationType(..)
-    , patchFiles
     , udfFileToPathThing
     , PathType(..)
-    , extraOperatorProcessing
     , ToRust(..)
     , (~>)
-    , loadNoriaTemplate
     , renderDoc
-    , patchFile
     , ExecSem(..)
     , ExecSemantic
     , pattern SimpleSem
@@ -23,6 +19,7 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , mainArgsToTableRefs
     , rewriteFieldAccess
     , preResolveHook
+    , mkPatchesFor
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -49,48 +46,30 @@ import Control.Lens
     )
 import Control.Monad.RWS (runRWST)
 import Control.Monad.Writer (runWriterT, tell)
-import qualified Data.Foldable
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
 import qualified Data.IntMap as IM
-import qualified Data.IntSet as IS
-import Data.Maybe (fromJust)
 import qualified Data.Text as T
-import qualified Data.Text.Lazy as LT
-import qualified Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Prettyprint.Doc as PP
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 import Data.Traversable (for)
-import Prelude ((!!))
 import System.Directory (createDirectoryIfMissing)
-import System.Directory (makeAbsolute)
 import qualified System.FilePath as FP
-import qualified System.IO.Temp as Temp
 
 import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
 import qualified Ohua.ALang.Passes as ALang (normalize)
-import qualified Ohua.ALang.Refs as ALang
 import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply)
-import Ohua.CodeGen.Iface
-import qualified Ohua.CodeGen.JSONObject as JSONObject
-import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import qualified Ohua.CodeGen.NoriaUDF.Paths as Path
 import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL, rewriteFieldAccess)
 import Ohua.CodeGen.NoriaUDF.Types
 import Ohua.CodeGen.NoriaUDF.Util
-import Ohua.Compat.Clike.Types
-import qualified Ohua.DFGraph as DFGraph
 import qualified Ohua.Frontend.Lang as Fr
 import qualified Ohua.Frontend.NS as NS
-import qualified Ohua.Helpers.Graph as GR
-import Ohua.Helpers.Template (Substitutions, Template)
-import qualified Ohua.Helpers.Template as TemplateHelper
-import Ohua.Standalone (CombinedAnn(..), PreResolveHook, RawDecl, RawNamespace)
-
-import Paths_ohuac
+import Ohua.Helpers.Template (Substitutions)
+import Ohua.Standalone (CombinedAnn(..), PreResolveHook, RawNamespace)
 
 type Fields = IM.IntMap Text
 
@@ -575,33 +554,6 @@ mkOpStructName udfName = T.toTitle (unwrap $ udfName ^. name)
 
 mkNodePath udfName = udfFileToPathThing ModPath udfName [mkOpStructName udfName]
 
-patchFile ::
-       (MonadIO m, MonadLogger m)
-    => Maybe FilePath
-    -> FilePath
-    -> Substitutions
-    -> m ()
-patchFile mOutDir file subs = do
-    tmpl <- TemplateHelper.parseTemplate <$> readFile file
-    writeF file =<<
-        TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tmpl subs
-  where
-    writeF =
-        flip (maybe writeFile) mOutDir $ \dir filename content ->
-            liftIO $ outputFile (dir FP.</> filename) content
-
--- TODO create the state impls in map-reduce/state.rs needs sub key "state-trait-coerce-impls"
-patchFiles ::
-       (MonadIO m, MonadLogger m) => Maybe FilePath -> [UDFDescription] -> m ()
-patchFiles mOutDir udfs =
-    mapM_ (uncurry $ patchFile mOutDir) (HashMap.toList fileMap)
-  where
-    toMap =
-        ([ Path.dataflowSourceDir <> "/ops/ohua/mod.rs" ~>
-           ["link-generated-modules" ~> ["pub mod generated;"]]
-         ] <>) .
-        HashMap.fromListWith (HashMap.unionWith (<>))
-    fileMap = toMap $ udfs >>= mkPatchesFor
 
 mkPatchesFor :: UDFDescription -> [(FilePath, HashMap Text [Text])]
 mkPatchesFor UDFDescription {..} =
@@ -931,82 +883,6 @@ setupReturnRecieve returns =
             (\(i, x) -> Endo $ Let x (mkNthExpr i (length returns) (Var bnd)))
             (zip [0 ..] returns)
 
-outputFile :: MonadIO m => FilePath -> Text -> m ()
-outputFile path content =
-    liftIO $ do
-        createDirectoryIfMissing True (FP.takeDirectory path)
-        writeFile path content
-
-doTheGenerating ::
-       (MonadIO m, MonadLogger m, Foldable f)
-    => (FilePath -> FilePath)
-    -> f GenerationType
-    -> m ()
-doTheGenerating scopePath toGen = do
-    templates <-
-        HashMap.fromList <$>
-        sequence
-            [ (t, ) <$> loadNoriaTemplate t
-            | TemplateSubstitution t _ _ <- Data.Foldable.toList toGen
-            ]
-    let getTemplate t =
-            fromMaybe
-                (error $ "Invariant broken, template not found " <> toText t) $
-            HashMap.lookup t templates
-    Data.Foldable.for_ toGen $ \case
-        TemplateSubstitution t (scopePath -> path) subs -> do
-            p <- liftIO $ makeAbsolute path
-            logDebugN $ "Outputting to path " <> fromString p
-            outputFile path =<<
-                TemplateHelper.sub
-                    TemplateHelper.Opts {preserveSpace = True}
-                    (getTemplate t)
-                    subs
-        GenerateFile (scopePath -> path) content ->
-            liftIO $ writeFile path content
-
-loadNoriaTemplate :: MonadIO m => FilePath -> m [TemplateHelper.Rep]
-loadNoriaTemplate t =
-    liftIO $ do
-        path <- getDataFileName $ "templates/noria" FP.</> t
-        TemplateHelper.parseTemplate <$> readFile path
-
-extraOperatorProcessing ::
-       (MonadError Error m, MonadIO m, MonadLogger m)
-    => Bool
-    -> [OperatorDescription]
-    -> m ()
-extraOperatorProcessing useSandbox ops = do
-    let udfs =
-            mapMaybe
-                (\case
-                     Op_UDF desc -> Just desc
-                     _ -> Nothing)
-                ops
-    outDir <-
-        if useSandbox
-            then do
-                fp <- liftIO $ createSysTempDir "noria-udfs"
-                logInfoN
-                    ("Writing files to sandbox directory " <> fromString fp)
-                pure $ Just fp
-            else pure Nothing
-    let scopePath = maybe id (FP.</>) outDir
-    doTheGenerating scopePath (udfs >>= generations)
-    outputFile (scopePath Path.generatedOpsModFile) $ T.unlines $
-        map (\u -> "pub mod " <> unwrap (udfName u ^. name) <> ";") udfs
-    outputFile (scopePath Path.generatedStatesModFile) $ T.unlines $
-        mapMaybe
-            (\case
-                 u@(UDFDescription {udfState = Just _}) ->
-                     Just $ "pub mod " <> unwrap (udfName u ^. name) <> ";"
-                 _ -> Nothing)
-            udfs
-    patchFiles outDir udfs
-  where
-    createSysTempDir pat =
-        Temp.getCanonicalTemporaryDirectory >>= \sysd ->
-            Temp.createTempDirectory sysd pat
 
 mainArgsToTableRefs :: Expr -> (Word, [(Binding, Word)], Expr)
 mainArgsToTableRefs =

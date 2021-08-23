@@ -50,7 +50,40 @@ import qualified System.Directory as FS
 import qualified System.FilePath as FS
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Printf (printf)
+import Control.Exception (throw)
 
+
+data LoweringError
+    = UnexpectedTypeForField NType Binding
+    | UnknownBuiltin QualifiedBinding
+    | MissingReturnType Operator
+    | IncorrectType Text QualifiedBinding GR.Node [NType]
+    | FieldNotFound Binding Binding NTFields
+    | UnexpectedOperator Operator
+    | InvalidIndexIntoType Int NType
+    | InvalidIndexIntoTypes Int [NType] Operator Int Operator
+    | ExpectedNumericLiteral Lit
+    | InvalidArgumentType Operator (Maybe (Int, Int)) [NType]
+    | LabelNotFound Int
+    | InvalidReturnType Operator [NType] (Maybe Int)
+    | UnexpectedOutputColumn Operator Int Int
+    | FilterIsMissingAField
+    | InvalidLiteralInputs Operator [Lit]
+    | BindingNotFoundInVarmap Operator Text (HashMap Text Mir.Table)
+    | UnexpectedColumnType Mir.Column
+    | UnexpectedType Text Operator [NType]
+    | TypeNotKnown GR.Node
+    | LiteralNotFound GR.Node
+    | WrongNumberOfAncestors GR.Node Operator Int Int
+    | ColumnNotFound GR.Node (IM.IntMap [SomeColumn])
+    | TableColumnsNotFound Mir.Table (HashMap Mir.Table [Mir.Column])
+    | ProjectInputsDoNotLineUp [(Int, Lit)] [NType]
+    | InvalidFilterAfterIsEmpty (GR.MContext Operator ())
+    | UnexpectedNumberOfAncestors GR.Node Operator Word [GR.Node]
+    deriving Show
+
+
+instance Exception LoweringError
 
 -- data Column = InternalColumn (Int, Int) | NamedColumn Mir.Column
 --     deriving (Show, Eq, Ord, Generic)
@@ -123,7 +156,7 @@ quickDumpGrAsDot =
 
 expectNumLit :: HasCallStack => Lit -> Integer
 expectNumLit (NumericLit n) = n
-expectNumLit other = error $ "Expected numeric literal, found " <> show other
+expectNumLit other = throw $ ExpectedNumericLiteral other
 
 getLit :: IntMap [a] -> Int -> [a]
 getLit m k = fromMaybe [] $ IM.lookup k m
@@ -195,29 +228,24 @@ typeGraph udfs envInputs g = m
     idxOf i t =
         case t of
             _
-                | i < 0 ->
-                    error $
-                    "Negative indices make no sense in this context " <>
-                    show i <> " " <> quickRender t
+                | i < 0 -> throw $ InvalidIndexIntoType i t
             NTTup ts
                 | Just t' <- ts ^? ix i -> t'
             NTScalar (Left InternalColumn {..})
                 | outputIndex == -1 ->
                     NTScalar $
                     Left InternalColumn {producingOperator, outputIndex = i}
-            _ ->
-                error $
-                "Cannot take index " <> show i <> " of type " <> quickRender t
+            _ -> throw $ InvalidIndexIntoType i t
     mkRetType :: GR.Node -> [NType] -> Operator -> [NType]
     mkRetType n argTypes o =
         case o of
             Filter {} -> [fromIndex Nothing 0]
-            Join {} -> unexpectedOp "Join"
+            Join {} -> throw $ UnexpectedOperator o
             Identity -> [fromIndex (Just 1) 0]
             Sink -> [fromIndex (Just 1) 0]
             Source t -> [NTSeq (NTRecFromTable t)]
-            Project {} -> argTypes
-            Union -> unexpectedOp "Union"
+            Project {..} -> map NTScalar $ projectEmit <> map (Left . fst) projectLits
+            Union -> throw $ UnexpectedOperator Union
             CustomOp bnd _
                 | bnd == Refs.nth ->
                     let Just (0, NumericLit (fromIntegral -> idx)) =
@@ -236,7 +264,7 @@ typeGraph udfs envInputs g = m
                 | bnd == Refs.ifFun ->
                   case argTypes of
                       [x] -> [x,x]
-                      other -> error $ "Expected only one input type to if " <> show n <> " " <> quickRender o <> ", found " <> quickRender other
+                      _ -> throw $ IncorrectType "expected one onput type" Refs.ifFun n argTypes
                 | bnd == Refs.select -> [fromIndex Nothing 1]
                 | QualifiedBinding ["ohua", "lang"] b <- bnd ->
                     case b of
@@ -245,44 +273,27 @@ typeGraph udfs envInputs g = m
                             | b `elem`
                                   (["lt", "gt", "eq", "and", "or", "leq", "geq", "<", ">", "<=", ">=", "==", "!=", "&&", "||"] :: Vector Binding) ->
                                 likeUdf
-                            | otherwise ->
-                                error $
-                                "Unknown builtin function " <> quickRender bnd
+                            | otherwise -> throw $ UnknownBuiltin bnd
                 | QualifiedBinding ["ohua", "lang", "field"] f <- bnd ->
                     pure $
                     case fromIndex (Just 1) 0 of
                         NTRecFromTable t ->
                             NTScalar $ Right $ Mir.Column (Just t) $ unwrap f
-                        r@(NTAnonRec _ fields) ->
+                        r@(NTAnonRec rb fields) ->
                             fromMaybe
-                                (error $
-                                 "Field " <>
-                                 unwrap f <>
-                                 " not found in record " <> quickRender r) $
+                                (throw $ FieldNotFound f rb fields) $
                             List.lookup f fields
+                        other -> throw $ UnexpectedTypeForField other f
                 | Just _ <- udfs o -> likeUdf
-            _ ->
-                error $
-                "Could not determine return type of operator " <> quickRender o
+            _ -> throw $ MissingReturnType o
       where
         likeUdf = [NTScalar $ Left $ InternalColumn n 0]
-        unexpectedOp op =
-            error $ op <> "not expected here, got " <> quickRender o
         invalidArgs :: a
-        invalidArgs =
-            error $
-            "Invalid argument types " <>
-            quickRender argTypes <> " for operator " <> quickRender o
+        invalidArgs = throw $ InvalidArgumentType o Nothing argTypes
         fromIndex l i
             | Just el <- l
             , let al = length argTypes
-            , el /= al =
-                error $
-                "Wrong number of arguments for operator " <>
-                quickRender o <>
-                " expected " <>
-                show l <>
-                " got " <> show al <> " arguments: " <> quickRender argTypes
+            , el /= al = throw $ InvalidArgumentType o (Just (el, al)) argTypes
             | Just t' <- argTypes ^? ix i = t'
             | otherwise = invalidArgs
     m =
@@ -298,16 +309,7 @@ typeGraph udfs envInputs g = m
                                in if outIdx == (-1)
                                       then NTTup retTypes
                                       else fromMaybe
-                                               (error $
-                                                "Index too large " <>
-                                                show outIdx <>
-                                                " in " <>
-                                                quickRender retTypes <>
-                                                " in " <>
-                                                quickRender (GR.lab g p) <>
-                                                " from input " <>
-                                                show inIdx <>
-                                                " of operator " <> quickRender l) $
+                                               (throw $ InvalidIndexIntoTypes outIdx retTypes (getLabel g p) inIdx l) $
                                            retTypes ^? ix outIdx)
                           | (p, (outIdx, inIdx)) <- GR.lpre g n
                           ]
@@ -324,6 +326,9 @@ gFoldTopSort f g =
         g
         (GR.topsort g)
 
+getLabel :: GR.Graph gr => gr a b -> Int -> a
+getLabel g n = fromMaybe (throw $ LabelNotFound n) $ GR.lab g n
+
 inlineCtrl ::
        (GR.DynGraph gr, HasCallStack)
     => (GR.Node -> [NType])
@@ -331,7 +336,6 @@ inlineCtrl ::
     -> gr Operator (Int, Int)
 inlineCtrl getType =
     gFoldTopSort $ \g ctx@(ins, n, lab, outs) ->
-        let errInfo = show n <> " " <> quickRender lab in
         case lab of
             CustomOp l _
                 | l == Refs.ctrl ->
@@ -342,7 +346,7 @@ inlineCtrl getType =
                                 | ((out, pred -> idx), p) <- ins
                                 ]
                         (ctxSource, ctxSourceOutIdx, _) = idxmap IM.! (-1)
-                        Just ctxSourceLab = GR.lab g ctxSource
+                        ctxSourceLab = getLabel g ctxSource
                      in case ctxSourceLab of
                             CustomOp ctxL _
                                 | ctxL == Refs.smapFun ->
@@ -364,18 +368,12 @@ inlineCtrl getType =
                                     let theCol =
                                             case getType ctxSource Prelude.!! ctxSourceOutIdx of
                                                 NTScalar s -> s
-                                                other -> error $ "Unexpected type " <> quickRender other <> " as output of `ifFn` in " <> errInfo
+                                                other -> throw $ InvalidReturnType lab [other] (Just n)
                                         theVal =
                                             case ctxSourceOutIdx of
                                                 0 -> 1
                                                 1 -> 0
-                                                other ->
-                                                    error $
-                                                    "Unexpected if output column for node " <>
-                                                    show ctxSource <>
-                                                    " expected 0 or 1, got " <>
-                                                    show other <>
-                                                    " in " <> errInfo
+                                                other -> throw $ UnexpectedOutputColumn lab n other
                                      in ( ins
                                         , n
                                         , Filter
@@ -383,17 +381,14 @@ inlineCtrl getType =
                                                     [ ( theCol
                                                       , Mir.Comparison
                                                             Mir.Equal
-                                                            (Mir.ConstantValue $
-                                                             NumericLit theVal))
+                                                            (Mir.ConstantValue
+                                                             theVal))
                                                     ]
+                                              , arguments = ("what?", []) -- throw FilterIsMissingAField
                                               }
                                         , outs) GR.&
                                         g
-                                | otherwise ->
-                                    error $
-                                    "Unexpected type (" <>
-                                    quickRender ctxL <>
-                                    ") for context source of node " <> errInfo
+                            _ -> throw $ UnexpectedOperator ctxSourceLab
             _ -> ctx GR.& g
 
 selectToUnion :: (GR.DynGraph gr, gr Operator (a, Int) ~ g) => g -> g
@@ -402,7 +397,7 @@ selectToUnion =
         case l of
             CustomOp o _
                 | o == Refs.select ->
-                    (filter (\(l, op) -> snd l == 0) ins, n, Union, outs)
+                    (filter ((==0) . snd . fst) ins, n, Union, outs)
             _ -> (ins, n, l, outs)
 
 sequentializeScalars ::
@@ -560,10 +555,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                              case length $ GR.pre' ctx of
                                  1 -> True
                                  2 -> False
-                                 other ->
-                                     error $
-                                     "Unexpected number of ancestors for node " <>
-                                     show ctx
+                                 _ -> throw $ UnexpectedNumberOfAncestors (GR.node' ctx) Union 2 (GR.pre' ctx)
                          Identity -> True
                          _ -> False)
                 gr3
@@ -620,7 +612,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
             [succ sinkId ..]
     typeMap = typeGraph getExecSemantic envInputs iGr0
     getType n =
-        fromMaybe (error $ "Type not found for node " <> show n) $ mGetType n
+        fromMaybe (throw $ TypeNotKnown n) $ mGetType n
     mGetType = flip IM.lookup typeMap
     iGr :: GR.Gr Operator ()
     iGr = GR.emap (const ()) selectRemoved
@@ -718,9 +710,8 @@ retype3 m lits ty other@(QualifiedBinding namespace name) =
     case namespace of
         ["intrinsic"] ->
             case name of
-                "sink" -> error "No longer exists"
-                "source" -> error "sources now need table names"
-                _ -> error $ "Unknown intrinsic " <> showT name
+                "sink" -> throw $ UnexpectedOperator Sink
+                _ -> throw $ UnknownBuiltin other
         ["ohua", "lang"]
             | name == "(,)" -> Project (map toCol ty)
             | name `elem` builtinSimpleFuns ->
@@ -730,10 +721,7 @@ retype3 m lits ty other@(QualifiedBinding namespace name) =
                 case Prelude.lookup 0 lits of
                     Just (FunRefLit (FunRef r _)) ->
                         retype3 m (error "impossible") ty r
-                    other ->
-                        error $
-                        "An 'unitFun' should have a 'FunRefLit' as input at index 0. Instead I found these literal inputs: " <>
-                        show other
+                    _ -> throw $ InvalidLiteralInputs (CustomOp other []) (map snd lits)
             | otherwise -> CustomOp other []
         ["ohua", "lang", "field"] -> CustomOp other []
         ["ohua", "sql", "table"] -> Source (Mir.TableByName $ unwrap name)
@@ -748,10 +736,7 @@ retype3 m lits ty other@(QualifiedBinding namespace name) =
             case ty of
                 NTSeq stTy:rest ->
                     HashMap.fromList $ zip varnames (map handle $ stTy : rest)
-                _ ->
-                    error $
-                    "weird type for operator " <>
-                    quickRender a <> " type: " <> quickRender ty
+                _ -> throw $ InvalidReturnType a ty Nothing
         newConds =
             HashMap.fromList $
             map
@@ -764,38 +749,26 @@ retype3 m lits ty other@(QualifiedBinding namespace name) =
                                    (Mir.ColumnValue $ matchTable c)
                            other -> other)) $
             HashMap.toList conds
-        matchTable Mir.Column {table = Just (Mir.TableByName n), name} =
-            Mir.Column
-                { table =
-                      Just $
-                      fromMaybe
-                          (error $
-                           "Binding " <>
-                           n <>
-                           " not found in varmap " <>
-                           show varnames <> " for operator " <> quickRender a) $
-                      HashMap.lookup n varmap
-                , name
-                }
-        matchTable c =
-            error $
-            "Weird shape for column in filter rewrite (must be over named table), got " <>
-            quickRender c
+        matchTable = \case
+            Mir.Column {table = Just (Mir.TableByName n), name} ->
+                Mir.Column
+                    { table =
+                          Just $
+                          fromMaybe
+                              (throw $ BindingNotFoundInVarmap a n varmap) $
+                          HashMap.lookup n varmap
+                    , name
+                    }
+            c -> throw $ UnexpectedColumnType c
         handle =
             \case
                 NTRecFromTable t -> t
-                _ ->
-                    error $
-                    "Expected table when treating " <>
-                    quickRender a <> " found " <> quickRender ty
+                _ -> throw $ UnexpectedType "NTRecFromTable" a ty
     rewriteFilter a = a
     toCol =
         \case
             NTScalar s -> s
-            t ->
-                error $
-                "Expected scalar type, got " <>
-                quickRender t <> " in operator " <> quickRender other
+            t -> throw $ UnexpectedType "NTScalar" (CustomOp other []) [t]
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
@@ -949,8 +922,7 @@ calcColumns cOpOut gr = colmap
   where
     fromNode n =
         fromMaybe
-            (error $
-             "No cols found for node " <> show n <> " in " <> show colmap) $
+            (throw $ ColumnNotFound n colmap) $
         IM.lookup n colmap
     colmap =
         IM.fromList $
@@ -958,14 +930,16 @@ calcColumns cOpOut gr = colmap
             (\(n, l) ->
                  let pre = GR.pre gr n
                      fromAncestor =
-                         let [a] = pre
+                         let a = case pre of
+                                     [a] -> a
+                                     other -> throw $ UnexpectedNumberOfAncestors n l 1 other
                           in fromNode a
                   in (n, ) $
                      case l of
                          Source t ->
                              map Right $
                              fromMaybe
-                                 (error $ "No columns found for " <> show t) $
+                                 (throw $ TableColumnsNotFound t tableColumn) $
                              HashMap.lookup t tableColumn
                          Sink -> fromAncestor
                          CustomOp {} -> fromAncestor <> map Left (cOpOut n)
@@ -974,16 +948,15 @@ calcColumns cOpOut gr = colmap
                          Filter {} -> fromAncestor
                          Union -> assert (take (length short) long == short) short
                            where
-                             [a, b] = pre
+                             (a, b) = case pre of
+                                          [a,b] -> (a,b)
+                                          other -> throw $ UnexpectedNumberOfAncestors n l 2 other
                              retA = fromNode a
                              retB = fromNode b
                              (long, short) = if length retA < length retB then (retB, retA) else (retA, retB)
                          Join {}
                              | length pre /= 2 ->
-                                 error $
-                                 "Wrong number of ancestors " <>
-                                 show (length pre) <>
-                                 " on " <> show n <> " " <> quickRender l
+                               throw $ WrongNumberOfAncestors n l 2 (length pre)
                              | otherwise -> pre >>= fromNode) $
         GR.labNodes gr
     tableColumn =
@@ -1091,8 +1064,6 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 Union -> pure Mir.Union {mirUnionEmit = map (\(_, n) -> map someColToMirCol $ actualColumn IM.! n) ins}
                 Project _ ->  pure $ Mir.Identity mirCols
                 Identity -> pure $ Mir.Identity mirCols
-                Sink -> error "impossible"
-                Source {} -> error "impossible"
                 Filter f _ -> do
                     let conds = map (flip HashMap.lookup $ HashMap.map reCond f) cols
                     assertM $ length (catMaybes conds) == HashMap.size f
@@ -1113,6 +1084,7 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                                   (fromIntegral $ colAsIndex $ Right v)
                               Mir.ConstantValue v ->
                                   Mir.ConstantValue v
+                other -> throw $ UnexpectedOperator other
             | n <- nonSinkSourceNodes
             , let (ins, _, op, _) = GR.context mg n
                   cols = actualColumn IM.! n

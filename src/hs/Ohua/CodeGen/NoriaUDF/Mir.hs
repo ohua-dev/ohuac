@@ -1,11 +1,13 @@
 module Ohua.CodeGen.NoriaUDF.Mir where
 
 import qualified Data.Binary as B
+
 import Data.Word
 import qualified Ohua.DFGraph as DFGraph
 import Ohua.Prelude hiding (list, Identity)
 import Data.Text.Prettyprint.Doc as P hiding (list)
 import Ohua.ALang.PPrint ()
+import Control.Exception (throw)
 
 list = brackets . concatWith (surround ", ")
 
@@ -72,10 +74,9 @@ deMorganOp = \case
     Greater -> LessOrEqual
     GreaterOrEqual -> Less
 
-
 data Value col
     = ColumnValue col
-    | ConstantValue Lit
+    | ConstantValue DataType
     deriving (Show, Eq, Generic)
 
 instance Pretty col => Pretty ( Value col) where
@@ -99,6 +100,22 @@ instance Hashable col => Hashable (FilterCondition col)
 
 instance NFData col => NFData ( FilterCondition col )
 
+data DataType
+    = None
+    | Int Integer
+    deriving (Show, Eq, Generic)
+
+instance Num DataType where
+    fromInteger = Int
+
+data LiteralNotSupported = LiteralNotSupported Lit deriving (Show)
+
+instance Exception LiteralNotSupported
+
+litToDataType :: Lit -> DataType
+litToDataType (NumericLit n) = Int n
+litToDataType other = throw $ LiteralNotSupported other
+
 data Node
     = Regular
           { nodeFunction :: QualifiedBinding
@@ -109,6 +126,7 @@ data Node
           { mirJoinProject :: [Column]
           , left :: [Column]
           , right :: [Column]
+          , isLeftJoin :: Bool
           }
     | Identity [Column]
     | Filter
@@ -117,6 +135,7 @@ data Node
           }
     | Union
       { mirUnionEmit :: [[Column]] }
+    | Project { projectEmit :: [Column], projectLiterals :: [(Text, DataType)]}
   deriving (Show, Eq, Generic)
 
 instance Pretty Node where
@@ -126,8 +145,10 @@ instance Pretty Node where
         Identity cols -> "≡" <+> list (map pretty cols)
         Filter conds -> "σ" <+> list [pretty (idx :: Word) <+> pretty cond | (idx, Just cond) <- zip [0..] conds]
         Union emit ->  "∪" <+> list [pretty c | lc <- emit, c <- lc]
+        Project {} -> "π"
 
 
+instance B.Binary DataType
 instance B.Binary a => B.Binary (Value a)
 instance B.Binary Operator
 instance B.Binary col => B.Binary (FilterCondition col)
@@ -135,7 +156,6 @@ instance B.Binary ExecutionType
 instance B.Binary Node
 instance B.Binary Table
 instance B.Binary Column
-
 instance B.Binary HostExpr
 instance B.Binary FnId
 instance B.Binary FunRef
@@ -145,3 +165,12 @@ instance B.Binary NSRef where
     get = makeThrow <$> B.get
 instance B.Binary Binding
 instance B.Binary QualifiedBinding
+
+instance NFData DataType
+
+instance Hashable DataType
+instance Pretty DataType where
+    pretty =
+        \case
+            None -> "None"
+            Int i -> "Int" <> P.parens (pretty i)

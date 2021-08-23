@@ -42,7 +42,7 @@ exprToMirCondition tab (Lambda table body) =
             then pure tab
             else tell [v] >> pure v
         pure $ Mir.ColumnValue (Mir.Column (Just $ Mir.TableByName $ unwrap v') (unwrap n))
-    toVal (Lit l) = pure $ Mir.ConstantValue l
+    toVal (Lit l) = pure $ Mir.ConstantValue $ Mir.litToDataType l
     toVal other = mkE other
     flipOp =
         \case
@@ -81,7 +81,7 @@ exprToMirCondition tab (Lambda table body) =
     f (BuiltinFunE "not" `Apply` thing) = deMorgan <$> f thing
     f other =
         toVal other >>= \case
-            Mir.ColumnValue c -> pure $ Comp (Right c, Mir.Comparison Mir.Equal $ Mir.ConstantValue (NumericLit 1))
+            Mir.ColumnValue c -> pure $ Comp (Right c, Mir.Comparison Mir.Equal $ Mir.ConstantValue 1)
             _ -> mkE other
     deMorgan = transform $ \case
         (Conj con a b) -> Conj (deMorganConjunction con) a b

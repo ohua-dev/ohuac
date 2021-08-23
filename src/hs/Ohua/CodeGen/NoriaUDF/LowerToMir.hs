@@ -43,7 +43,7 @@ import Ohua.CodeGen.NoriaUDF.Types
 import qualified Ohua.DFGraph as DFGraph
 import qualified Ohua.Helpers.Graph as GR
 import qualified Ohua.Helpers.Template as TemplateHelper
-import Ohua.Prelude hiding (First, Identity)
+import Ohua.Prelude hiding (First, Identity, (&))
 import Prelude ((!!))
 import qualified Prelude
 import qualified System.Directory as FS
@@ -239,6 +239,7 @@ typeGraph udfs envInputs g = m
     mkRetType :: GR.Node -> [NType] -> Operator -> [NType]
     mkRetType n argTypes o =
         case o of
+            IsEmptyCheck -> [NTScalar (Left InternalColumn {producingOperator=n,outputIndex=0})]
             Filter {} -> [fromIndex Nothing 0]
             Join {} -> throw $ UnexpectedOperator o
             Identity -> [fromIndex (Just 1) 0]
@@ -409,8 +410,9 @@ sequentializeScalars mGetSem g0 = gFoldTopSort f g0
   where
     getSem = mGetSem
     tc = GR.tc g0
+    canInline l = l == IsEmptyCheck || Just (One, One) == getSem l
     f g' ctx@(ins, n, l, outs)
-        | Just (One, One) <- getSem l
+        | canInline l
         , [(_, p)] <- ins
         , (Just (pins, _, plab, pouts), g'') <- GR.match p g'
         --, Just (_, One) <- getSem plab
@@ -456,6 +458,12 @@ execSemOf nodes =
         Source _ -> Just (Many, Many)
         Sink -> Just (Many, Many)
         Union -> Just (Many, Many)
+        IsEmptyCheck -> Just (Many, One)
+
+(&) :: GR.DynGraph gr => GR.Context a b -> gr a b -> gr a b
+(&) = (GR.&)
+
+infixr 4 &
 
 joinWhereMerge ::
        (GR.DynGraph gr, gr Operator () ~ g) => (GR.Node -> [NType]) -> g -> g
@@ -471,46 +479,61 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
                 Right r
                     | "id" `Text.isSuffixOf` Mir.name r -> succ
                 _ -> id
+    handleJoin g n jt
+        | length cols < 1 = throw $ UnexpectedType "no matching filter found" filterlab filtert
+        | [( (), fsuc' )] <- fsuc
+        , (Just (_, _, IsEmptyCheck, emouts), g3) <- GR.match fsuc' g2 =
+                let [f1, f2] = map snd emouts
+                    matchFilter v (Just ([], _, Filter { conditions }, outs))
+                        | [(Left ( InternalColumn { producingOperator = op, outputIndex = 0} ), (Mir.Comparison Mir.Equal (Mir.ConstantValue v')))] <- HashMap.toList conditions
+                        , v' == v && op == fsuc' = outs
+                    matchFilter _ ctx = throw $ InvalidFilterAfterIsEmpty ctx in
+                let (matchFilter 1 -> f1outs, g4) = GR.match f1 g3
+                    (matchFilter 0 -> f2outs, g5) = GR.match f2 g4
+                    (( theCol, _ ):_) = cols
+                    mkFilter op = Filter { conditions = HashMap.fromList [(theCol, Mir.Comparison op (Mir.ConstantValue Mir.None) )]
+                                         , arguments = ("no", []) -- throw FilterIsMissingAField
+                                         }
+                in (ins, n, Join LeftOuterJoin cols, [((), f1 ), ((), f2)]) &
+                   ([], f1, mkFilter Mir.Equal, f1outs ) &
+                   ([], f2, mkFilter Mir.NotEqual, f2outs ) &
+                   g5
+        | otherwise = (ins, n, Join jt cols, nsuc) GR.& ng
+      where
+        (Just (ins, _, _, [((), suc)]), g1) = GR.match n g
+        (Just (fins, _, filterlab@(Filter conds filterfields), fsuc), g2) =
+            GR.match suc g1
+        filtert@(NTSeq (NTRecFromTable t):_) = getType suc
+        colIsFromTable =
+            \case
+                Right c -> Mir.table c == Just t
+                _ -> False
+        (rem, cols) =
+            unzip $
+            chooseAJoinCol
+                [ (sc1, (c1, c2))
+                | (sc1, Mir.Comparison Mir.Equal (Mir.ColumnValue (Right -> v))) <-
+                      HashMap.toList conds
+                , (c1, c2) <-
+                      case (colIsFromTable sc1, colIsFromTable v) of
+                          (True, False) -> [(sc1, v)]
+                          (False, True) -> [(v, sc1)]
+                          _ -> []
+                ]
+        (ng, nsuc) =
+            if length cols == HashMap.size conds
+                then (g2, fsuc)
+                else ( ( fins
+                        , suc
+                        , Filter
+                              (foldr' HashMap.delete conds rem)
+                              filterfields
+                        , fsuc) GR.&
+                        g2
+                      , [((), suc)])
     f g =
         \case
-            (n, Join jt []) ->
-                let (Just (ins, _, jl, [((), suc)]), g') = GR.match n g
-                    (Just (fins, _, filterlab@(Filter conds filterfields), fsuc), g'') =
-                        GR.match suc g'
-                    filtert@(NTSeq (NTRecFromTable t):_) = getType suc
-                    colIsFromTable =
-                        \case
-                            Right c -> Mir.table c == Just t
-                            _ -> False
-                    (rem, cols) =
-                        unzip $
-                        chooseAJoinCol
-                            [ (sc1, (c1, c2))
-                            | (sc1, Mir.Comparison Mir.Equal (Mir.ColumnValue (Right -> v))) <-
-                                  HashMap.toList conds
-                            , (c1, c2) <-
-                                  case (colIsFromTable sc1, colIsFromTable v) of
-                                      (True, False) -> [(sc1, v)]
-                                      (False, True) -> [(v, sc1)]
-                                      _ -> []
-                            ]
-                    (ng, nsuc) =
-                        if length cols == HashMap.size conds
-                            then (g'', fsuc)
-                            else ( ( fins
-                                   , suc
-                                   , Filter
-                                         (foldr' HashMap.delete conds rem)
-                                         filterfields
-                                   , fsuc) GR.&
-                                   g''
-                                 , [((), suc)])
-                 in if length cols < 1
-                        then error $
-                             "No matching filters found in " <>
-                             quickRender filterlab <>
-                             " with type " <> quickRender filtert
-                        else (ins, n, Join jt cols, nsuc) GR.& ng
+            (n, Join jt []) -> handleJoin g n jt
             _ -> g
 
 -- TODO
@@ -619,15 +642,15 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     selectRemoved = selectToUnion ctrlRemoved
     ctrlRemoved = inlineCtrl (snd . getType) iGr0
     getLits n =
-        fromMaybe (error $ "No literals found for node " <> show n) $
+        fromMaybe [] $
         IM.lookup n envInputs
     iGr0 =
         GR.gmap
-            (\ctx@(in_, n, lab, out) ->
+            (\(in_, n, lab, out) ->
                  ( in_
                  , n
                  , either
-                       (retype3 gMirNodes (getLits n) (fst $ getType n))
+                       (retype3 gMirNodes n (getLits n) (fst $ getType n))
                        id
                        lab
                  , out))
@@ -702,29 +725,32 @@ type TypeMap = IM.IntMap ([NType], [NType])
 
 retype3 ::
        GeneratedMirNodes
+    -> GR.Node
     -> [(Int, Lit)]
     -> [NType]
     -> QualifiedBinding
     -> Operator
-retype3 m lits ty other@(QualifiedBinding namespace name) =
+retype3 m n lits ty other@(QualifiedBinding namespace name) =
     case namespace of
         ["intrinsic"] ->
             case name of
                 "sink" -> throw $ UnexpectedOperator Sink
                 _ -> throw $ UnknownBuiltin other
         ["ohua", "lang"]
-            | name == "(,)" -> Project (map toCol ty)
+            | name == "(,)" ->
+              Project { projectEmit = map toCol ty, projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits }
             | name `elem` builtinSimpleFuns ->
                 CustomOp other (map toCol ty)
             | name == "id" -> Identity
             | name == "unitFn" ->
                 case Prelude.lookup 0 lits of
                     Just (FunRefLit (FunRef r _)) ->
-                        retype3 m (error "impossible") ty r
+                        retype3 m n (error "impossible") ty r
                     _ -> throw $ InvalidLiteralInputs (CustomOp other []) (map snd lits)
             | otherwise -> CustomOp other []
         ["ohua", "lang", "field"] -> CustomOp other []
         ["ohua", "sql", "table"] -> Source (Mir.TableByName $ unwrap name)
+        ["ohua", "sql", "query"] | name == "table_is_empty" -> IsEmptyCheck
         _ ->
             fromMaybe (CustomOp other (map toCol ty)) $
             fmap rewriteFilter $ HashMap.lookup other m
@@ -769,6 +795,9 @@ retype3 m lits ty other@(QualifiedBinding namespace name) =
         \case
             NTScalar s -> s
             t -> throw $ UnexpectedType "NTScalar" (CustomOp other []) [t]
+    litToDBLit = \case
+        FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _) -> Mir.None
+        other -> throw $ InvalidLiteralInputs (Project [] []) [other]
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
@@ -787,11 +816,7 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
                         , Join InnerJoin []
                         , [((), n)]) GR.&
                         GR.delEdges [(x, n), (y, n)] g
-                    other ->
-                        error $
-                        "Multiple ancestors for " <>
-                        show n <>
-                        " (" <> show lab <> ") a bit unexpected " <> show other
+                    other -> throw $ WrongNumberOfAncestors n lab 1 (length other)
 
 -- UDF {
 --     function_name: String,
@@ -848,7 +873,8 @@ instance ToRust SerializableGraph where
                 Mir.ColumnValue c -> "Value::Column" <> PP.parens (pretty c)
         encodeValueConstant =
             ("DataType::" <>) . \case
-                NumericLit n -> "Int" <> PP.parens (pretty n)
+                Mir.Int n -> "Int" <> PP.parens (pretty n)
+                Mir.None -> "None"
         mirNodeToRust =
             ("MirNodeType::" <>) . \case
                 Mir.Identity _ -> "Identity"
@@ -875,7 +901,7 @@ instance ToRust SerializableGraph where
                                     "Simple" <> recordSyn [("carry", pretty i)])
                         ]
                 Mir.Join {..} ->
-                    "Join" <+>
+                    (if isLeftJoin then "LeftJoin" else "Join" ) <+>
                     recordSyn
                         [ ("on_left", ppColVec left)
                         , ("on_right", ppColVec right)
@@ -884,6 +910,8 @@ instance ToRust SerializableGraph where
                 Mir.Union {..} ->
                     "Union" <+>
                     recordSyn [("emit", ppVec $ map ppColVec mirUnionEmit)]
+                Mir.Project {..} ->
+                    "Project" <+> recordSyn [("emit", ppColVec projectEmit), ("literals", ppVec $ map (\(s, c) -> PP.tupled [pretty s, encodeValueConstant c]) projectLiterals )]
         recordSyn =
             PP.encloseSep PP.lbrace PP.rbrace PP.comma .
             map (uncurry $ PP.surround ": ")
@@ -936,6 +964,7 @@ calcColumns cOpOut gr = colmap
                           in fromNode a
                   in (n, ) $
                      case l of
+                         IsEmptyCheck -> [Left $ InternalColumn {producingOperator=n, outputIndex=0}]
                          Source t ->
                              map Right $
                              fromMaybe
@@ -943,7 +972,7 @@ calcColumns cOpOut gr = colmap
                              HashMap.lookup t tableColumn
                          Sink -> fromAncestor
                          CustomOp {} -> fromAncestor <> map Left (cOpOut n)
-                         Project {} -> fromAncestor
+                         Project {..} -> fromAncestor <> map (Left . fst) projectLits
                          Identity -> fromAncestor
                          Filter {} -> fromAncestor
                          Union -> assert (take (length short) long == short) short
@@ -976,7 +1005,7 @@ calcColumns cOpOut gr = colmap
                               case c2 of
                                   Mir.ColumnValue c -> [Right c]
                                   _ -> []
-                      Project cols -> cols
+                      Project {..} -> projectEmit
                       Join {joinOn} -> joinOn >>= \(c1, c2) -> [c1, c2]
                       _ -> []
             ]
@@ -1026,43 +1055,42 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                         }
                     where Just execSem = execSemMap op
                 Join {joinType, joinOn}
-                    | joinType /= InnerJoin -> unimplemented
-                    | otherwise ->
-                        let containsCols actual =
-                                all (`elem` actual)
-                            (l, r) = unzip joinOn
-                            [lp, rp] = map snd ins
-                            lc = actualColumn IM.! lp
-                            rc = actualColumn IM.! rp
-                            lpHasL = containsCols lc l
-                            rpHasL = containsCols rc l
-                            lpHasR = containsCols lc r
-                            rpHasR = containsCols rc r
-                            (map someColToMirCol -> left, map someColToMirCol -> right) =
-                                if | lpHasL && lpHasR && rpHasR && rpHasL ->
-                                       error $
-                                       "Ambiguous columns in join " <>
-                                       quickRender op
-                                   | lpHasL && rpHasR -> (l, r)
-                                   | lpHasR && rpHasL -> (r, l)
-                                   | not (lpHasL || rpHasL) ->
-                                       error $ "Left join columns not found"
-                                   | not (rpHasR || lpHasR) ->
-                                       error $ "Right join columns not found"
-                                   | otherwise ->
-                                       error $
-                                       "impossible " <>
-                                       show (lpHasL, rpHasL, lpHasR, rpHasR)
-                         in do
-                            logDebugN $ quickRender op <> ":"
-                            logDebugN $ "Saw \n    left parent " <> show lp <> "(" <> show (toNIdx lp) <> ") with columns " <> quickRender lc <> "\n    right parent " <> show rp <> "(" <> show (toNIdx rp) <> ") with columns " <> quickRender rc
-                            let boolAsNot = \case True -> ""; _ -> "not "
-                            logDebugN $ "Demanded left columns " <> boolAsNot lpHasL <> "found in left parent, " <> boolAsNot rpHasL <> "found in right parent"
-                            logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
-                            logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
-                            pure Mir.Join {mirJoinProject = mirCols, left, right}
+                    | otherwise -> do
+                          logDebugN $ quickRender op <> ":"
+                          logDebugN $ "Saw \n    left parent " <> show lp <> "(" <> show (toNIdx lp) <> ") with columns " <> quickRender lc <> "\n    right parent " <> show rp <> "(" <> show (toNIdx rp) <> ") with columns " <> quickRender rc
+                          let boolAsNot = \case True -> ""; _ -> "not "
+                          logDebugN $ "Demanded left columns " <> boolAsNot lpHasL <> "found in left parent, " <> boolAsNot rpHasL <> "found in right parent"
+                          logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
+                          logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
+                          pure Mir.Join {mirJoinProject = mirCols, left, right, isLeftJoin = joinType == LeftOuterJoin}
+                        where
+                          containsCols actual =
+                              all (`elem` actual)
+                          (l, r) = unzip joinOn
+                          [lp, rp] = map snd ins
+                          lc = actualColumn IM.! lp
+                          rc = actualColumn IM.! rp
+                          lpHasL = containsCols lc l
+                          rpHasL = containsCols rc l
+                          lpHasR = containsCols lc r
+                          rpHasR = containsCols rc r
+                          (map someColToMirCol -> left, map someColToMirCol -> right) =
+                              if | lpHasL && lpHasR && rpHasR && rpHasL ->
+                                      error $
+                                      "Ambiguous columns in join " <>
+                                      quickRender op
+                                  | lpHasL && rpHasR -> (l, r)
+                                  | lpHasR && rpHasL -> (r, l)
+                                  | not (lpHasL || rpHasL) ->
+                                      error $ "Left join columns not found"
+                                  | not (rpHasR || lpHasR) ->
+                                      error $ "Right join columns not found"
+                                  | otherwise ->
+                                      error $
+                                      "impossible " <>
+                                      show (lpHasL, rpHasL, lpHasR, rpHasR)
                 Union -> pure Mir.Union {mirUnionEmit = map (\(_, n) -> map someColToMirCol $ actualColumn IM.! n) ins}
-                Project _ ->  pure $ Mir.Identity mirCols
+                Project {..} ->  pure $ Mir.Project { projectEmit = mirCols, projectLiterals = zip (repeat "unused") $ map snd projectLits }
                 Identity -> pure $ Mir.Identity mirCols
                 Filter f _ -> do
                     let conds = map (flip HashMap.lookup $ HashMap.map reCond f) cols
@@ -1096,7 +1124,7 @@ toSerializableGraph entrypoint execSemMap tm mg = do
             projectedCols = HashSet.toList $ findProjCols s
             findProjCols s =
                 case GR.lab mg s of
-                    Just (Project p) -> HashSet.fromList p
+                    Just (Project p lits) -> HashSet.fromList $ p <> map (Left . fst) lits
                     Just _ -> HashSet.unions $ map findProjCols $ GR.pre mg s
                     Nothing -> error "Why no label?"
         (sinkIn, sinkOut) <-

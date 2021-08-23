@@ -14,9 +14,11 @@ data NType
     = NTSeq NType
     | NTTup [NType]
     | NTRecFromTable Mir.Table
-    | NTAnonRec Binding [(Binding, NType)]
+    | NTAnonRec Binding NTFields
     | NTScalar SomeColumn
   deriving (Show, Eq, Ord, Generic)
+
+type NTFields = [(Binding, NType)]
 
 instance Hashable NType
 instance NFData NType
@@ -77,16 +79,16 @@ data JoinType
     | InnerJoin
     deriving (Show, Eq, Generic)
 
-
 data Operator
     = CustomOp QualifiedBinding [SomeColumn]
     | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
-    | Project [SomeColumn]
+    | Project { projectEmit :: [ SomeColumn ], projectLits :: [(InternalColumn, Mir.DataType )] }
     | Identity
     | Union
     | Sink
     | Source Mir.Table
     | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
+    | IsEmptyCheck
     deriving (Show, Eq, Generic)
 
 -- instance Hashable Operator
@@ -104,8 +106,9 @@ instance PP.Pretty Operator where
         Identity -> "≡"
         Sink -> "Sink"
         Source s -> "B" <+> PP.pretty s
-        Project c -> "π" <+> PP.list (map showCol c)
+        Project {..} -> "π" <+> PP.list (map showCol projectEmit <> map pretty projectLits)
         CustomOp o c -> PP.pretty o <+> PP.list (map showCol c)
+        IsEmptyCheck -> "∅?"
       where
           showCol = \case
               Left InternalColumn{..} -> PP.pretty producingOperator <> ":" <> PP.pretty outputIndex

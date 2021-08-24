@@ -63,7 +63,7 @@ data LoweringError
     | InvalidIndexIntoType Int NType
     | InvalidIndexIntoTypes Int [NType] Operator Int Operator
     | ExpectedNumericLiteral Lit
-    | InvalidArgumentType Operator (Maybe (Int, Int)) [NType]
+    | InvalidArgumentType GR.Node Operator (Maybe (Int, Int)) [NType]
     | LabelNotFound Int
     | InvalidReturnType Operator [NType] (Maybe Int)
     | UnexpectedOutputColumn Operator Int Int
@@ -80,8 +80,14 @@ data LoweringError
     | ProjectInputsDoNotLineUp [(Int, Lit)] [NType]
     | InvalidFilterAfterIsEmpty (GR.MContext Operator ())
     | UnexpectedNumberOfAncestors GR.Node Operator Word [GR.Node]
+    | AmbiguousColumnsInJoin Operator
+    | JoinColumnsNotFound Bool Operator [SomeColumn] [SomeColumn] [SomeColumn]
+    | Impossible
+    | ExpectedEqualType GR.Node Operator NType NType
     deriving Show
 
+traceWarning :: Text -> a -> a
+traceWarning t = trace ("WARNING: " <> t)
 
 instance Exception LoweringError
 
@@ -142,6 +148,7 @@ quickDumpGrAsDot =
     \entrypoint f g -> do
         let dir = "." <> toString (unwrap entrypoint) <> "-graphs"
         i <- atomicModifyIORef' graphDumpIndex (\i -> (succ i, i))
+        when (i == initial) $ liftIO $ FS.removeDirectoryRecursive dir
         let file = dir FS.</> show i <> "-" <> f
         liftIO $ do
             FS.createDirectoryIfMissing False dir
@@ -151,7 +158,8 @@ quickDumpGrAsDot =
                 g
         logDebugN $ "Wrote graph " <> toText file
   where
-    graphDumpIndex = unsafePerformIO $ newIORef 1
+    initial = 1
+    graphDumpIndex = unsafePerformIO $ newIORef initial
     {-# NOINLINE graphDumpIndex #-}
 
 expectNumLit :: HasCallStack => Lit -> Integer
@@ -161,17 +169,18 @@ expectNumLit other = throw $ ExpectedNumericLiteral other
 getLit :: IntMap [a] -> Int -> [a]
 getLit m k = fromMaybe [] $ IM.lookup k m
 
-isJoin :: Operator -> Bool
-isJoin Join {} = True
-isJoin _ = False
+isJoin, isSink, isSource :: Operator -> Bool
+isJoin = \case
+    Join {} -> True
+    _ -> False
 
-isSink :: Operator -> Bool
-isSink Sink = True
-isSink _ = False
+isSink = \case
+    Sink -> True
+    _ -> False
 
-isSource :: Operator -> Bool
-isSource Source {} = True
-isSource _ = False
+isSource = \case
+    Source {} -> True
+    _ -> False
 
 groupOnInt :: [(a, Int)] -> [([a], Int)]
 groupOnInt =
@@ -245,13 +254,16 @@ typeGraph udfs envInputs g = m
             Identity -> [fromIndex (Just 1) 0]
             Sink -> [fromIndex (Just 1) 0]
             Source t -> [NTSeq (NTRecFromTable t)]
-            Project {..} -> map NTScalar $ projectEmit <> map (Left . fst) projectLits
+            Project {..} -> [NTTup $ map NTScalar $ projectEmit <> map (Left . fst) projectLits]
             Union -> throw $ UnexpectedOperator Union
             CustomOp bnd _
                 | bnd == Refs.nth ->
-                    let Just (0, NumericLit (fromIntegral -> idx)) =
+                    let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ LiteralNotFound n) $
                             find ((== 0) . view _1) $ envInputs `getLit` n
-                     in [fromIndex Nothing idx]
+                     in case fromIndex (Just 1) 0 of
+                            NTTup tys
+                                | Just t <- tys ^? ix idx -> [t]
+                            t -> throw (InvalidIndexIntoType idx t)
                 | bnd == Refs.smapFun ->
                     case fromIndex (Just 1) 0 of
                         NTSeq t ->
@@ -260,16 +272,26 @@ typeGraph udfs envInputs g = m
                             , NTScalar $ Left $ InternalColumn n 2
                             ] {- is this really necessary? -}
                         _ -> invalidArgs
-                | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 0]
+                | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 1]
                 | bnd == Refs.ctrl -> Prelude.tail argTypes
                 | bnd == Refs.ifFun ->
                   case argTypes of
                       [x] -> [x,x]
                       _ -> throw $ IncorrectType "expected one onput type" Refs.ifFun n argTypes
-                | bnd == Refs.select -> [fromIndex Nothing 1]
+                | bnd == Refs.select ->
+                  case argTypes of
+                      [_, x] -> [x]
+                      [_, a, b]
+                          | shallowEqNType a b -> [a]
+                          | Just t <- (if | isUnitNType a -> Just b | isUnitNType b -> Just a | otherwise -> Nothing) -> [t]
+                          | Just (t1, t2) <-
+                            (if | isSeqNType a -> Just (a, b) | isSeqNType b -> Just (b, a) | otherwise -> Nothing) ->
+                                traceWarning ("select arguments had differing type, choosing sequence type " <> quickRender t1 <> " over " <> quickRender t2) [t1]
+                          | otherwise -> throw $ ExpectedEqualType n o a b
+                      _ -> throw $ InvalidArgumentType n o (Just (2, length argTypes)) argTypes
                 | QualifiedBinding ["ohua", "lang"] b <- bnd ->
                     case b of
-                        "(,)" -> argTypes
+                        "(,)" -> [NTTup argTypes ]
                         _
                             | b `elem`
                                   (["lt", "gt", "eq", "and", "or", "leq", "geq", "<", ">", "<=", ">=", "==", "!=", "&&", "||"] :: Vector Binding) ->
@@ -290,13 +312,13 @@ typeGraph udfs envInputs g = m
       where
         likeUdf = [NTScalar $ Left $ InternalColumn n 0]
         invalidArgs :: a
-        invalidArgs = throw $ InvalidArgumentType o Nothing argTypes
-        fromIndex l i
-            | Just el <- l
-            , let al = length argTypes
-            , el /= al = throw $ InvalidArgumentType o (Just (el, al)) argTypes
+        invalidArgs = throw $ InvalidArgumentType n o Nothing argTypes
+        fromIndex (Just el) _
+            | let al = length argTypes
+            , el /= al = throw $ InvalidArgumentType n o (Just (el, al)) argTypes
+        fromIndex _ i
             | Just t' <- argTypes ^? ix i = t'
-            | otherwise = invalidArgs
+            | otherwise = throw $ InvalidArgumentType n o (Just (i, length argTypes)) argTypes
     m =
         IM.fromList
             [ (n, (argTypes, mkRetType n argTypes l))
@@ -433,7 +455,7 @@ sequentializeScalars mGetSem g0 = gFoldTopSort f g0
             [o | o@(_, o') <- stuff, not (any (flip reachable o' . snd) stuff)]
 
 builtinSimpleFuns :: Vector Binding
-builtinSimpleFuns = ["lt", "gt", "leq", "eq", "geq", "not", "and", "==", ">=", "<=", "!=", "<", ">", "&&", "||"]
+builtinSimpleFuns = ["nth", "lt", "gt", "leq", "eq", "geq", "not", "and", "==", ">=", "<=", "!=", "<", ">", "&&", "||"]
 
 execSemOf ::
        (QualifiedBinding -> Maybe UDFDescription)
@@ -448,9 +470,7 @@ execSemOf nodes =
             | op == Refs.ctrl -> Just (One, Many)
             | op ^. namespace == ["ohua", "lang", "field"] -> Just (One, One)
             | QualifiedBinding ["ohua", "lang"] b <- op
-            , b `elem` builtinSimpleFuns
-                   ->
-                Just (One, One)
+            , b `elem` builtinSimpleFuns -> Just (One, One)
             | otherwise -> execSemantic <$> nodes op
         Filter {} -> Just (Many, Many)
         Identity -> Nothing
@@ -739,6 +759,7 @@ retype3 m n lits ty other@(QualifiedBinding namespace name) =
         ["ohua", "lang"]
             | name == "(,)" ->
               Project { projectEmit = map toCol ty, projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits }
+            | name == "nth" -> CustomOp other []
             | name `elem` builtinSimpleFuns ->
                 CustomOp other (map toCol ty)
             | name == "id" -> Identity
@@ -983,7 +1004,7 @@ calcColumns cOpOut gr = colmap
                              retA = fromNode a
                              retB = fromNode b
                              (long, short) = if length retA < length retB then (retB, retA) else (retA, retB)
-                         Join {}
+                         Join {joinOn}
                              | length pre /= 2 ->
                                throw $ WrongNumberOfAncestors n l 2 (length pre)
                              | otherwise -> pre >>= fromNode) $
@@ -1013,6 +1034,52 @@ calcColumns cOpOut gr = colmap
 instance PP.Pretty SomeColumn where
     pretty = either pretty pretty
 
+opToMir actualColumn ins toNIdx mirCols cols execSemMap n op = case op of
+    CustomOp o ccols ->
+        pure $
+        Mir.Regular
+            { nodeFunction = o
+            , indices = map someColToMirCol ccols
+            , executionType =
+                  case execSem of
+                      ReductionSem -> unimplemented
+                      SimpleSem ->
+                          let [p] = ins
+                            in Mir.Simple $
+                              fromIntegral $
+                              length $ actualColumn IM.! snd p
+                      _ -> unimplemented
+            }
+        where Just execSem = execSemMap op
+    Join {joinType, joinOn} ->
+        pure Mir.Join {mirJoinProject = mirCols, left = map someColToMirCol l, right = map someColToMirCol r, isLeftJoin = joinType == LeftOuterJoin}
+      where
+        (l, r) = unzip joinOn
+    Union -> pure Mir.Union {mirUnionEmit = map (\(_, n) -> map someColToMirCol $ actualColumn IM.! n) ins}
+    Project {..} ->  pure $ Mir.Project { projectEmit = mirCols, projectLiterals = zip (repeat "unused") $ map snd projectLits }
+    Identity -> pure $ Mir.Identity mirCols
+    Filter f _ -> do
+        let conds = map (flip HashMap.lookup $ HashMap.map reCond f) cols
+        assertM $ length (catMaybes conds) == HashMap.size f
+        pure $
+            Mir.Filter
+                { conditions = conds
+                }
+        where
+          colAsIndex :: HasCallStack => SomeColumn -> Word
+          colAsIndex c = fromIntegral $
+              fromMaybe (error $ "Expected to find column " <> quickRender c <> " in " <> quickRender cols <> "\n  Operator " <> show n <> " " <> quickRender op) $
+              List.elemIndex c cols
+          reCond (Mir.Comparison op val) =
+              Mir.Comparison op $
+              case val of
+                  Mir.ColumnValue v ->
+                      Mir.ColumnValue
+                      (fromIntegral $ colAsIndex $ Right v)
+                  Mir.ConstantValue v ->
+                      Mir.ConstantValue v
+    other -> throw $ UnexpectedOperator other
+
 toSerializableGraph ::
        (MonadLogger m, MonadIO m)
     => Binding
@@ -1036,90 +1103,47 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 , strip outs)
     adjacencies <-
         sequence
-            [ (, mirCols, map (toNIdx . snd) ins) <$>
-            case op of
-                CustomOp o ccols ->
-                    pure $
-                    Mir.Regular
-                        { nodeFunction = o
-                        , indices = map someColToMirCol ccols
-                        , executionType =
-                              case execSem of
-                                  ReductionSem -> unimplemented
-                                  SimpleSem ->
-                                      let [p] = ins
-                                       in Mir.Simple $
-                                          fromIntegral $
-                                          length $ actualColumn IM.! snd p
-                                  _ -> unimplemented
-                        }
-                    where Just execSem = execSemMap op
-                Join {joinType, joinOn}
-                    | otherwise -> do
-                          logDebugN $ quickRender op <> ":"
-                          logDebugN $ "Saw \n    left parent " <> show lp <> "(" <> show (toNIdx lp) <> ") with columns " <> quickRender lc <> "\n    right parent " <> show rp <> "(" <> show (toNIdx rp) <> ") with columns " <> quickRender rc
-                          let boolAsNot = \case True -> ""; _ -> "not "
-                          logDebugN $ "Demanded left columns " <> boolAsNot lpHasL <> "found in left parent, " <> boolAsNot rpHasL <> "found in right parent"
-                          logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
-                          logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
-                          pure Mir.Join {mirJoinProject = mirCols, left, right, isLeftJoin = joinType == LeftOuterJoin}
-                        where
-                          containsCols actual =
-                              all (`elem` actual)
-                          (l, r) = unzip joinOn
-                          [lp, rp] = map snd ins
-                          lc = actualColumn IM.! lp
-                          rc = actualColumn IM.! rp
-                          lpHasL = containsCols lc l
-                          rpHasL = containsCols rc l
-                          lpHasR = containsCols lc r
-                          rpHasR = containsCols rc r
-                          (map someColToMirCol -> left, map someColToMirCol -> right) =
-                              if | lpHasL && lpHasR && rpHasR && rpHasL ->
-                                      error $
-                                      "Ambiguous columns in join " <>
-                                      quickRender op
-                                  | lpHasL && rpHasR -> (l, r)
-                                  | lpHasR && rpHasL -> (r, l)
-                                  | not (lpHasL || rpHasL) ->
-                                      error $ "Left join columns not found"
-                                  | not (rpHasR || lpHasR) ->
-                                      error $ "Right join columns not found"
-                                  | otherwise ->
-                                      error $
-                                      "impossible " <>
-                                      show (lpHasL, rpHasL, lpHasR, rpHasR)
-                Union -> pure Mir.Union {mirUnionEmit = map (\(_, n) -> map someColToMirCol $ actualColumn IM.! n) ins}
-                Project {..} ->  pure $ Mir.Project { projectEmit = mirCols, projectLiterals = zip (repeat "unused") $ map snd projectLits }
-                Identity -> pure $ Mir.Identity mirCols
-                Filter f _ -> do
-                    let conds = map (flip HashMap.lookup $ HashMap.map reCond f) cols
-                    assertM $ length (catMaybes conds) == HashMap.size f
-                    pure $
-                        Mir.Filter
-                            { conditions = conds
-                            }
-                    where
-                      colAsIndex :: HasCallStack => SomeColumn -> Word
-                      colAsIndex c = fromIntegral $
-                          fromMaybe (error $ "Expected to find column " <> quickRender c <> " in " <> quickRender cols <> "\n  Operator " <> show n <> " " <> quickRender op) $
-                          List.elemIndex c cols
-                      reCond (Mir.Comparison op val) =
-                          Mir.Comparison op $
-                          case val of
-                              Mir.ColumnValue v ->
-                                  Mir.ColumnValue
-                                  (fromIntegral $ colAsIndex $ Right v)
-                              Mir.ConstantValue v ->
-                                  Mir.ConstantValue v
-                other -> throw $ UnexpectedOperator other
+            [ (, mirCols, ) <$> opToMir actualColumn ins toNIdx mirCols cols execSemMap n op <*> ancestors
             | n <- nonSinkSourceNodes
             , let (ins, _, op, _) = GR.context mg n
                   cols = actualColumn IM.! n
                   mirCols = map someColToMirCol cols
+                  ancestors = case op of
+                      Join {joinOn}
+                          | [lp,rp] <- map snd ins -> do
+                                let containsCols actual =
+                                        all (`elem` actual)
+                                    (l, r) = unzip joinOn
+                                    lc = actualColumn IM.! lp
+                                    rc = actualColumn IM.! rp
+                                    lpHasL = containsCols lc l
+                                    rpHasL = containsCols rc l
+                                    lpHasR = containsCols lc r
+                                    rpHasR = containsCols rc r
+                                    (left, right) =
+                                        if | lpHasL && lpHasR && rpHasR && rpHasL ->
+                                                throw $ AmbiguousColumnsInJoin op
+                                           | lpHasL && rpHasR -> (lp, rp)
+                                           | lpHasR && rpHasL -> (rp, lp)
+                                           | not (lpHasL || rpHasL) ->
+                                                 throw $ JoinColumnsNotFound True op l lc rc
+                                           | not (rpHasR || lpHasR) ->
+                                                 throw $ JoinColumnsNotFound False op l lc rc
+                                           | otherwise ->
+                                                 throw $ Impossible
+                                logDebugN $ quickRender op <> ":"
+                                logDebugN $ "Saw \n    left parent " <> show lp <> "(" <> show (toNIdx lp) <> ") with columns " <> quickRender lc <> "\n    right parent " <> show rp <> "(" <> show (toNIdx rp) <> ") with columns " <> quickRender rc
+                                let boolAsNot = \case True -> ""; _ -> "not "
+                                logDebugN $ "Demanded left columns " <> boolAsNot lpHasL <> "found in left parent, " <> boolAsNot rpHasL <> "found in right parent"
+                                logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
+                                logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
+                                pure $ map toNIdx [left, right]
+                          | otherwise ->
+                               throw $ WrongNumberOfAncestors n op 2 (length ins)
+                      _ -> pure $ map (toNIdx . snd) ins
             ]
     sink0 <- do
-        let [(s, _, l)] = GR.inn mg $ fst sink
+        let [(s, _, _)] = GR.inn mg $ fst sink
             avail = HashSet.fromList $ completeOutputColsFor s
             projectedCols = HashSet.toList $ findProjCols s
             findProjCols s =

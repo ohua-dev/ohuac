@@ -18,6 +18,27 @@ data NType
     | NTScalar SomeColumn
   deriving (Show, Eq, Ord, Generic)
 
+isRecNType, isSeqNType, isUnitNType :: NType -> Bool
+
+isRecNType = \case
+    NTAnonRec {} -> True
+    NTRecFromTable {} -> True
+    _ -> False
+
+isSeqNType = \case
+    NTSeq {} -> True
+    _ -> False
+
+isUnitNType = \case
+    NTTup [] -> True
+    _ -> False
+
+shallowEqNType :: NType -> NType -> Bool
+shallowEqNType NTSeq {} NTSeq {} = True
+shallowEqNType NTTup {} NTTup {} = True
+shallowEqNType NTScalar {} NTScalar {} = True
+shallowEqNType t1 t2 = isRecNType t1 && isRecNType t2
+
 type NTFields = [(Binding, NType)]
 
 instance Hashable NType

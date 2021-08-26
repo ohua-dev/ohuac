@@ -148,9 +148,10 @@ quickDumpGrAsDot =
     \entrypoint f g -> do
         let dir = "." <> toString (unwrap entrypoint) <> "-graphs"
         i <- atomicModifyIORef' graphDumpIndex (\i -> (succ i, i))
-        when (i == initial) $ liftIO $ FS.removeDirectoryRecursive dir
         let file = dir FS.</> show i <> "-" <> f
         liftIO $ do
+            exists <- FS.doesDirectoryExist dir
+            when (exists && i == initial) $ FS.removeDirectoryRecursive dir
             FS.createDirectoryIfMissing False dir
             LT.writeFile file .
                 GraphViz.renderDot .
@@ -932,7 +933,12 @@ instance ToRust SerializableGraph where
                     "Union" <+>
                     recordSyn [("emit", ppVec $ map ppColVec mirUnionEmit)]
                 Mir.Project {..} ->
-                    "Project" <+> recordSyn [("emit", ppColVec projectEmit), ("literals", ppVec $ map (\(s, c) -> PP.tupled [pretty s, encodeValueConstant c]) projectLiterals )]
+                    "Project" <+>
+                    recordSyn
+                    [ ("emit", ppColVec projectEmit)
+                    , ("arithmetic", ppVec [])
+                    , ("literals", ppVec $ map (\(s, c) -> PP.tupled [ PP.dquotes ( pretty s ) <> ".to_string()", encodeValueConstant c]) projectLiterals )
+                    ]
         recordSyn =
             PP.encloseSep PP.lbrace PP.rbrace PP.comma .
             map (uncurry $ PP.surround ": ")

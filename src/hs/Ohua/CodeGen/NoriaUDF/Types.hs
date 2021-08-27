@@ -9,6 +9,7 @@ import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.HashMap.Strict as HashMap
+import Control.Lens.Plated (Plated, plate, gplate)
 
 data NType
     = NTSeq NType
@@ -17,6 +18,9 @@ data NType
     | NTAnonRec Binding NTFields
     | NTScalar SomeColumn
   deriving (Show, Eq, Ord, Generic)
+
+instance Plated NType where
+    plate = gplate
 
 isRecNType, isSeqNType, isUnitNType :: NType -> Bool
 
@@ -105,19 +109,21 @@ data Operator
     | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
     | Project { projectEmit :: [ SomeColumn ], projectLits :: [(InternalColumn, Mir.DataType )] }
     | Identity
-    | Union
     | Sink
     | Source Mir.Table
     | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
     | IsEmptyCheck
+    | Select SelectPayload
     deriving (Show, Eq, Generic)
+
+type SelectPayload = [[Either SomeColumn Mir.Table]]
 
 -- instance Hashable Operator
 
 
 instance PP.Pretty Operator where
     pretty = \case
-        Union -> "⋃"
+        Select sides -> "⋃" <+> PP.list (map (PP.list . map (either showCol PP.pretty)) sides)
         Filter conds _ ->
             "σ" <+>
             PP.list

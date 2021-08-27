@@ -12,6 +12,7 @@ module Ohua.CodeGen.NoriaUDF.LowerToMir
     ) where
 
 import Control.Lens (Simple, (?~), (%=), (^?!), ix, to, use, at)
+import qualified Control.Lens as Lens
 import qualified Data.GraphViz as GraphViz
 import qualified Data.GraphViz.Printing as GraphViz
 import qualified Data.HashMap.Strict as HashMap
@@ -50,7 +51,8 @@ import qualified System.Directory as FS
 import qualified System.FilePath as FS
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Printf (printf)
-import Control.Exception (throw)
+import qualified Control.Exception (throw, displayException)
+import qualified GHC.Exception
 
 
 data LoweringError
@@ -75,7 +77,7 @@ data LoweringError
     | TypeNotKnown GR.Node
     | LiteralNotFound GR.Node
     | WrongNumberOfAncestors GR.Node Operator Int Int
-    | ColumnNotFound GR.Node (IM.IntMap [SomeColumn])
+    | ColumnNotFound GR.Node (IM.IntMap LoweringMapEntry)
     | TableColumnsNotFound Mir.Table (HashMap Mir.Table [Mir.Column])
     | ProjectInputsDoNotLineUp [(Int, Lit)] [NType]
     | InvalidFilterAfterIsEmpty (GR.MContext Operator ())
@@ -83,8 +85,27 @@ data LoweringError
     | AmbiguousColumnsInJoin Operator
     | JoinColumnsNotFound Bool Operator [SomeColumn] [SomeColumn] [SomeColumn]
     | Impossible
+    | Unimplemented
     | ExpectedEqualType GR.Node Operator NType NType
+    | ColumnHasNoTable Mir.Column
+    | ColumnNotFoundInList SomeColumn [SomeColumn] GR.Node Operator
+    | InvalidUDFReturnType GR.Node NType
+    | Expected2TypeRowsInSelect GR.Node SelectPayload
+    | CannotReconcileSelectArmTypes (Either SomeColumn Mir.Table) (Either SomeColumn Mir.Table)
+    | AncestorNotFound [Int] GR.Node GR.Node
+    | NoMirEquivalent Operator GR.Node
     deriving Show
+
+data ErrorWithTrace = forall e . Exception e => ErrorWithTrace CallStack e
+
+instance Exception ErrorWithTrace
+
+instance Prelude.Show ErrorWithTrace where
+    show (ErrorWithTrace trace e) =
+        Prelude.unlines [Control.Exception.displayException e, "Stack Trace:", GHC.Exception.prettyCallStack trace]
+
+throw :: ( HasCallStack, Exception e) => e -> a
+throw e = Control.Exception.throw $ ErrorWithTrace callStack e
 
 traceWarning :: Text -> a -> a
 traceWarning t = trace ("WARNING: " <> t)
@@ -108,7 +129,8 @@ type GeneratedMirNodes = HashMap QualifiedBinding Operator
 
 type LitMap = IntMap [(Int, Lit)]
 
-type AdjList a = [(a, [Mir.Column], [Word])]
+type AdjList a = [Adj a]
+type Adj a = (a, [Mir.Column], [Word])
 
 data SerializableGraph =
     SerializableGraph
@@ -256,7 +278,17 @@ typeGraph udfs envInputs g = m
             Sink -> [fromIndex (Just 1) 0]
             Source t -> [NTSeq (NTRecFromTable t)]
             Project {..} -> [NTTup $ map NTScalar $ projectEmit <> map (Left . fst) projectLits]
-            Union -> throw $ UnexpectedOperator Union
+            Select _ ->
+                  case argTypes of
+                      [_, x] -> [x]
+                      [_, a, b]
+                          | shallowEqNType a b -> [a]
+                          | Just t <- (if | isUnitNType a -> Just b | isUnitNType b -> Just a | otherwise -> Nothing) -> [t]
+                          | Just (t1, t2) <-
+                            (if | isSeqNType a -> Just (a, b) | isSeqNType b -> Just (b, a) | otherwise -> Nothing) ->
+                                traceWarning ("select arguments had differing type, choosing sequence type " <> quickRender t1 <> " over " <> quickRender t2) [t1]
+                          | otherwise -> throw $ ExpectedEqualType n o a b
+                      _ -> throw $ InvalidArgumentType n o (Just (2, length argTypes)) argTypes
             CustomOp bnd _
                 | bnd == Refs.nth ->
                     let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ LiteralNotFound n) $
@@ -279,17 +311,6 @@ typeGraph udfs envInputs g = m
                   case argTypes of
                       [x] -> [x,x]
                       _ -> throw $ IncorrectType "expected one onput type" Refs.ifFun n argTypes
-                | bnd == Refs.select ->
-                  case argTypes of
-                      [_, x] -> [x]
-                      [_, a, b]
-                          | shallowEqNType a b -> [a]
-                          | Just t <- (if | isUnitNType a -> Just b | isUnitNType b -> Just a | otherwise -> Nothing) -> [t]
-                          | Just (t1, t2) <-
-                            (if | isSeqNType a -> Just (a, b) | isSeqNType b -> Just (b, a) | otherwise -> Nothing) ->
-                                traceWarning ("select arguments had differing type, choosing sequence type " <> quickRender t1 <> " over " <> quickRender t2) [t1]
-                          | otherwise -> throw $ ExpectedEqualType n o a b
-                      _ -> throw $ InvalidArgumentType n o (Just (2, length argTypes)) argTypes
                 | QualifiedBinding ["ohua", "lang"] b <- bnd ->
                     case b of
                         "(,)" -> [NTTup argTypes ]
@@ -415,13 +436,12 @@ inlineCtrl getType =
                             _ -> throw $ UnexpectedOperator ctxSourceLab
             _ -> ctx GR.& g
 
-selectToUnion :: (GR.DynGraph gr, gr Operator (a, Int) ~ g) => g -> g
-selectToUnion =
+dropASelectInput :: (GR.DynGraph gr, gr Operator (a, Int) ~ g) => g -> g
+dropASelectInput =
     GR.gmap $ \(ins, n, l, outs) ->
         case l of
-            CustomOp o _
-                | o == Refs.select ->
-                    (filter ((==0) . snd . fst) ins, n, Union, outs)
+            Select {} ->
+                (filter ((==0) . snd . fst) ins, n, l, outs)
             _ -> (ins, n, l, outs)
 
 sequentializeScalars ::
@@ -478,7 +498,7 @@ execSemOf nodes =
         Project {} -> Just (One, One)
         Source _ -> Just (Many, Many)
         Sink -> Just (Many, Many)
-        Union -> Just (Many, Many)
+        Select {} -> Just (Many, Many)
         IsEmptyCheck -> Just (Many, One)
 
 (&) :: GR.DynGraph gr => GR.Context a b -> gr a b -> gr a b
@@ -557,6 +577,7 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
             (n, Join jt []) -> handleJoin g n jt
             _ -> g
 
+
 -- TODO
 -- - Rewrite literals to projection
 -- - Incorporate indices from previously compiled udfs
@@ -595,11 +616,11 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                              c == "ohua.sql.query/group_by" ||
                              c `elem`
                              ([Refs.smapFun, Refs.collect, Refs.nth, Refs.ifFun] :: Vector QualifiedBinding)
-                         Union ->
+                         s@Select {} ->
                              case length $ GR.pre' ctx of
                                  1 -> True
                                  2 -> False
-                                 _ -> throw $ UnexpectedNumberOfAncestors (GR.node' ctx) Union 2 (GR.pre' ctx)
+                                 _ -> throw $ UnexpectedNumberOfAncestors (GR.node' ctx) s 2 (GR.pre' ctx)
                          Identity -> True
                          _ -> False)
                 gr3
@@ -660,7 +681,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     mGetType = flip IM.lookup typeMap
     iGr :: GR.Gr Operator ()
     iGr = GR.emap (const ()) selectRemoved
-    selectRemoved = selectToUnion ctrlRemoved
+    selectRemoved = dropASelectInput ctrlRemoved
     ctrlRemoved = inlineCtrl (snd . getType) iGr0
     getLits n =
         fromMaybe [] $
@@ -764,6 +785,14 @@ retype3 m n lits ty other@(QualifiedBinding namespace name) =
             | name `elem` builtinSimpleFuns ->
                 CustomOp other (map toCol ty)
             | name == "id" -> Identity
+            | name == "select" ->
+              let flattenTy = Lens.para $ \a r -> case a of
+                      NTScalar s -> [Left s]
+                      NTRecFromTable t -> [Right t]
+                      _ -> concat r
+                  (_:ts) = ty
+              in
+              Select $ map flattenTy ts
             | name == "unitFn" ->
                 case Prelude.lookup 0 lits of
                     Just (FunRefLit (FunRef r _)) ->
@@ -827,7 +856,7 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
     f g (n, lab) =
         case lab of
             Join {} -> g
-            Union -> g
+            Select _ -> g
             _ ->
                 case GR.pre g n of
                     [] -> g
@@ -840,27 +869,6 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
                         GR.delEdges [(x, n), (y, n)] g
                     other -> throw $ WrongNumberOfAncestors n lab 1 (length other)
 
--- UDF {
---     function_name: String,
---     //Do I need this?
---     input: Vec<Column>,
---     group_by: Vec<Column>,
--- },
--- pub enum Operator {
---     Not,
---     And,
---     Or,
---     Like,
---     NotLike,
---     Equal,
---     NotEqual,
---     Greater,
---     GreaterOrEqual,
---     Less,
---     LessOrEqual,
---     In,
---     Is,
--- }
 instance ToRust SerializableGraph where
     asRust graph =
         "UDFGraph" <>
@@ -953,9 +961,6 @@ instance ToRust SerializableGraph where
                 , PP.dquotes $ pretty name
                 ]
 
-completeOutputColsFor :: OpMapEntry -> [Mir.Column]
-completeOutputColsFor i = i ^. _2 <> i ^. _3
-
 someColToMirCol :: SomeColumn -> Mir.Column
 someColToMirCol =
     either
@@ -971,58 +976,156 @@ toMirCol DFGraph.Target {..} =
         , name = showT $ "o" <> (pretty operator) <> "_i" <> (pretty index)
         }
 
-calcColumns ::
-       (GR.Node -> [InternalColumn]) -> OperatorGraph -> IM.IntMap [SomeColumn]
-calcColumns cOpOut gr = colmap
+
+instance PP.Pretty SomeColumn where
+    pretty = either pretty pretty
+
+type LoweringMapEntry = (Mir.Node, [SomeColumn], [GR.Node])
+
+handleNode :: (Operator -> Maybe ExecSemantic) -> (IM.IntMap ([NType], [NType] )) -> GR.Gr Operator () -> IM.IntMap LoweringMapEntry -> GR.Node -> LoweringMapEntry
+handleNode execSemMap tm mg m n = case op of
+    CustomOp o ccols ->
+        withCols (fromAncestor <> map Left (getUdfReturnCols n)) $
+        defaultRet
+        Mir.Regular
+            { nodeFunction = o
+            , indices = map someColToMirCol ccols
+            , executionType =
+                  case execSem of
+                      ReductionSem -> unimplemented
+                      SimpleSem ->
+                          let [p] = ins
+                            in Mir.Simple $
+                              fromIntegral $
+                              length $ ancestorColumns (snd p)
+                      _ -> unimplemented
+            }
+        where Just execSem = execSemMap op
+    Join {joinType, joinOn}
+        | [lp,rp] <- map snd ins ->
+              let lc = ancestorColumns lp
+                  rc = ancestorColumns rp
+                  lpHasL = containsCols lc l
+                  rpHasL = containsCols rc l
+                  lpHasR = containsCols lc r
+                  rpHasR = containsCols rc r
+                  (left, right) =
+                      if | lpHasL && lpHasR && rpHasR && rpHasL ->
+                              throw $ AmbiguousColumnsInJoin op
+                          | lpHasL && rpHasR -> (lp, rp)
+                          | lpHasR && rpHasL -> (rp, lp)
+                          | not (lpHasL || rpHasL) ->
+                                throw $ JoinColumnsNotFound True op l lc rc
+                          | not (rpHasR || lpHasR) ->
+                                throw $ JoinColumnsNotFound False op l lc rc
+                          | otherwise ->
+                                throw $ Impossible
+          in withCols ( pre >>= ancestorColumns ) $
+              withAncestors [left, right] $
+              defaultRet Mir.Join
+              { mirJoinProject = map someColToMirCol $ lc <> rc
+              , left = map someColToMirCol l
+              , right = map someColToMirCol r
+              , isLeftJoin = joinType == LeftOuterJoin
+              }
+        | otherwise ->
+              throw $ WrongNumberOfAncestors n op 2 (length ins)
+      where
+        (l, r) = unzip joinOn
+        containsCols actual =
+            all (`elem` actual)
+    Select tys
+        | [t1, t2] <- tys ->
+          let
+              (fromL, fromR) = unzip $ zip t1 t2 >>= \case
+                  (Left c, Left c2) -> pure (c, c2)
+                  (Right tab, Right tab2)
+                      | tab == tab2 -> map (\(Right -> a) -> (a, a)) $ tableColumn ^?! ix tab
+                  (t1, t2) -> throw $ CannotReconcileSelectArmTypes t1 t2
+              fromArms = HashSet.fromList $ fromL <> fromR
+              extraA = HashSet.difference retASet fromArms
+              extraB = HashSet.difference retBSet fromArms
+              extra = HashSet.intersection extraA extraB
+          in
+          assert (length t1 == length t2) $
+          withCols (fromL <> HashSet.toList extra) $
+          defaultRet Mir.Union
+          { mirUnionEmit = map (map someColToMirCol . (<> HashSet.toList extra) ) [fromL, fromR]
+          }
+        | otherwise -> throw $ Expected2TypeRowsInSelect n tys
+      where
+        (a, b) = case pre of
+                    [a,b] -> (a,b)
+                    other -> throw $ UnexpectedNumberOfAncestors n op 2 other
+        retA = ancestorColumns a
+        retASet = HashSet.fromList retA
+        retB = ancestorColumns b
+        retBSet = HashSet.fromList retB
+
+    Project {..} ->
+        withCols (fromAncestor <> map (Left . fst) projectLits) $
+        defaultRet Mir.Project
+        { projectEmit = map someColToMirCol fromAncestor
+        , projectLiterals = zip (repeat "unused") $ map snd projectLits
+        }
+    Identity -> defaultRet $ Mir.Identity $ map someColToMirCol fromAncestor
+    Filter f _ ->
+        defaultRet
+            Mir.Filter
+                { conditions = map (flip HashMap.lookup $ HashMap.map reCond f) fromAncestor
+                }
+      where
+        colAsIndex :: HasCallStack => SomeColumn -> Word
+        colAsIndex c = fromIntegral $
+            fromMaybe (throw $ ColumnNotFoundInList c fromAncestor n op) $
+            List.elemIndex c fromAncestor
+        reCond (Mir.Comparison op val) =
+            Mir.Comparison op $
+            case val of
+                Mir.ColumnValue v ->
+                    Mir.ColumnValue
+                    (fromIntegral $ colAsIndex $ Right v)
+                Mir.ConstantValue v ->
+                    Mir.ConstantValue v
+    IsEmptyCheck -> withCols [Left $ InternalColumn {producingOperator=n, outputIndex=0}] $ defaultRet $ throw $ NoMirEquivalent IsEmptyCheck n
+    Source t ->
+        let cols =
+                map Right $
+                fromMaybe
+                    (throw $ TableColumnsNotFound t tableColumn) $
+                HashMap.lookup t tableColumn
+        in withCols cols $ defaultRet $ throw $ NoMirEquivalent (Source t) n
+    Sink -> defaultRet $ throw $ NoMirEquivalent Sink n
+    other -> throw $ UnexpectedOperator other
   where
-    fromNode n =
-        fromMaybe
-            (throw $ ColumnNotFound n colmap) $
-        IM.lookup n colmap
-    colmap =
-        IM.fromList $
-        map
-            (\(n, l) ->
-                 let pre = GR.pre gr n
-                     fromAncestor =
-                         let a = case pre of
-                                     [a] -> a
-                                     other -> throw $ UnexpectedNumberOfAncestors n l 1 other
-                          in fromNode a
-                  in (n, ) $
-                     case l of
-                         IsEmptyCheck -> [Left $ InternalColumn {producingOperator=n, outputIndex=0}]
-                         Source t ->
-                             map Right $
-                             fromMaybe
-                                 (throw $ TableColumnsNotFound t tableColumn) $
-                             HashMap.lookup t tableColumn
-                         Sink -> fromAncestor
-                         CustomOp {} -> fromAncestor <> map Left (cOpOut n)
-                         Project {..} -> fromAncestor <> map (Left . fst) projectLits
-                         Identity -> fromAncestor
-                         Filter {} -> fromAncestor
-                         Union -> assert (take (length short) long == short) short
-                           where
-                             (a, b) = case pre of
-                                          [a,b] -> (a,b)
-                                          other -> throw $ UnexpectedNumberOfAncestors n l 2 other
-                             retA = fromNode a
-                             retB = fromNode b
-                             (long, short) = if length retA < length retB then (retB, retA) else (retA, retB)
-                         Join {joinOn}
-                             | length pre /= 2 ->
-                               throw $ WrongNumberOfAncestors n l 2 (length pre)
-                             | otherwise -> pre >>= fromNode) $
-        GR.labNodes gr
+    pre = GR.pre mg n
+    fromAncestor =
+        let a = case pre of
+                    [a] -> a
+                    other -> throw $ UnexpectedNumberOfAncestors n op 1 other
+        in ancestorColumns a
+    ancestorColumns :: HasCallStack => GR.Node -> [SomeColumn]
+    ancestorColumns n0 = fromMaybe (throw $ AncestorNotFound (IM.keys m) n n0) $ m ^? ix n0 . _2
+    defaultRet = ( , fromAncestor , map snd ins)
+    withCols c = _2 .~ c
+    withAncestors c = _3 .~ c
+    (ins, _, op, _) = GR.context mg n
+    getUdfReturnCols n =
+        maybe
+            (throw $ TypeNotKnown n)
+            (map (\case
+                      NTScalar (Left s) -> s
+                      t -> throw (InvalidUDFReturnType n t)) .
+             snd) $
+        IM.lookup n tm
     tableColumn =
         HashSet.toList <$>
         HashMap.fromListWith
             HashSet.union
-            [ ( fromMaybe (error $ quickRender col <> " has no table") $
+            [ ( fromMaybe (throw $ ColumnHasNoTable col) $
                 Mir.table col
               , HashSet.singleton col)
-            | (_, lab) <- GR.labNodes gr
+            | (_, lab) <- GR.labNodes mg
             , Right col <-
                   case lab of
                       CustomOp op cols -> cols
@@ -1037,55 +1140,6 @@ calcColumns cOpOut gr = colmap
                       _ -> []
             ]
 
-instance PP.Pretty SomeColumn where
-    pretty = either pretty pretty
-
-opToMir actualColumn ins toNIdx mirCols cols execSemMap n op = case op of
-    CustomOp o ccols ->
-        pure $
-        Mir.Regular
-            { nodeFunction = o
-            , indices = map someColToMirCol ccols
-            , executionType =
-                  case execSem of
-                      ReductionSem -> unimplemented
-                      SimpleSem ->
-                          let [p] = ins
-                            in Mir.Simple $
-                              fromIntegral $
-                              length $ actualColumn IM.! snd p
-                      _ -> unimplemented
-            }
-        where Just execSem = execSemMap op
-    Join {joinType, joinOn} ->
-        pure Mir.Join {mirJoinProject = mirCols, left = map someColToMirCol l, right = map someColToMirCol r, isLeftJoin = joinType == LeftOuterJoin}
-      where
-        (l, r) = unzip joinOn
-    Union -> pure Mir.Union {mirUnionEmit = map (\(_, n) -> map someColToMirCol $ actualColumn IM.! n) ins}
-    Project {..} ->  pure $ Mir.Project { projectEmit = mirCols, projectLiterals = zip (repeat "unused") $ map snd projectLits }
-    Identity -> pure $ Mir.Identity mirCols
-    Filter f _ -> do
-        let conds = map (flip HashMap.lookup $ HashMap.map reCond f) cols
-        assertM $ length (catMaybes conds) == HashMap.size f
-        pure $
-            Mir.Filter
-                { conditions = conds
-                }
-        where
-          colAsIndex :: HasCallStack => SomeColumn -> Word
-          colAsIndex c = fromIntegral $
-              fromMaybe (error $ "Expected to find column " <> quickRender c <> " in " <> quickRender cols <> "\n  Operator " <> show n <> " " <> quickRender op) $
-              List.elemIndex c cols
-          reCond (Mir.Comparison op val) =
-              Mir.Comparison op $
-              case val of
-                  Mir.ColumnValue v ->
-                      Mir.ColumnValue
-                      (fromIntegral $ colAsIndex $ Right v)
-                  Mir.ConstantValue v ->
-                      Mir.ConstantValue v
-    other -> throw $ UnexpectedOperator other
-
 toSerializableGraph ::
        (MonadLogger m, MonadIO m)
     => Binding
@@ -1095,7 +1149,6 @@ toSerializableGraph ::
     -> m SerializableGraph
 toSerializableGraph entrypoint execSemMap tm mg = do
     $(logDebug) "Calculated Columns"
-    $(logDebug) $ showT actualColumn
     quickDumpGrAsDot entrypoint "serializable.dot" $
         flip GR.gmap mg $ \(ins, n, l, outs) ->
             let strip = map $ first $ const ("" :: Text)
@@ -1105,48 +1158,12 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                   " " <>
                   quickRender l <>
                   "\n" <>
-                  quickRender (map someColToMirCol $ actualColumn IM.! n)
+                  quickRender (completeOutputColsFor n)
                 , strip outs)
-    adjacencies <-
-        sequence
-            [ (, mirCols, ) <$> opToMir actualColumn ins toNIdx mirCols cols execSemMap n op <*> ancestors
+
+    let adjacencies =
+            [ _2 %~ map someColToMirCol $ _3 %~ map toNIdx $ (loweredOps IM.! n)
             | n <- nonSinkSourceNodes
-            , let (ins, _, op, _) = GR.context mg n
-                  cols = actualColumn IM.! n
-                  mirCols = map someColToMirCol cols
-                  ancestors = case op of
-                      Join {joinOn}
-                          | [lp,rp] <- map snd ins -> do
-                                let containsCols actual =
-                                        all (`elem` actual)
-                                    (l, r) = unzip joinOn
-                                    lc = actualColumn IM.! lp
-                                    rc = actualColumn IM.! rp
-                                    lpHasL = containsCols lc l
-                                    rpHasL = containsCols rc l
-                                    lpHasR = containsCols lc r
-                                    rpHasR = containsCols rc r
-                                    (left, right) =
-                                        if | lpHasL && lpHasR && rpHasR && rpHasL ->
-                                                throw $ AmbiguousColumnsInJoin op
-                                           | lpHasL && rpHasR -> (lp, rp)
-                                           | lpHasR && rpHasL -> (rp, lp)
-                                           | not (lpHasL || rpHasL) ->
-                                                 throw $ JoinColumnsNotFound True op l lc rc
-                                           | not (rpHasR || lpHasR) ->
-                                                 throw $ JoinColumnsNotFound False op l lc rc
-                                           | otherwise ->
-                                                 throw $ Impossible
-                                logDebugN $ quickRender op <> ":"
-                                logDebugN $ "Saw \n    left parent " <> show lp <> "(" <> show (toNIdx lp) <> ") with columns " <> quickRender lc <> "\n    right parent " <> show rp <> "(" <> show (toNIdx rp) <> ") with columns " <> quickRender rc
-                                let boolAsNot = \case True -> ""; _ -> "not "
-                                logDebugN $ "Demanded left columns " <> boolAsNot lpHasL <> "found in left parent, " <> boolAsNot rpHasL <> "found in right parent"
-                                logDebugN $ "Demanded right columns " <> boolAsNot lpHasR <> "found in left parent, " <> boolAsNot rpHasR <> "found in right parent"
-                                logDebugN $ "Thus chosen to demand as follows:\n    from left parent (" <> show lp <> "): " <> quickRender left <> "\n    from right parent (" <> show rp <> "): " <> quickRender right
-                                pure $ map toNIdx [left, right]
-                          | otherwise ->
-                               throw $ WrongNumberOfAncestors n op 2 (length ins)
-                      _ -> pure $ map (toNIdx . snd) ins
             ]
     sink0 <- do
         let [(s, _, _)] = GR.inn mg $ fst sink
@@ -1186,7 +1203,11 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 }
     pure sgr
   where
-    completeOutputColsFor = map someColToMirCol . (actualColumn IM.!)
+    loweredOps = IM.fromList
+                 [ (n, handleNode execSemMap tm mg loweredOps n)
+                 | n <- GR.nodes mg
+                 ]
+    completeOutputColsFor n = loweredOps ^?! ix n . _2 . to (map someColToMirCol)
     sources =
         sortOn
             (view _1)
@@ -1202,18 +1223,6 @@ toSerializableGraph entrypoint execSemMap tm mg = do
              nonSinkSourceNodes)
     toNIdx :: Int -> Word
     toNIdx = ((IM.fromListWith (\a _ -> error $ "Double index " <> show a) $ map swap indexMapping) IM.!)
-    getUdfReturnCols n =
-        maybe
-            (error $ "No type for node " <> show n)
-            (map (\case
-                      NTScalar (Left s) -> s
-                      t ->
-                          error $
-                          "Unexpected output of UDF " <>
-                          show n <> " " <> quickRender t) .
-             snd) $
-        IM.lookup n tm
-    actualColumn = calcColumns getUdfReturnCols mg
     nonSinkSourceNodes :: [Int]
     nonSinkSourceNodes =
         [ n
@@ -1228,81 +1237,9 @@ toSerializableGraph entrypoint execSemMap tm mg = do
     [sink] = filter (isSink . snd) (GR.labNodes mg)
     colFrom op = toMirCol . DFGraph.Target (unsafeMake op)
 
--- isIsomorphic :: (Eq a, Ord b) => Gr a b -> Gr a b -> Bool
--- isIsomorphic gr1 gr2 = isJust $ isomorphicMapping gr1 gr2
-
--- isomorphicMapping :: (Eq a, Ord b) => Gr a b -> Gr a b -> Maybe IsoMap
--- isomorphicMapping g1 g2 = either (const Nothing) Just $ matchGraph g1 g2
-
--- type IsoMap = IntMap.IntMap Int
-
--- maxOn :: Ord b => (a -> b) -> a -> a -> a
--- maxOn f a0 a1
---     | ((>=) `on` f) a0 a1 = a0
---     | otherwise = a1
-
--- type IsoFailData = (IsoMap, Maybe (Int, Int))
-
--- plusEither ::
---        Either IsoFailData b -> Either IsoFailData b -> Either IsoFailData b
--- plusEither (Left a) (Left a2) = Left $ maxOn (IntMap.size . fst) a a2
--- plusEither r@(Right _) _ = r
--- plusEither _ b = b
-
--- emptyEither :: Either IsoFailData b
--- emptyEither = Left (mempty, Nothing)
-
--- sumEither ::
---        (Container c, Element c ~ Either IsoFailData b)
---     => c
---     -> Either IsoFailData b
--- sumEither = foldl' plusEither emptyEither
-
--- mapsEither ::
---        Container c
---     => (Element c -> Either IsoFailData b)
---     -> c
---     -> Either IsoFailData b
--- mapsEither f = foldl' (\a b -> plusEither a (f b)) emptyEither
-
--- matchGraph :: (Eq a, Ord b) => Gr a b -> Gr a b -> Either IsoFailData IsoMap
--- matchGraph gr1 gr2
---     | order gr1 == 0 && order gr2 == 0 = Right mempty
--- matchGraph gr1 gr2 = go (nodes gr1) [] [] mempty
---   where
---     go :: [Int] -> [Int] -> [Int] -> IsoMap -> Either IsoFailData IsoMap
---     go rest !gr1Selected !gr2Selected !mapping =
---         if gr1Subgr == rename mapping (subgraph gr2Selected gr2)
---             then descend rest
---             else failMatch
---       where
---         gr1Subgr = subgraph gr1Selected gr1
---         descend []
---             | gr1Subgr == gr1 && order gr2 == order gr1Subgr = Right mapping
---             | otherwise = failMatch
---         descend (x:xs) = selectX `mapsEither` nodes gr2
---           where
---             selectX k =
---                 go xs (x : gr1Selected) (k : gr2Selected) $
---                 IntMap.insert k x mapping
---         failMatch = Left (lastMapping, lastSelects)
---         lastSelects =
---             case (gr1Selected, gr2Selected) of
---                 (x:_, k:_) -> Just (k, x)
---                 _ -> Nothing
---         lastMapping = maybe id (IntMap.delete . fst) lastSelects mapping
---     rename mapping gr = mkGraph ns es
---       where
---         ns = first newName <$> labNodes gr
---         es = map (\(a, b, c) -> (newName a, newName b, c)) (labEdges gr)
---         newName node =
---             fromMaybe
---                 (error $
---                  "Invariant broken: missing mapping for node " <> show node) $
---             IntMap.lookup node mapping
 
 unimplemented :: HasCallStack => a
-unimplemented = error "Function or branch not yet implemented"
+unimplemented = throw Unimplemented
 
 type UdfMap = HashMap QualifiedBinding UDFDescription
 

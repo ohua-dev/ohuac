@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use itertools::Itertools;
 
 use super::super::att3::Typed;
+use super::super::Value;
 use nom_sql::SqlType;
 
 use crate::ops::grouped::get_group_values;
@@ -137,7 +138,7 @@ impl Ingredient for
                     ,
                     [
                         // <insert(udf-arg-strs)>
-                    ].iter().map(usize::to_string).join(",")
+                    ].into_iter().map(|v:&&Value| v.to_string()).join(",")
             )
         } else {
             // <insert(udf-name-str)>

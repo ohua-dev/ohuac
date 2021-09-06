@@ -105,7 +105,7 @@ data JoinType
     deriving (Show, Eq, Generic)
 
 data Operator
-    = CustomOp QualifiedBinding [SomeColumn]
+    = CustomOp { opName :: QualifiedBinding, opInputs :: [Either Mir.DataType SomeColumn] }
     | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
     | Project { projectEmit :: [ SomeColumn ], projectLits :: [(InternalColumn, Mir.DataType )] }
     | Identity
@@ -134,7 +134,7 @@ instance PP.Pretty Operator where
         Sink -> "Sink"
         Source s -> "B" <+> PP.pretty s
         Project {..} -> "π" <+> PP.list (map showCol projectEmit <> map pretty projectLits)
-        CustomOp o c -> PP.pretty o <+> PP.list (map showCol c)
+        CustomOp o c -> PP.pretty o <+> PP.list (map (either pretty showCol ) c)
         IsEmptyCheck -> "∅?"
       where
           showCol = \case

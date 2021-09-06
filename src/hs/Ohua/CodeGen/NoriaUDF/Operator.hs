@@ -405,12 +405,12 @@ baseUdfSubMap udfName rowName accessedFields =
     [ "udf-name" ~> [T.toTitle $ unwrap $ udfName ^. name]
     , "udf-name-str" ~> ["\"" <> unwrap (udfName ^. name) <> "\""]
     , "udf-arg-strs" ~>
-      map (\e -> "self." <> unwrap (idxPropFromName e) <> ",") accessedFields
+      map (\e -> "&self." <> unwrap (idxPropFromName e) <> ",") accessedFields
     , "row-name" ~> [unwrap rowName]
     , "special-state-coerce-call" ~>
       ["." <> mkSpecialStateCoerceName udfName <> "()"]
     , "node-properties" ~>
-      map (\e -> unwrap (idxPropFromName e) <> ": usize,") accessedFields
+      map (\e -> unwrap (idxPropFromName e) <> ": Value,") accessedFields
     , "node-property-args" ~>
       map ((<> ",") . unwrap . idxPropFromName) accessedFields
     , "udf-args" ~> ["udf_arg_placeholder,"]
@@ -604,7 +604,7 @@ mkPatchesFor UDFDescription {..} =
                          PP.tupled
                              ("parent" : "0" :
                               map
-                                  (\n -> "over_cols" <> PP.brackets (pretty n))
+                                  (\n -> "over_cols" <> PP.brackets (pretty n) <> ".clone()")
                                   [0 .. pred $ length referencedFields] <>
                               [extraNodeArg])
                        ] <>
@@ -633,10 +633,10 @@ pattern GenFuncsNamespace <- ["ohua", "generated"]
 
 toSQLType :: TyExpr SomeBinding -> Text
 toSQLType (TyRef (Unqual b))
-    | b == "i32" = "Int(32)"
-    | b == "i64" = "Int(64)"
-    | b == "bool" = "Tinyint"
-toSQLType t = error $ "No SQL equivalent known for type " <> show t
+    | b == "i32" = "SqlType::Int(32)"
+    | b == "i64" = "SqlType::Int(64)"
+    | b == "bool" = "SqlType::Tinyint"
+toSQLType t = trace ("WARNING: No SQL equivalent known for type " <> show t :: Text) "unreachable!(\"Cannot convert return type of this function. This function cannot be called as the last node in a query.\")"
 
 preResolveHook ::
        (MonadIO m, MonadError Error m, MonadLogger m)
@@ -672,9 +672,9 @@ preResolveHook registerOp r =
                                           ">::into" <>
                                           PP.parens o)
                                      t $
-                                 "r[self." <>
+                                 "match &self." <>
                                  pretty (idxPropFromName i) <>
-                                 "].clone()")
+                                 " { Value::Column(c) => r[*c].clone(), Value::Constant(c) => c.clone() }")
                             fbody $
                         reverse $
                         zip3
@@ -686,7 +686,7 @@ preResolveHook registerOp r =
                             accessedFields
                       ]
                     , "udf-ret-type" ~>
-                      [ ("SqlType::" <>) $ toSQLType $
+                      [ toSQLType $
                         fromMaybe
                             (error $ "type for " <> unwrap oldName <> " unknown")
                             (source ^? annotation . to typeAnn . _Just .

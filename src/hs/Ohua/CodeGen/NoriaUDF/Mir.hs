@@ -119,7 +119,7 @@ litToDataType other = throw $ LiteralNotSupported other
 data Node
     = Regular
           { nodeFunction :: QualifiedBinding
-          , indices :: [Column]
+          , indices :: [Value Word]
           , executionType :: ExecutionType
           }
     | Join

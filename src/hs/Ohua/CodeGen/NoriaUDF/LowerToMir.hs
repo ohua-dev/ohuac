@@ -79,7 +79,7 @@ data LoweringError
     | WrongNumberOfAncestors GR.Node Operator Int Int
     | ColumnNotFound GR.Node (IM.IntMap LoweringMapEntry)
     | TableColumnsNotFound Mir.Table (HashMap Mir.Table [Mir.Column])
-    | ProjectInputsDoNotLineUp [(Int, Lit)] [NType]
+    | InputsDoNotLineUp [(Int, Lit)] [NType]
     | InvalidFilterAfterIsEmpty (GR.MContext Operator ())
     | UnexpectedNumberOfAncestors GR.Node Operator Word [GR.Node]
     | AmbiguousColumnsInJoin Operator
@@ -535,7 +535,7 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
                     mkFilter op = Filter { conditions = HashMap.fromList [(theCol, Mir.Comparison op (Mir.ConstantValue Mir.None) )]
                                          , arguments = ("no", []) -- throw FilterIsMissingAField
                                          }
-                in (ins, n, Join LeftOuterJoin cols, [((), f1 ), ((), f2)]) &
+                in (ins, n, Join LeftOuterJoin $ map swap cols, [((), f1 ), ((), f2)]) &
                    ([], f1, mkFilter Mir.Equal, f1outs ) &
                    ([], f2, mkFilter Mir.NotEqual, f2outs ) &
                    g5
@@ -780,10 +780,13 @@ retype3 m n lits ty other@(QualifiedBinding namespace name) =
                 _ -> throw $ UnknownBuiltin other
         ["ohua", "lang"]
             | name == "(,)" ->
-              Project { projectEmit = map toCol ty, projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits }
+              Project
+              { projectEmit = map toCol ty
+              , projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits
+              }
             | name == "nth" -> CustomOp other []
             | name `elem` builtinSimpleFuns ->
-                CustomOp other (map toCol ty)
+                CustomOp other mkUDFInputs
             | name == "id" -> Identity
             | name == "select" ->
               let flattenTy = Lens.para $ \a r -> case a of
@@ -803,9 +806,18 @@ retype3 m n lits ty other@(QualifiedBinding namespace name) =
         ["ohua", "sql", "table"] -> Source (Mir.TableByName $ unwrap name)
         ["ohua", "sql", "query"] | name == "table_is_empty" -> IsEmptyCheck
         _ ->
-            fromMaybe (CustomOp other (map toCol ty)) $
+            fromMaybe (CustomOp other mkUDFInputs) $
             fmap rewriteFilter $ HashMap.lookup other m
   where
+    mkUDFInputs = (unfoldr consolidate (sortOn fst lits, ty, 0))
+    consolidate (lits, tys, succ -> n) = case lits of
+        []
+            | t:ts <- tys -> Just (Right $ toCol t, ([], ts, n) )
+            | otherwise -> Nothing
+        (li,l):ls
+            | succ li == n -> Just (Left (litToDBLit l), (ls, tys, n))
+            | t:ts <- tys -> Just (Right $ toCol t, (lits, ts, n))
+            | otherwise -> throw $ InputsDoNotLineUp lits tys
     rewriteFilter a@(Filter conds vars@(st, free)) = Filter newConds vars
       where
         varnames = map unwrap $ st : free
@@ -920,7 +932,7 @@ instance ToRust SerializableGraph where
                     recordSyn
                         [ ( "function_name"
                           , PP.dquotes (pretty nodeFunction) <> ".to_string()")
-                        , ("indices", ppColVec indices)
+                        , ("indices", ppVec $ map encodeValue indices)
                         , ( "execution_type"
                           , "ExecutionType::" <>
                             case executionType of
@@ -989,7 +1001,7 @@ handleNode execSemMap tm mg m n = case op of
         defaultRet
         Mir.Regular
             { nodeFunction = o
-            , indices = map someColToMirCol ccols
+            , indices = map (either Mir.ConstantValue (Mir.ColumnValue . colAsIndex) ) ccols
             , executionType =
                   case execSem of
                       ReductionSem -> unimplemented
@@ -1009,21 +1021,24 @@ handleNode execSemMap tm mg m n = case op of
                   rpHasL = containsCols rc l
                   lpHasR = containsCols lc r
                   rpHasR = containsCols rc r
-                  (left, right) =
+                  leftStuff = (lp, lc)
+                  rightStuff = (rp, rc)
+                  (( left, leftCol ), ( right, rightCol )) =
                       if | lpHasL && lpHasR && rpHasR && rpHasL ->
                               throw $ AmbiguousColumnsInJoin op
-                          | lpHasL && rpHasR -> (lp, rp)
-                          | lpHasR && rpHasL -> (rp, lp)
+                          | lpHasL && rpHasR -> (leftStuff, rightStuff)
+                          | lpHasR && rpHasL -> (rightStuff, leftStuff)
                           | not (lpHasL || rpHasL) ->
                                 throw $ JoinColumnsNotFound True op l lc rc
                           | not (rpHasR || lpHasR) ->
                                 throw $ JoinColumnsNotFound False op l lc rc
                           | otherwise ->
                                 throw $ Impossible
-          in withCols ( pre >>= ancestorColumns ) $
+                  proj = leftCol <> rightCol
+          in withCols proj $
               withAncestors [left, right] $
               defaultRet Mir.Join
-              { mirJoinProject = map someColToMirCol $ lc <> rc
+              { mirJoinProject = map someColToMirCol proj
               , left = map someColToMirCol l
               , right = map someColToMirCol r
               , isLeftJoin = joinType == LeftOuterJoin
@@ -1037,20 +1052,23 @@ handleNode execSemMap tm mg m n = case op of
     Select tys
         | [t1, t2] <- tys ->
           let
-              (fromL, fromR) = unzip $ zip t1 t2 >>= \case
+              (HashSet.fromList -> fromL, HashSet.fromList -> fromR) = unzip $ zip t1 t2 >>= \case
                   (Left c, Left c2) -> pure (c, c2)
                   (Right tab, Right tab2)
                       | tab == tab2 -> map (\(Right -> a) -> (a, a)) $ tableColumn ^?! ix tab
                   (t1, t2) -> throw $ CannotReconcileSelectArmTypes t1 t2
-              fromArms = HashSet.fromList $ fromL <> fromR
+              fromArms = HashSet.union fromL fromR
               extraA = HashSet.difference retASet fromArms
               extraB = HashSet.difference retBSet fromArms
               extra = HashSet.intersection extraA extraB
+              emitL = filter (flip HashSet.member (HashSet.union extra fromL) ) retA
           in
           assert (length t1 == length t2) $
-          withCols (fromL <> HashSet.toList extra) $
+          withCols emitL $
           defaultRet Mir.Union
-          { mirUnionEmit = map (map someColToMirCol . (<> HashSet.toList extra) ) [fromL, fromR]
+          { mirUnionEmit = map (map someColToMirCol)
+            [ emitL, filter (flip HashSet.member (HashSet.union extra fromR)) retB
+            ]
           }
         | otherwise -> throw $ Expected2TypeRowsInSelect n tys
       where
@@ -1075,10 +1093,6 @@ handleNode execSemMap tm mg m n = case op of
                 { conditions = map (flip HashMap.lookup $ HashMap.map reCond f) fromAncestor
                 }
       where
-        colAsIndex :: HasCallStack => SomeColumn -> Word
-        colAsIndex c = fromIntegral $
-            fromMaybe (throw $ ColumnNotFoundInList c fromAncestor n op) $
-            List.elemIndex c fromAncestor
         reCond (Mir.Comparison op val) =
             Mir.Comparison op $
             case val of
@@ -1098,6 +1112,10 @@ handleNode execSemMap tm mg m n = case op of
     Sink -> defaultRet $ throw $ NoMirEquivalent Sink n
     other -> throw $ UnexpectedOperator other
   where
+    colAsIndex :: HasCallStack => SomeColumn -> Word
+    colAsIndex c = fromIntegral $
+        fromMaybe (throw $ ColumnNotFoundInList c fromAncestor n op) $
+        List.elemIndex c fromAncestor
     pre = GR.pre mg n
     fromAncestor =
         let a = case pre of
@@ -1128,7 +1146,7 @@ handleNode execSemMap tm mg m n = case op of
             | (_, lab) <- GR.labNodes mg
             , Right col <-
                   case lab of
-                      CustomOp op cols -> cols
+                      CustomOp op cols -> rights cols
                       Filter conds _ ->
                           HashMap.toList conds >>= \(c1, Mir.Comparison _ c2) ->
                               c1 :

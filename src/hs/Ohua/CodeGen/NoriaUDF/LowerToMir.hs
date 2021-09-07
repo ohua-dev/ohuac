@@ -94,6 +94,7 @@ data LoweringError
     | CannotReconcileSelectArmTypes (Either SomeColumn Mir.Table) (Either SomeColumn Mir.Table)
     | AncestorNotFound [Int] GR.Node GR.Node
     | NoMirEquivalent Operator GR.Node
+    | UnableToFindSingleMatchingCtrlChild GR.Node [(GR.Node, Maybe Operator)]
     deriving Show
 
 data ErrorWithTrace = forall e . Exception e => ErrorWithTrace CallStack e
@@ -289,7 +290,7 @@ typeGraph udfs envInputs g = m
                                 traceWarning ("select arguments had differing type, choosing sequence type " <> quickRender t1 <> " over " <> quickRender t2) [t1]
                           | otherwise -> throw $ ExpectedEqualType n o a b
                       _ -> throw $ InvalidArgumentType n o (Just (2, length argTypes)) argTypes
-            Ctrl _ -> Prelude.tail argTypes
+            Ctrl {} -> Prelude.tail argTypes
             CustomOp bnd _
                 | bnd == Refs.nth ->
                     let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ LiteralNotFound n) $
@@ -378,7 +379,7 @@ getLabel g n = fromMaybe (throw $ LabelNotFound n) $ GR.lab g n
 handleCtrl :: (GR.DynGraph gr) => gr Operator () -> gr Operator ()
 handleCtrl = flip GR.ufold GR.empty $ \ctx g ->
     case GR.lab' ctx of
-        Ctrl IfCtrl {..} ->
+        Ctrl _ IfCtrl {..} ->
             (_3 .~
             Filter
             { conditions =
@@ -483,6 +484,7 @@ sequentializeScalars mGetSem g0 = gFoldTopSort f g0
             ((pins, p, plab, []) GR.& g'')
         | Just (_, Many) <- getSem l = g
         | CustomOp fun _ <- l
+        , False
         , Refs.smapFun == fun || Refs.ifFun == fun =
           (hashNub [p | p@(_, p0) <- ins,  not $ any (reachable p0 . snd) ins], n, l, prunedOuts) GR.& g'
         | null prunedOuts = g
@@ -520,7 +522,7 @@ execSemOf nodes =
         Sink -> Just (Many, Many)
         Select {} -> Just (Many, Many)
         IsEmptyCheck -> Just (Many, One)
-        Ctrl _ -> Just (Many, One)
+        Ctrl {} -> Just (Many, One)
 
 (&) :: GR.DynGraph gr => GR.Context a b -> gr a b -> gr a b
 (&) = (GR.&)
@@ -598,6 +600,33 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
             (n, Join jt []) -> handleJoin g n jt
             _ -> g
 
+mergeSmapToCtrl :: (GR.DynGraph gr) => gr Operator () -> gr Operator ()
+mergeSmapToCtrl = \g -> foldl' f g (GR.labNodes g)
+  where
+    f g (n, CustomOp o _)
+        | o == Refs.smapFun =
+              case matching of
+                  -- Sometimes an smap has no ctrl (if there were no free
+                  -- variables). So we insert one. I don't like that we have to
+                  -- do that but I don't see a way around this.
+                  [] -> (_3 .~ Ctrl n SmapCtrl) ctx & g'
+                  [( ctrl, _ )] ->
+                      GR.insEdges (map (, ctrl, ()) $ GR.pre g n) $
+                      GR.insEdges (map ( (ctrl, , ()) . fst ) others) $
+                      GR.delNode n g
+                  _ -> throw $ UnableToFindSingleMatchingCtrlChild n labSuc
+      where
+        (Just ctx, g') = GR.match n g
+        labSuc = map (id &&& GR.lab g) $ GR.suc g n
+        (matching, others) =
+            List.partition
+            (\(_, l) ->
+                    case l of
+                        Just (Ctrl src _) -> src == n
+                        _ -> False)
+            labSuc
+    f g _ = g
+
 
 -- TODO
 -- - Rewrite literals to projection
@@ -617,13 +646,14 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                 , n
                 , show n <> " " <> either quickRender quickRender l
                 , strip outs)
-    quickDumpGr "ctrl-removed.dot" $ printableLabelWithTypes ctrlRemoved
     quickDumpGr "select-removed.dot" $ mkLabelsPrintable selectRemoved
     -- debugLogGR "Initial Graph" iGr
     quickDumpGr "initial-graph.dot" $ printableLabelWithTypes iGr
+    let smapRemoved = mergeSmapToCtrl iGr
+    quickDumpGr "smap-removed.dot" $ printableLabelWithTypes smapRemoved
     -- ctrlRemoved <- handleSuperfluousEdgesAndCtrl (\case CustomOp l _ -> l == Refs.ctrl; _ -> False) gr1
     -- quickDumpGrAsDot "edges-removed-graph.dot" $ GR.nemap quickRender (const ("" :: Text)) ctrlRemoved
-    let udfSequentialized = sequentializeScalars getExecSemantic iGr
+    let udfSequentialized = sequentializeScalars getExecSemantic smapRemoved
     quickDumpGr "scalars-sequentialized.dot" $
         printableLabelWithTypes udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
@@ -633,7 +663,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
             removeSuperfluousOperators
                 (\ctx ->
                      case GR.lab' ctx of
-                         Ctrl _ -> assert (length (GR.pre' ctx) == 1) True
+                         Ctrl _ _ -> assert (length (GR.pre' ctx) == 1) True
                          CustomOp c _ ->
                              c ^. namespace == ["ohua", "lang", "field"] ||
                              c == "ohua.sql.query/group_by" ||
@@ -753,25 +783,6 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     operators = DFGraph.operators graph
     arcs = DFGraph.direct $ DFGraph.arcs graph
 
-getNodesOfType :: GetGraph g opLabel a s m => (opLabel -> Bool) -> m [GR.Node]
-getNodesOfType f = use $ _1 . to (map fst . filter (f . snd) . GR.labNodes)
-
-sDelNode :: GetGraph g vertexLabel edgeLabel s m => GR.Node -> m ()
-sDelNode node = _1 %= (GR.delNode node)
-
-sGetContext ::
-       GetGraph g opLabel edgeLabel s m
-    => GR.Node
-    -> m (GR.Context opLabel edgeLabel)
-sGetContext node = use $ _1 . to (flip GR.context node)
-
-sInsEdge :: GetGraph g a b s m => GR.LEdge b -> m ()
-sInsEdge edge = _1 %= GR.insEdge edge
-
-collapseMultiArcs ::
-       GR.DynGraph gr => gr opLabel edgeLabel -> gr opLabel [edgeLabel]
-collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
-
 removeSuperfluousOperators ::
        (GR.DynGraph gr, gr a () ~ g, a ~ Operator) => (GR.Context a () -> Bool) -> g -> g
 removeSuperfluousOperators p g0 =
@@ -791,8 +802,8 @@ removeSuperfluousOperators p g0 =
 type TypeMap = IM.IntMap ([NType], [NType])
 
 
-determineCtrlType :: GR.Graph gr => gr Operator (Int, Int) -> GR.Node -> [NType] -> CtrlType
-determineCtrlType g n ts =
+determineCtrlType :: GR.Graph gr => gr Operator (Int, Int) -> GR.Node -> [NType] -> (Int, CtrlType )
+determineCtrlType g n ts = (ctxSource, ) $
     case ctxSourceLab of
         CustomOp ctxL _
             | ctxL == Refs.smapFun -> SmapCtrl
@@ -838,7 +849,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
                     , projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits
                     }
                 "nth" -> CustomOp other []
-                "ctrl" -> Ctrl $ determineCtrlType g n ty
+                "ctrl" -> uncurry Ctrl $ determineCtrlType g n ty
                 _ | name `elem` builtinSimpleFuns ->
                     CustomOp other mkUDFInputs
                 "id" -> Identity

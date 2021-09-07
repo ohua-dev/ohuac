@@ -120,7 +120,7 @@ data Operator
     | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
     | IsEmptyCheck
     | Select SelectPayload
-    | Ctrl CtrlType
+    | Ctrl Int CtrlType
     deriving (Show, Eq, Generic)
 
 type SelectPayload = [[Either SomeColumn Mir.Table]]
@@ -143,7 +143,7 @@ instance PP.Pretty Operator where
         Project {..} -> "π" <+> PP.list (map showCol projectEmit <> map pretty projectLits)
         CustomOp o c -> PP.pretty o <+> PP.list (map (either pretty showCol ) c)
         IsEmptyCheck -> "∅?"
-        Ctrl ty -> "ctrl" <> PP.parens (if ty == SmapCtrl then "smap" else "if")
+        Ctrl _ ty -> "ctrl" <> PP.parens (if ty == SmapCtrl then "smap" else "if")
       where
           showCol = \case
               Left InternalColumn{..} -> PP.pretty producingOperator <> ":" <> PP.pretty outputIndex

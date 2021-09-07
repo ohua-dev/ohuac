@@ -268,8 +268,8 @@ typeGraph udfs envInputs g = m
                     NTScalar $
                     Left InternalColumn {producingOperator, outputIndex = i}
             _ -> throw $ InvalidIndexIntoType i t
-    mkRetType :: GR.Node -> [NType] -> Operator -> [NType]
-    mkRetType n argTypes o =
+    mkRetType :: GR.Node -> [(Int , NType )] -> Operator -> [NType]
+    mkRetType n indexedArgTypes o =
         case o of
             IsEmptyCheck -> [NTScalar (Left InternalColumn {producingOperator=n,outputIndex=0})]
             Filter {} -> [fromIndex Nothing 0]
@@ -289,6 +289,7 @@ typeGraph udfs envInputs g = m
                                 traceWarning ("select arguments had differing type, choosing sequence type " <> quickRender t1 <> " over " <> quickRender t2) [t1]
                           | otherwise -> throw $ ExpectedEqualType n o a b
                       _ -> throw $ InvalidArgumentType n o (Just (2, length argTypes)) argTypes
+            Ctrl _ -> Prelude.tail argTypes
             CustomOp bnd _
                 | bnd == Refs.nth ->
                     let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ LiteralNotFound n) $
@@ -306,7 +307,7 @@ typeGraph udfs envInputs g = m
                             ] {- is this really necessary? -}
                         _ -> invalidArgs
                 | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 1]
-                | bnd == Refs.ctrl -> Prelude.tail argTypes
+                | bnd == Refs.ctrl -> throw $ UnexpectedOperator o
                 | bnd == Refs.ifFun ->
                   case argTypes of
                       [x] -> [x,x]
@@ -332,6 +333,7 @@ typeGraph udfs envInputs g = m
                 | Just _ <- udfs o -> likeUdf
             _ -> throw $ MissingReturnType o
       where
+        argTypes = map snd indexedArgTypes
         likeUdf = [NTScalar $ Left $ InternalColumn n 0]
         invalidArgs :: a
         invalidArgs = throw $ InvalidArgumentType n o Nothing argTypes
@@ -343,10 +345,9 @@ typeGraph udfs envInputs g = m
             | otherwise = throw $ InvalidArgumentType n o (Just (i, length argTypes)) argTypes
     m =
         IM.fromList
-            [ (n, (argTypes, mkRetType n argTypes l))
+            [ (n, (map snd argTypes, mkRetType n argTypes l))
             | (n, l) <- GR.labNodes g
             , let argTypes =
-                      map snd $
                       sortOn
                           fst
                           [ ( inIdx
@@ -373,6 +374,24 @@ gFoldTopSort f g =
 
 getLabel :: GR.Graph gr => gr a b -> Int -> a
 getLabel g n = fromMaybe (throw $ LabelNotFound n) $ GR.lab g n
+
+handleCtrl :: (GR.DynGraph gr) => gr Operator () -> gr Operator ()
+handleCtrl = flip GR.ufold GR.empty $ \ctx g ->
+    case GR.lab' ctx of
+        Ctrl IfCtrl {..} ->
+            (_3 .~
+            Filter
+            { conditions =
+                    [ ( conditionColumn
+                      , Mir.Comparison
+                          Mir.Equal
+                          (Mir.ConstantValue
+                              $ if iAmTrueBranch then 1 else 0))
+                    ]
+            , arguments = ("what?", []) -- throw FilterIsMissingAField
+            }) ctx & g
+        _ -> ctx & g
+
 
 inlineCtrl ::
        (GR.DynGraph gr, HasCallStack)
@@ -464,7 +483,8 @@ sequentializeScalars mGetSem g0 = gFoldTopSort f g0
             ((pins, p, plab, []) GR.& g'')
         | Just (_, Many) <- getSem l = g
         | CustomOp fun _ <- l
-        , Refs.smapFun == fun = (hashNub [p | p@(_, p0) <- ins,  not $ any (reachable p0 . snd) ins], n, l, prunedOuts) GR.& g'
+        , Refs.smapFun == fun || Refs.ifFun == fun =
+          (hashNub [p | p@(_, p0) <- ins,  not $ any (reachable p0 . snd) ins], n, l, prunedOuts) GR.& g'
         | null prunedOuts = g
         | otherwise = (ins, n, l, prunedOuts) GR.& g'
       where
@@ -500,6 +520,7 @@ execSemOf nodes =
         Sink -> Just (Many, Many)
         Select {} -> Just (Many, Many)
         IsEmptyCheck -> Just (Many, One)
+        Ctrl _ -> Just (Many, One)
 
 (&) :: GR.DynGraph gr => GR.Context a b -> gr a b -> gr a b
 (&) = (GR.&)
@@ -607,10 +628,12 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
         printableLabelWithTypes udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
     quickDumpGr "annotated-and-reduced-ohua-graph.dot" $ mkLabelsPrintable gr3
+    let ctrlHandled = handleCtrl gr3
     let gr2 =
             removeSuperfluousOperators
                 (\ctx ->
                      case GR.lab' ctx of
+                         Ctrl _ -> assert (length (GR.pre' ctx) == 1) True
                          CustomOp c _ ->
                              c ^. namespace == ["ohua", "lang", "field"] ||
                              c == "ohua.sql.query/group_by" ||
@@ -623,7 +646,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                                  _ -> throw $ UnexpectedNumberOfAncestors (GR.node' ctx) s 2 (GR.pre' ctx)
                          Identity -> True
                          _ -> False)
-                gr3
+                ctrlHandled
     quickDumpGr "superf-removed.dot" $ printableLabelWithIndices gr2
     let whereMerged = joinWhereMerge (fst . getType) gr2
     quickDumpGr "join-where-merged-with-types.dot" $
@@ -682,7 +705,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
     iGr :: GR.Gr Operator ()
     iGr = GR.emap (const ()) selectRemoved
     selectRemoved = dropASelectInput ctrlRemoved
-    ctrlRemoved = inlineCtrl (snd . getType) iGr0
+    ctrlRemoved = {- inlineCtrl (snd . getType) -} iGr0
     getLits n =
         fromMaybe [] $
         IM.lookup n envInputs
@@ -692,7 +715,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                  ( in_
                  , n
                  , either
-                       (retype3 gMirNodes n (getLits n) (fst $ getType n))
+                       (retype3 gMirNodes iGr0 n (getLits n) (fst $ getType n))
                        id
                        lab
                  , out))
@@ -767,43 +790,71 @@ removeSuperfluousOperators p g0 =
 
 type TypeMap = IM.IntMap ([NType], [NType])
 
-retype3 ::
-       GeneratedMirNodes
+
+determineCtrlType :: GR.Graph gr => gr Operator (Int, Int) -> GR.Node -> [NType] -> CtrlType
+determineCtrlType g n ts =
+    case ctxSourceLab of
+        CustomOp ctxL _
+            | ctxL == Refs.smapFun -> SmapCtrl
+            | ctxL == Refs.ifFun -> flip IfCtrl theCol $
+                  case ctxSourceOutIdx of
+                      0 -> True
+                      1 -> False
+                      other -> throw $ UnexpectedOutputColumn lab n other
+        _ -> throw $ UnexpectedOperator ctxSourceLab
+  where
+    lab = CustomOp Refs.ctrl []
+    theCol =
+        case ts of
+            NTScalar s:_ -> s
+            other -> throw $ InvalidReturnType lab other (Just n)
+    idxmap =
+        IM.fromList
+        [ (idx, (p, out, ts Prelude.!! idx))
+        | (p, (out, pred -> idx)) <- GR.lpre g n
+        ]
+    (ctxSource, ctxSourceOutIdx, _) = idxmap IM.! (-1)
+    ctxSourceLab = getLabel g ctxSource
+
+retype3 :: (GR.Graph gr, g ~ gr Operator (Int, Int))
+    => GeneratedMirNodes
+    -> g
     -> GR.Node
     -> [(Int, Lit)]
     -> [NType]
     -> QualifiedBinding
     -> Operator
-retype3 m n lits ty other@(QualifiedBinding namespace name) =
+retype3 m g n lits ty other@(QualifiedBinding namespace name) =
     case namespace of
         ["intrinsic"] ->
             case name of
                 "sink" -> throw $ UnexpectedOperator Sink
                 _ -> throw $ UnknownBuiltin other
-        ["ohua", "lang"]
-            | name == "(,)" ->
-              Project
-              { projectEmit = map toCol ty
-              , projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits
-              }
-            | name == "nth" -> CustomOp other []
-            | name `elem` builtinSimpleFuns ->
-                CustomOp other mkUDFInputs
-            | name == "id" -> Identity
-            | name == "select" ->
-              let flattenTy = Lens.para $ \a r -> case a of
-                      NTScalar s -> [Left s]
-                      NTRecFromTable t -> [Right t]
-                      _ -> concat r
-                  (_:ts) = ty
-              in
-              Select $ map flattenTy ts
-            | name == "unitFn" ->
-                case Prelude.lookup 0 lits of
-                    Just (FunRefLit (FunRef r _)) ->
-                        retype3 m n (error "impossible") ty r
-                    _ -> throw $ InvalidLiteralInputs (CustomOp other []) (map snd lits)
-            | otherwise -> CustomOp other []
+        ["ohua", "lang"] ->
+            case name of
+                "(,)" ->
+                    Project
+                    { projectEmit = map toCol ty
+                    , projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits
+                    }
+                "nth" -> CustomOp other []
+                "ctrl" -> Ctrl $ determineCtrlType g n ty
+                _ | name `elem` builtinSimpleFuns ->
+                    CustomOp other mkUDFInputs
+                "id" -> Identity
+                "select" ->
+                    let flattenTy = Lens.para $ \a r -> case a of
+                            NTScalar s -> [Left s]
+                            NTRecFromTable t -> [Right t]
+                            _ -> concat r
+                        (_:ts) = ty
+                    in
+                        Select $ map flattenTy ts
+                "unitFn"
+                    | Just (FunRefLit (FunRef r _)) <- Prelude.lookup 0 lits ->
+                          retype3 m g n (error "impossible") ty r
+                    | otherwise -> throw $ InvalidLiteralInputs (CustomOp other []) (map snd lits)
+                _ -> CustomOp other []
         ["ohua", "lang", "field"] -> CustomOp other []
         ["ohua", "sql", "table"] -> Source (Mir.TableByName $ unwrap name)
         ["ohua", "sql", "query"] | name == "table_is_empty" -> IsEmptyCheck

@@ -104,6 +104,12 @@ data JoinType
     | InnerJoin
     deriving (Show, Eq, Generic)
 
+data CtrlType
+    = SmapCtrl
+    | IfCtrl { iAmTrueBranch :: Bool, conditionColumn :: SomeColumn }
+    deriving (Generic, Eq, Ord, Show)
+
+
 data Operator
     = CustomOp { opName :: QualifiedBinding, opInputs :: [Either Mir.DataType SomeColumn] }
     | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
@@ -114,6 +120,7 @@ data Operator
     | Filter { conditions :: HashMap SomeColumn ( Mir.FilterCondition Mir.Column), arguments :: (Binding, [Binding]) }
     | IsEmptyCheck
     | Select SelectPayload
+    | Ctrl CtrlType
     deriving (Show, Eq, Generic)
 
 type SelectPayload = [[Either SomeColumn Mir.Table]]
@@ -136,6 +143,7 @@ instance PP.Pretty Operator where
         Project {..} -> "π" <+> PP.list (map showCol projectEmit <> map pretty projectLits)
         CustomOp o c -> PP.pretty o <+> PP.list (map (either pretty showCol ) c)
         IsEmptyCheck -> "∅?"
+        Ctrl ty -> "ctrl" <> PP.parens (if ty == SmapCtrl then "smap" else "if")
       where
           showCol = \case
               Left InternalColumn{..} -> PP.pretty producingOperator <> ":" <> PP.pretty outputIndex
@@ -167,7 +175,9 @@ type RegisterOperator = OperatorDescription -> IO ()
 instance B.Binary GenerationType
 instance B.Binary UDFDescription
 instance B.Binary Operator
+instance B.Binary CtrlType
 instance B.Binary OperatorDescription
+instance NFData CtrlType
 instance NFData Operator
 instance NFData JoinType
 instance Hashable JoinType

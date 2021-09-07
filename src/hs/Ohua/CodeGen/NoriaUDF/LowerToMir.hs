@@ -392,48 +392,48 @@ inlineCtrl getType =
                                 ]
                         (ctxSource, ctxSourceOutIdx, _) = idxmap IM.! (-1)
                         ctxSourceLab = getLabel g ctxSource
-                     in case ctxSourceLab of
-                            CustomOp ctxL _
-                                | ctxL == Refs.smapFun ->
-                                    flip GR.insEdges g $
-                                    outs >>= \((out, in_), j) ->
-                                        let (np, nout, t) = idxmap IM.! out
-                                         in case t of
-                                                NTSeq _ ->
-                                                    [(np, j, (nout, in_))]
-                                                _ ->
-                                                    [ ( np
-                                                      , ctxSource
-                                                      , (nout, minBound))
-                                                    , ( ctxSource
-                                                      , j
-                                                      , (maxBound, in_))
-                                                    ]
-                                | ctxL == Refs.ifFun ->
-                                    let theCol =
-                                            case getType ctxSource Prelude.!! ctxSourceOutIdx of
-                                                NTScalar s -> s
-                                                other -> throw $ InvalidReturnType lab [other] (Just n)
-                                        theVal =
-                                            case ctxSourceOutIdx of
-                                                0 -> 1
-                                                1 -> 0
-                                                other -> throw $ UnexpectedOutputColumn lab n other
-                                     in ( ins
-                                        , n
-                                        , Filter
-                                              { conditions =
-                                                    [ ( theCol
-                                                      , Mir.Comparison
-                                                            Mir.Equal
-                                                            (Mir.ConstantValue
-                                                             theVal))
-                                                    ]
-                                              , arguments = ("what?", []) -- throw FilterIsMissingAField
-                                              }
-                                        , outs) GR.&
-                                        g
-                            _ -> throw $ UnexpectedOperator ctxSourceLab
+                        g' =
+                            case ctxSourceLab of
+                                CustomOp ctxL _
+                                    | ctxL == Refs.smapFun -> g
+                                    | ctxL == Refs.ifFun ->
+                                        let theCol =
+                                                case getType ctxSource Prelude.!! ctxSourceOutIdx of
+                                                    NTScalar s -> s
+                                                    other -> throw $ InvalidReturnType lab [other] (Just n)
+                                            theVal =
+                                                case ctxSourceOutIdx of
+                                                    0 -> 1
+                                                    1 -> 0
+                                                    other -> throw $ UnexpectedOutputColumn lab n other
+                                        in ( ins
+                                            , n
+                                            , Filter
+                                                  { conditions =
+                                                        [ ( theCol
+                                                          , Mir.Comparison
+                                                                Mir.Equal
+                                                                (Mir.ConstantValue
+                                                                theVal))
+                                                        ]
+                                                  , arguments = ("what?", []) -- throw FilterIsMissingAField
+                                                  }
+                                            , outs) GR.& g
+                                _ -> throw $ UnexpectedOperator ctxSourceLab
+                    in  flip GR.insEdges g' $
+                        outs >>= \((out, in_), j) ->
+                            let (np, nout, t) = idxmap IM.! out
+                            in case t of
+                                    NTSeq _ ->
+                                        [(np, j, (nout, in_))]
+                                    _ ->
+                                        [ ( np
+                                          , ctxSource
+                                          , (nout, minBound))
+                                        , ( ctxSource
+                                          , j
+                                          , (maxBound, in_))
+                                        ]
             _ -> ctx GR.& g
 
 dropASelectInput :: (GR.DynGraph gr, gr Operator (a, Int) ~ g) => g -> g
@@ -750,13 +750,15 @@ collapseMultiArcs ::
 collapseMultiArcs = GR.gmap $ (_1 %~ groupOnInt) . (_4 %~ groupOnInt)
 
 removeSuperfluousOperators ::
-       (GR.DynGraph gr, gr a () ~ g) => (GR.Context a () -> Bool) -> g -> g
+       (GR.DynGraph gr, gr a () ~ g, a ~ Operator) => (GR.Context a () -> Bool) -> g -> g
 removeSuperfluousOperators p g0 =
     foldr'
         (\n g ->
              let ctx = GR.context g n
               in if p ctx
-                     then let [newNode] = GR.pre' ctx
+                     then let newNode = case GR.pre' ctx of
+                                            [n] -> n
+                                            other -> throw $ UnexpectedNumberOfAncestors n (GR.lab' ctx) 1 other
                            in GR.insEdges (map (newNode, , ()) $ GR.suc' ctx) $
                               GR.delNode n g
                      else g)
@@ -870,16 +872,14 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
             Join {} -> g
             Select _ -> g
             _ ->
-                case GR.pre g n of
-                    [] -> g
-                    [_] -> g
-                    [x, y] ->
-                        ( [((), x), ((), y)]
-                        , Prelude.head $ GR.newNodes 1 g
-                        , Join InnerJoin []
-                        , [((), n)]) GR.&
-                        GR.delEdges [(x, n), (y, n)] g
-                    other -> throw $ WrongNumberOfAncestors n lab 1 (length other)
+                fst $ foldl (\(g, other) x -> (maybe id (\y g ->
+                                                               ( [((), x), ((), y)]
+                                                               , Prelude.head $ GR.newNodes 1 g
+                                                               , Join InnerJoin []
+                                                               , [((), n)]) GR.&
+                                                               GR.delEdges [(x, n), (y, n)] g
+                                                       ) other g
+                                             , Just x))  (g, Nothing) (GR.pre g n)
 
 instance ToRust SerializableGraph where
     asRust graph =

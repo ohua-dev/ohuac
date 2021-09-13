@@ -80,7 +80,7 @@ data LoweringError
     | ColumnNotFound GR.Node (IM.IntMap LoweringMapEntry)
     | TableColumnsNotFound Mir.Table (HashMap Mir.Table [Mir.Column])
     | InputsDoNotLineUp [(Int, Lit)] [NType]
-    | InvalidFilterAfterIsEmpty (GR.MContext Operator ())
+    | InvalidFilterAfterIsEmpty GR.Node (GR.MContext Operator ())
     | UnexpectedNumberOfAncestors GR.Node Operator Word [GR.Node]
     | AmbiguousColumnsInJoin Operator
     | JoinColumnsNotFound Bool Operator [SomeColumn] [SomeColumn] [SomeColumn]
@@ -95,6 +95,7 @@ data LoweringError
     | AncestorNotFound [Int] GR.Node GR.Node
     | NoMirEquivalent Operator GR.Node
     | UnableToFindSingleMatchingCtrlChild GR.Node [(GR.Node, Maybe Operator)]
+    | WeirdProjectSetupInLeftOuterJoinIf GR.Node [(GR.Node, [ProjectColSpec])] [GR.Node]
     deriving Show
 
 data ErrorWithTrace = forall e . Exception e => ErrorWithTrace CallStack e
@@ -278,7 +279,7 @@ typeGraph udfs envInputs g = m
             Identity -> [fromIndex (Just 1) 0]
             Sink -> [fromIndex (Just 1) 0]
             Source t -> [NTSeq (NTRecFromTable t)]
-            Project {..} -> [NTTup $ map NTScalar $ projectEmit <> map (Left . fst) projectLits]
+            Project {..} -> [NTTup $ map (NTScalar . either (Left . fst ) id ) projectEmit]
             Select _ ->
                   case argTypes of
                       [_, x] -> [x]
@@ -548,12 +549,12 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
         | [( (), fsuc' )] <- fsuc
         , (Just (_, _, IsEmptyCheck, emouts), g3) <- GR.match fsuc' g2 =
                 let [f1, f2] = map snd emouts
-                    matchFilter v (Just ([], _, Filter { conditions }, outs))
-                        | [(Left ( InternalColumn { producingOperator = op, outputIndex = 0} ), (Mir.Comparison Mir.Equal (Mir.ConstantValue v')))] <- HashMap.toList conditions
-                        , v' == v && op == fsuc' = outs
-                    matchFilter _ ctx = throw $ InvalidFilterAfterIsEmpty ctx in
-                let (matchFilter 1 -> f1outs, g4) = GR.match f1 g3
-                    (matchFilter 0 -> f2outs, g5) = GR.match f2 g4
+                    matchFilter v (Just ([], _, Ctrl op ( IfCtrl {..}), outs))
+                        | iAmTrueBranch == v -- && op == fsuc'    The previous op has already been dropped. but this would be a good safety condition
+                        = outs
+                    matchFilter _ ctx = throw $ InvalidFilterAfterIsEmpty fsuc' ctx in
+                let (matchFilter True -> f1outs, g4) = GR.match f1 g3
+                    (matchFilter False -> f2outs, g5) = GR.match f2 g4
                     (( theCol, _ ):_) = cols
                     mkFilter op = Filter { conditions = HashMap.fromList [(theCol, Mir.Comparison op (Mir.ConstantValue Mir.None) )]
                                          , arguments = ("no", []) -- throw FilterIsMissingAField
@@ -658,12 +659,11 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
         printableLabelWithTypes udfSequentialized
     let gr3 = multiArcToJoin2 udfSequentialized
     quickDumpGr "annotated-and-reduced-ohua-graph.dot" $ mkLabelsPrintable gr3
-    let ctrlHandled = handleCtrl gr3
     let gr2 =
             removeSuperfluousOperators
                 (\ctx ->
                      case GR.lab' ctx of
-                         Ctrl _ _ -> assert (length (GR.pre' ctx) == 1) True
+                         Ctrl _ SmapCtrl -> assert (length (GR.pre' ctx) == 1) True
                          CustomOp c _ ->
                              c ^. namespace == ["ohua", "lang", "field"] ||
                              c == "ohua.sql.query/group_by" ||
@@ -676,13 +676,17 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                                  _ -> throw $ UnexpectedNumberOfAncestors (GR.node' ctx) s 2 (GR.pre' ctx)
                          Identity -> True
                          _ -> False)
-                ctrlHandled
+                gr3
     quickDumpGr "superf-removed.dot" $ printableLabelWithIndices gr2
     let whereMerged = joinWhereMerge (fst . getType) gr2
     quickDumpGr "join-where-merged-with-types.dot" $
         printableLabelWithTypes whereMerged
     quickDumpGr "join-where-merged.dot" $ mkLabelsPrintable whereMerged
-    pure (typeMap, whereMerged)
+    lojOptimized <- optimizeLeftOuterJoin whereMerged
+    quickDumpGr "loj-optimized.dot" $ mkLabelsPrintable lojOptimized
+    let ctrlHandled = handleCtrl lojOptimized
+    quickDumpGr "ctrl-handled.dot" $ mkLabelsPrintable ctrlHandled
+    pure (typeMap, ctrlHandled)
     -- TODO Actually, its better to put the indices as edge labels. Means I have
     -- to group when inserting the joins, but I don't have to keep adjusting the
     -- operator Id's for the Target's
@@ -801,6 +805,59 @@ removeSuperfluousOperators p g0 =
 
 type TypeMap = IM.IntMap ([NType], [NType])
 
+optimizeLeftOuterJoin :: ( GR.DynGraph gr, gr Operator () ~ g, MonadLogger m ) => g -> m g
+optimizeLeftOuterJoin = \g -> foldM f g (GR.labNodes g)
+  where
+    f g (joinN, Join { joinType = LeftOuterJoin, ..} )
+        | all isSimple thenLabels
+        , all (== Mir.None) litMatches
+        , all fromParentTable litMatchCols =
+          pure $
+          GR.insEdges [(joinN, List.head $ GR.suc g elseCtrl, ())
+                      , (List.head $ filter (not . (`elem` thenNodes)) $ GR.pre g selectN , List.head $ GR.suc g selectN, ())] $
+          GR.delNodes thenNodes $
+          GR.delNodes [thenCtrl, elseCtrl, selectN] g
+        | otherwise = mapM_ @[_] logDebugN
+          [ "Could not optimize join " <> show joinN
+          , "\tNodes are simple: " <> show (all isSimple thenLabels) <> " " <> show thenLabels
+          , "\tLiterals are None: " <> show (all (==Mir.None) litMatches) <> " " <> show litMatches
+          , "\tMAtching columns are from parent " <> show (all fromParentTable litMatchCols) <> " " <> show litMatchCols
+          , "\tLeft project: " <> show lproject
+          , "\tRight project: " <> show rproject
+          , "\tJoin Columns: " <> show joinOn
+          ] >> pure g
+      where
+        ( litMatches, litMatchCols ) = unzip $ mapMaybe (\case (Left (_, dat ), Right c) -> Just (dat, c); _ -> Nothing) $ zip (snd lproject ) (snd rproject)
+        (lproject, rproject) =
+            let go n = let Just l = GR.lab g n in
+                    case l of
+                        Project {projectEmit} -> (n, projectEmit)
+                        _ -> let [p] = GR.pre g n in go p
+            in case map go $ GR.pre g selectN of
+                [l@(ln, _), r@(rn, _)]
+                    | ln `elem` thenNodes -> (l, r)
+                    | rn `elem` thenNodes -> (r, l)
+                found -> throw $ WeirdProjectSetupInLeftOuterJoinIf selectN found thenNodes
+        ( [ thenCtrl ], [ elseCtrl ] ) = List.partition
+            (\case (GR.lab g -> Just (Filter {conditions})) | [(_, Mir.Comparison op (Mir.ConstantValue Mir.None))] <- HashMap.toList conditions -> op == Mir.Equal -- should probably also amke sure the column is correct
+                   _ -> False) $ GR.suc g joinN
+        ((selectN, selectL), ( thenNodes, thenLabels ) ) =
+            let go n = let Just l = GR.lab g n in
+                    case l of
+                        Select {} -> ((n, l), [])
+                        _ -> (s, (n, l): others ++ ( more >>= snd ))
+                            where (s, others): more = map go $ GR.suc g n
+            in second (unzip . Prelude.tail) $ go thenCtrl
+        fromParentTable = case joinOn of
+            [(_, Right Mir.Column{table=Just t})] -> \case
+                Right Mir.Column{table=Just t'} -> t' == t
+                _ -> False
+            _ -> const False
+        isSimple = \case
+            CustomOp b _ -> ( b ^.namespace ) `elem` ( [ ["ohua", "lang", "field"] ] :: Vector NSRef)
+            Project {} -> True
+            _ -> False
+    f g _ = pure g
 
 determineCtrlType :: GR.Graph gr => gr Operator (Int, Int) -> GR.Node -> [NType] -> (Int, CtrlType )
 determineCtrlType g n ts = (ctxSource, ) $
@@ -845,8 +902,8 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
             case name of
                 "(,)" ->
                     Project
-                    { projectEmit = map toCol ty
-                    , projectLits = map (\( idx, l ) -> (InternalColumn { producingOperator = n, outputIndex = idx}, litToDBLit l)) lits
+                    { projectEmit = map (mapLeft (first $ \idx -> InternalColumn { producingOperator = n, outputIndex = idx}) ) consolidated
+                    --, projectLits = map (\( idx, l ) -> (, litToDBLit l)) lits
                     }
                 "nth" -> CustomOp other []
                 "ctrl" -> uncurry Ctrl $ determineCtrlType g n ty
@@ -873,13 +930,14 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
             fromMaybe (CustomOp other mkUDFInputs) $
             fmap rewriteFilter $ HashMap.lookup other m
   where
-    mkUDFInputs = (unfoldr consolidate (sortOn fst lits, ty, 0))
+    mkUDFInputs = map (mapLeft snd) consolidated
+    consolidated = unfoldr consolidate (sortOn fst lits, ty, 0)
     consolidate (lits, tys, succ -> n) = case lits of
         []
             | t:ts <- tys -> Just (Right $ toCol t, ([], ts, n) )
             | otherwise -> Nothing
         (li,l):ls
-            | succ li == n -> Just (Left (litToDBLit l), (ls, tys, n))
+            | succ li == n -> Just (Left (li, litToDBLit l), (ls, tys, n))
             | t:ts <- tys -> Just (Right $ toCol t, (lits, ts, n))
             | otherwise -> throw $ InputsDoNotLineUp lits tys
     rewriteFilter a@(Filter conds vars@(st, free)) = Filter newConds vars
@@ -924,7 +982,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
             t -> throw $ UnexpectedType "NTScalar" (CustomOp other []) [t]
     litToDBLit = \case
         FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _) -> Mir.None
-        other -> throw $ InvalidLiteralInputs (Project [] []) [other]
+        other -> throw $ InvalidLiteralInputs (Project []) [other]
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
@@ -1148,6 +1206,7 @@ handleNode execSemMap tm mg m n = case op of
         { projectEmit = map someColToMirCol fromAncestor
         , projectLiterals = zip (repeat "unused") $ map snd projectLits
         }
+      where projectLits = mapMaybe (\case Left l -> Just l; _ -> Nothing) projectEmit
     Identity -> defaultRet $ Mir.Identity $ map someColToMirCol fromAncestor
     Filter f _ ->
         defaultRet
@@ -1215,7 +1274,7 @@ handleNode execSemMap tm mg m n = case op of
                               case c2 of
                                   Mir.ColumnValue c -> [Right c]
                                   _ -> []
-                      Project {..} -> projectEmit
+                      Project {..} -> mapMaybe (\case Right r -> Just r ; _ -> Nothing) projectEmit
                       Join {joinOn} -> joinOn >>= \(c1, c2) -> [c1, c2]
                       _ -> []
             ]
@@ -1251,7 +1310,7 @@ toSerializableGraph entrypoint execSemMap tm mg = do
             projectedCols = HashSet.toList $ findProjCols s
             findProjCols s =
                 case GR.lab mg s of
-                    Just (Project p lits) -> HashSet.fromList $ p <> map (Left . fst) lits
+                    Just (Project p) -> HashSet.fromList $ rights p <> mapMaybe (\case Left (l,_) -> Just $ Left l; _ -> Nothing) p
                     Just _ -> HashSet.unions $ map findProjCols $ GR.pre mg s
                     Nothing -> error "Why no label?"
         (sinkIn, sinkOut) <-

@@ -109,11 +109,12 @@ data CtrlType
     | IfCtrl { iAmTrueBranch :: Bool, conditionColumn :: SomeColumn }
     deriving (Generic, Eq, Ord, Show)
 
+type ProjectColSpec = Either (InternalColumn, Mir.DataType ) SomeColumn
 
 data Operator
     = CustomOp { opName :: QualifiedBinding, opInputs :: [Either Mir.DataType SomeColumn] }
     | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
-    | Project { projectEmit :: [ SomeColumn ], projectLits :: [(InternalColumn, Mir.DataType )] }
+    | Project { projectEmit :: [ProjectColSpec]}
     | Identity
     | Sink
     | Source Mir.Table
@@ -140,7 +141,7 @@ instance PP.Pretty Operator where
         Identity -> "≡"
         Sink -> "Sink"
         Source s -> "B" <+> PP.pretty s
-        Project {..} -> "π" <+> PP.list (map showCol projectEmit <> map pretty projectLits)
+        Project {..} -> "π" <+> PP.list (map (either pretty showCol ) projectEmit)
         CustomOp o c -> PP.pretty o <+> PP.list (map (either pretty showCol ) c)
         IsEmptyCheck -> "∅?"
         Ctrl _ ty -> "ctrl" <> PP.parens (if ty == SmapCtrl then "smap" else "if")

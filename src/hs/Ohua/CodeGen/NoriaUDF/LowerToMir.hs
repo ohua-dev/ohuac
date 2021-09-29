@@ -839,7 +839,7 @@ optimizeLeftOuterJoin = \g -> foldM f g (GR.labNodes g)
                     | rn `elem` thenNodes -> (r, l)
                 found -> throw $ WeirdProjectSetupInLeftOuterJoinIf selectN found thenNodes
         ( [ thenCtrl ], [ elseCtrl ] ) = List.partition
-            (\case (GR.lab g -> Just (Filter {conditions})) | [(_, Mir.Comparison op (Mir.ConstantValue Mir.None))] <- HashMap.toList conditions -> op == Mir.Equal -- should probably also amke sure the column is correct
+            (\case (GR.lab g -> Just (Filter {conditions})) | [(_, Mir.Comparison op (Mir.ConstantValue Mir.None))] <- HashMap.toList conditions -> op == Mir.Equal -- should probably also make sure the column is correct
                    _ -> False) $ GR.suc g joinN
         ((selectN, selectL), ( thenNodes, thenLabels ) ) =
             let go n = let Just l = GR.lab g n in
@@ -981,8 +981,12 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
             NTScalar s -> s
             t -> throw $ UnexpectedType "NTScalar" (CustomOp other []) [t]
     litToDBLit = \case
-        FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _) -> Mir.None
+        NULL -> Mir.None
+        NumericLit n -> Mir.Int n
         other -> throw $ InvalidLiteralInputs (Project []) [other]
+
+pattern NULL <- FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _)
+   where NULL = FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") Nothing)
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
@@ -992,14 +996,17 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
             Join {} -> g
             Select _ -> g
             _ ->
-                fst $ foldl (\(g, other) x -> (maybe id (\y g ->
-                                                               ( [((), x), ((), y)]
-                                                               , Prelude.head $ GR.newNodes 1 g
-                                                               , Join InnerJoin []
-                                                               , [((), n)]) GR.&
-                                                               GR.delEdges [(x, n), (y, n)] g
-                                                       ) other g
-                                             , Just x))  (g, Nothing) (GR.pre g n)
+                fst $ foldl' handleSingleFork  (g, Nothing) (GR.pre g n)
+      where
+        handleSingleFork (g, other) x =
+            (maybe id doJoin other g, Just x)
+          where
+            doJoin y g =
+                ( [((), x), ((), y)]
+                , Prelude.head $ GR.newNodes 1 g
+                , Join InnerJoin []
+                , [((), n)]) GR.&
+                GR.delEdges [(x, n), (y, n)] g
 
 instance ToRust SerializableGraph where
     asRust graph =
@@ -1058,7 +1065,7 @@ instance ToRust SerializableGraph where
                             case executionType of
                                 Mir.Reduction {..} ->
                                     "Reduction" <>
-                                    recordSyn [("group_by", ppColVec groupBy)]
+                                    recordSyn [("group_by", ppVec $ map pretty groupBy)]
                                 Mir.Simple i ->
                                     "Simple" <> recordSyn [("carry", pretty i)])
                         ]
@@ -1121,18 +1128,22 @@ handleNode execSemMap tm mg m n = case op of
         defaultRet
         Mir.Regular
             { nodeFunction = o
-            , indices = map (either Mir.ConstantValue (Mir.ColumnValue . colAsIndex) ) ccols
-            , executionType =
+            , indices = ind
+            , executionType = execT
+            }
+        where
+          Just execSem = execSemMap op
+          stdIndices = map (either Mir.ConstantValue (Mir.ColumnValue . colAsIndex) ) ccols
+          (ind, execT) =
                   case execSem of
-                      ReductionSem -> unimplemented
+                      ReductionSem -> let (Mir.ColumnValue x:xs) = stdIndices in (xs, Mir.Reduction [x])
                       SimpleSem ->
                           let [p] = ins
-                            in Mir.Simple $
-                              fromIntegral $
-                              length $ ancestorColumns (snd p)
+                            in (stdIndices
+                               , Mir.Simple $
+                                 fromIntegral $
+                                 length $ ancestorColumns (snd p))
                       _ -> unimplemented
-            }
-        where Just execSem = execSemMap op
     Join {joinType, joinOn}
         | [lp,rp] <- map snd ins ->
               let lc = ancestorColumns lp

@@ -423,6 +423,11 @@ generatedOpSourcePath udfName =
     toString (unwrap $ udfName ^. name) <>
     ".rs"
 
+makeStateReturn :: Expr -> Expr
+makeStateReturn = transform $ \case
+    Let unit val (Lit UnitLit) | isIgnoredBinding unit -> val
+    e -> e
+
 processStatefulUdf ::
        (MonadOhua m)
     => Fields
@@ -430,9 +435,16 @@ processStatefulUdf ::
     -> Expression
     -> Binding
     -> Expression
-    -> m (Expression, OperatorDescription)
-processStatefulUdf fields udfName program state initState =
+    -> m (Expression, Either Expression OperatorDescription)
+processStatefulUdf fields udfName program state initState = do
+    logDebugN $ "Processing stateful UDF " <> quickRender program
     case program of
+        Let unit stuff (Lit UnitLit)
+            | isIgnoredBinding unit ->
+              case length [v | Var v <- universe stuff, v == state] of
+                  0 -> error "State not used. This should probably not be an error?"
+                  n | n > 1 -> error $ "State " <> quickRender state <> " is used too often (" <> show n <> ")"
+                  1 -> pure (makeStateReturn stuff, Left initState)
         Let unit (Smap _ mapF (Var coll)) reduceF
             | isIgnoredBinding unit -> do
                 (mapFn, rowName, fieldIndices) <- mkMapFn fields mapF state coll
@@ -491,12 +503,12 @@ processStatefulUdf fields udfName program state initState =
                                 mkFieldDestrExpr
                                     (foldl' Apply udf $ map Var newBnds)
                 ie <- ALang.normalize $ mkInvokeExpr $ embedE udfName
-                pure $ (ie, ) $ Op_UDF $
+                pure $ (ie, ) $ Right $ Op_UDF $
                     UDFDescription
                         { generations = [nodeSub, stateSub]
                         , udfName = udfName
                         , inputBindings = []
-                        , udfState = Just stateType
+                        , udfState = Just ( stateType, [] )
                         , referencedFields = fieldIndices
                         , execSemantic = ReductionSem
                         }
@@ -559,7 +571,7 @@ mkPatchesFor :: UDFDescription -> [(FilePath, HashMap Text [Text])]
 mkPatchesFor UDFDescription {..} =
     maybe
         []
-        (\st ->
+        (\( st, _ ) ->
              [ Path.dataflowSourceDir <> "/state/mod.rs" ~>
                [ ("state-trait-method-def" :: Text) ~>
                  mkStateTraitCoercionFunc udfName st "Option::None"
@@ -746,7 +758,8 @@ generateOperators ::
        Fields -> RegisterOperator -> Expression -> OhuaM env Expression
 generateOperators fields registerOp program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
-    program' <- transformM genStatefulOps program >>= transformM genPureOps
+    logDebugN $ "Found state values" <> quickRender (HashSet.toList stateVals)
+    program' <- evalStateT (transformM genStatefulOps program >>= transformM genPureOps) HashMap.empty
     logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
@@ -798,8 +811,11 @@ generateOperators fields registerOp program = do
                 quickRender (Let st initExpr udf)
             (invokeExpr, fdata) <-
                 processStatefulUdf fields udfName udf st initExpr
-            liftIO $ registerOp fdata
-            pure $ handleReturn invokeExpr e'
+            case fdata of
+                Left init -> modify (HashMap.insert st ( init, (Many, One) )) >> pure invokeExpr
+                Right fdata -> do
+                    liftIO $ registerOp fdata
+                    pure $ handleReturn invokeExpr e'
     genStatefulOps e = pure e
     genPureOps (Let bnd val@Apply {} body)
         | not $ isKnownFunction function = do
@@ -824,28 +840,28 @@ generateOperators fields registerOp program = do
                       ]
                     , "udf-ret-type" ~> ["SqlType::Double"]
                     ]
-            argVars <- traverse expectVar args
+            ( argVars, foldl (.) id -> extraLets ) <- unzip <$> traverse (\case Var v -> pure (v, id); other -> do b <- generateBindingWith "arg"; pure (b, Let b other) ) args
+            (udfState, execSem) <- case st of
+                 Nothing -> pure (Nothing, SimpleSem)
+                 Just (Var v) ->
+                     first (Just . stateToInit ) . fromMaybe (error $ "No initializer found for " <> quickRender v)
+                     <$> gets (HashMap.lookup v)
+                 Just other -> error $ "State should be a var " <> quickRender other
             liftIO $ registerOp $ Op_UDF $
                 UDFDescription
                     { udfName = udfName
                     , inputBindings = argVars
-                    , udfState = Nothing
+                    , udfState = udfState
                     , referencedFields = fieldIndices
                     , generations = [opGen]
-                    , execSemantic = SimpleSem
+                    , execSemantic = execSem
                     }
-            pure $ Let bnd (fromListToApply (FunRef udfName Nothing) args) body
+            pure $ extraLets $ Let bnd (fromListToApply (FunRef udfName Nothing) (map Var argVars)) body
       where
-        (FunRef function _, args) = fromApplyToList val
+        (st, FunRef function _, args) = stateAwareApplyToList val
         fieldIndices = [0 .. length args - 1]
         accessedFields = map ("none", ) fieldIndices
     genPureOps other = pure other
-    globalVals = HashSet.fromList $ RS.cata f program
-      where
-        f =
-            \case
-                LetF b _ o -> b : o
-                _ -> []
     stateVals =
         HashSet.fromList
             [ v
@@ -854,8 +870,18 @@ generateOperators fields registerOp program = do
                   case st of
                       Var v -> [v]
                       e -> error (show e)
-            ] `HashSet.difference`
-        globalVals
+            ]
+
+stateToInit :: Expr -> (QualifiedBinding, [Lit])
+stateToInit e = (fun, [case l of Lit l -> l; _ -> error $ quickRender l <> " is not a literal" | l <- args])
+  where (FunRef fun _, args) = fromApplyToList e
+
+stateAwareApplyToList :: Expr -> (Maybe Expr, FunRef, [Expr])
+stateAwareApplyToList = \case
+    Apply f val -> let (s, f', e) = stateAwareApplyToList f in (s, f', e ++ [val])
+    BindState v (Lit (FunRefLit f)) -> (Just v, f, [])
+    Lit (FunRefLit f) -> (Nothing, f, [])
+    e -> error $ quickRender e <> " is not a function application"
 
 isKnownFunction :: QualifiedBinding -> Bool
 isKnownFunction f =

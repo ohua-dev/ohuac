@@ -165,7 +165,7 @@ data UDFDescription = UDFDescription
       { generations :: [GenerationType]
       , udfName :: QualifiedBinding
       , inputBindings :: [Binding]
-      , udfState :: Maybe QualifiedBinding
+      , udfState :: Maybe (QualifiedBinding, [Lit])
       , referencedFields :: [Int]
       , execSemantic :: (ExecSem, ExecSem)
       } deriving (Eq, Generic)

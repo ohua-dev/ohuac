@@ -39,7 +39,7 @@ instance NFData Column
 
 data ExecutionType
     = Reduction
-          { groupBy :: [Column]
+          { groupBy :: [Word]
           }
     | Simple Word
   deriving (Show, Eq, Generic)

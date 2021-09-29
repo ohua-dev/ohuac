@@ -484,10 +484,6 @@ sequentializeScalars mGetSem g0 = gFoldTopSort f g0
             (ins, n, l, prune $ pouts ++ outs) GR.&
             ((pins, p, plab, []) GR.& g'')
         | Just (_, Many) <- getSem l = g
-        | CustomOp fun _ <- l
-        , False
-        , Refs.smapFun == fun || Refs.ifFun == fun =
-          (hashNub [p | p@(_, p0) <- ins,  not $ any (reachable p0 . snd) ins], n, l, prunedOuts) GR.& g'
         | null prunedOuts = g
         | otherwise = (ins, n, l, prunedOuts) GR.& g'
       where

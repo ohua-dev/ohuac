@@ -570,16 +570,17 @@ mkNodePath udfName = udfFileToPathThing ModPath udfName [mkOpStructName udfName]
 mkPatchesFor :: UDFDescription -> [(FilePath, HashMap Text [Text])]
 mkPatchesFor UDFDescription {..} =
     [ Path.dataflowSourceDir <> "/state/mod.rs" ~>
-      maybe
-        []
-        (\( st, _ ) ->
-               [ ("state-trait-method-def" :: Text) ~>
+        [ ("state-trait-method-def" :: Text) ~>
+          maybe
+            []
+            (\( st, _ ) ->
                  mkStateTraitCoercionFunc udfName st "Option::None"
                 -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
                 --     Option::None
                 -- }
-               ])
-        udfState
+               )
+            udfState
+        ]
     ]
         <>
     [ Path.dfOpsFile ~>

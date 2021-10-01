@@ -569,18 +569,19 @@ mkNodePath udfName = udfFileToPathThing ModPath udfName [mkOpStructName udfName]
 
 mkPatchesFor :: UDFDescription -> [(FilePath, HashMap Text [Text])]
 mkPatchesFor UDFDescription {..} =
-    maybe
+    [ Path.dataflowSourceDir <> "/state/mod.rs" ~>
+      maybe
         []
         (\( st, _ ) ->
-             [ Path.dataflowSourceDir <> "/state/mod.rs" ~>
                [ ("state-trait-method-def" :: Text) ~>
                  mkStateTraitCoercionFunc udfName st "Option::None"
                 -- fn as_click_ana_state<'a>(&'a mut self) -> Option<&'a mut self::click_ana::ClickAnaState> {
                 --     Option::None
                 -- }
-               ]
-             ])
-        udfState <>
+               ])
+        udfState
+    ]
+        <>
     [ Path.dfOpsFile ~>
       [ "node-operator-enum" ~> [nodeOpConstr <> "(" <> nodePath <> "),"]
       , "nodeop-from-impl-macro-call" ~>
@@ -596,12 +597,7 @@ mkPatchesFor UDFDescription {..} =
              -- NodeOperator::ClickAnaUDF(ref i) => i.$fn($($arg),*),
       ]
     , Path.opsInterfaceFile ~>
-      [ let (replacementKey, extraNodeArg) =
-                case execSemantic of
-                    ReductionSem ->
-                        ("generated-reducing-operator-inits", "group")
-                    SimpleSem -> ("generated-simple-operator-inits", "carry")
-         in replacementKey ~>
+    let mkInit extraNodeArg =
             [ renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
               ppBlock
                   (PP.vsep
@@ -623,7 +619,13 @@ mkPatchesFor UDFDescription {..} =
                    ".into()") <>
               ","
             ]
-      ]
+        (red, simpl) = case execSemantic of
+                           ReductionSem -> (mkInit "group", [])
+                           SimpleSem -> ([], mkInit "carry")
+    in
+    [ "generated-reducing-operator-inits" ~> red
+    , "generated-simple-operator-inits" ~> simpl
+    ]
     , Path.schemaFile ~>
       [ "type-resolution-for-generated-nodes" ~>
         [ renderDoc $ "ops::NodeOperator::" <> pretty nodeOpConstr <>

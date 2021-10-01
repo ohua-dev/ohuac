@@ -77,9 +77,9 @@ doTheGenerating ::
     -> m ()
 doTheGenerating toGen = do
     templates <-
-        HashMap.fromList <$>
-        sequence
-            [ (t, ) <$> loadNoriaTemplate t
+        traverse loadNoriaTemplate $
+        HashMap.fromList
+            [ (t, t)
             | TemplateSubstitution t _ _ <- Data.Foldable.toList toGen
             ]
     let getTemplate t =

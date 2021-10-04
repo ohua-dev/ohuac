@@ -1120,7 +1120,7 @@ type LoweringMapEntry = (Mir.Node, [SomeColumn], [GR.Node])
 handleNode :: (Operator -> Maybe ExecSemantic) -> (IM.IntMap ([NType], [NType] )) -> GR.Gr Operator () -> IM.IntMap LoweringMapEntry -> GR.Node -> LoweringMapEntry
 handleNode execSemMap tm mg m n = case op of
     CustomOp o ccols ->
-        withCols (fromAncestor <> map Left (getUdfReturnCols n)) $
+        withCols cols $
         defaultRet
         Mir.Regular
             { nodeFunction = o
@@ -1130,15 +1130,21 @@ handleNode execSemMap tm mg m n = case op of
         where
           Just execSem = execSemMap op
           stdIndices = map (either Mir.ConstantValue (Mir.ColumnValue . colAsIndex) ) ccols
-          (ind, execT) =
+          udfRetCols = map Left (getUdfReturnCols n)
+          (ind, cols, execT) =
                   case execSem of
-                      ReductionSem -> let (Mir.ColumnValue x:xs) = stdIndices in (xs, Mir.Reduction [x])
                       SimpleSem ->
                           let [p] = ins
                             in (stdIndices
+                               , fromAncestor <> udfRetCols
                                , Mir.Simple $
                                  fromIntegral $
                                  length $ ancestorColumns (snd p))
+                      ReductionSem ->
+                          let (Mir.ColumnValue x:xs) = stdIndices
+                              Right c:_ = ccols
+                          in
+                              (xs, c:udfRetCols , Mir.Reduction [x])
                       _ -> unimplemented
     Join {joinType, joinOn}
         | [lp,rp] <- map snd ins ->

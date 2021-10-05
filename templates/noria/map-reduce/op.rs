@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::super::att3::Typed;
 use nom_sql::SqlType;
+use super::super::Value;
 
 use crate::ops::grouped::get_group_values;
 use crate::state::cstate::{ SpecialStateWrapper, MemoElem };

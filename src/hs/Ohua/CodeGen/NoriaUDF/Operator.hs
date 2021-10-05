@@ -183,7 +183,7 @@ mkMapFn fields program' stateV coll = do
                 isTheState
                 mkAc
         mkAc func' args =
-            "diffs.push" <> "((Action::" <> pretty (T.toTitle (unwrap func')) <>
+            "diffs.push((Action::" <> pretty (T.toTitle (unwrap func')) <>
             (if null args || args == [Lit UnitLit]
                  then mempty
                  else PP.tupled (map (toRust False) args)) <>
@@ -757,6 +757,71 @@ rewriteQueryExpressions register e = do
             | Just process <- queryEDSL f -> process register st [arg]
         other -> pure other
 
+mkStatefulOpDesc :: Binding -> Expr -> QualifiedBinding -> [Binding] -> UDFDescription
+mkStatefulOpDesc function initState udfName args =
+    UDFDescription
+        { generations = [nodeSub, stateSub]
+        , udfName = udfName
+        , inputBindings = []
+        , udfState = Just $ stateToInit initState
+        , referencedFields = fieldIndices
+        , execSemantic = ReductionSem
+        }
+  where
+    nodeSub =
+        TemplateSubstitution
+                "map-reduce/op.rs"
+                (generatedOpSourcePath udfName) $
+            baseUdfSubMap udfName rowName accessedFields <>
+            [ "map" ~>
+                ["use " <> stateNSStr <> "::Action;"
+                , renderDoc $
+                    PP.vsep $
+                    [ "let arg_" <> pretty idx <+>
+                    "= match &self." <>
+                    pretty (idxPropFromName (stateV, idx)) <>
+                    "{Value::Constant(c) => c.clone(), Value::Column(c) => " <>
+                    pretty rowName <> "[*c].clone()}.into();"
+                    | (idx, _) <- argsWithIndices
+                    ] ++
+                    ["diffs.push((Action::" <> pretty (T.toTitle $ unwrap ( function :: Binding)) <>
+                        (if null args
+                            then mempty
+                            else PP.tupled (map (\i -> "arg_" <> pretty i) fieldIndices)) <>
+                        ", r_is_positive));"
+                    ]
+                ]
+            , "reduce" ~> ["computer.compute_new_value()"]
+            , "special-state-coerce-call" ~>
+            ["." <> mkSpecialStateCoerceName udfName <> "()"]
+            , "udf-state-type" ~> [stateTypeStr]
+            ]
+    state = "state"
+    stateV = state
+    rowName = "r"
+    argsWithIndices = zip [0..] $ drop 1 args
+    fieldIndices = map fst argsWithIndices
+    accessedFields = map (state, ) fieldIndices
+    stateType = getStateType initState
+    stateTypeStr = asRustT $ stateType ^. namespace
+    stateNSStr =
+        asRustT $ unwrapped @NSRef . asNonEmpty %~ init $
+        stateType ^.
+        namespace
+    stateSub =
+        TemplateSubstitution
+            "map-reduce/state.rs"
+            (Path.dataflowSourceDir <> "/state/ohua/generated/" <>
+            toString (unwrap $ udfName ^. name) <>
+            ".rs")
+            [ "state-trait-coerce-impls" ~>
+            mkStateTraitCoercionFunc
+                udfName
+                stateType
+                "Option::Some(self)"
+            , "udf-state-type" ~> [stateTypeStr]
+            ]
+
 generateOperators ::
        Fields -> RegisterOperator -> Expression -> OhuaM env Expression
 generateOperators fields registerOp program = do
@@ -815,7 +880,7 @@ generateOperators fields registerOp program = do
             (invokeExpr, fdata) <-
                 processStatefulUdf fields udfName udf st initExpr
             case fdata of
-                Left init -> modify (HashMap.insert st ( init, (Many, One) )) >> pure invokeExpr
+                Left init -> modify (HashMap.insert st init) >> pure invokeExpr
                 Right fdata -> do
                     liftIO $ registerOp fdata
                     pure $ handleReturn invokeExpr e'
@@ -826,39 +891,41 @@ generateOperators fields registerOp program = do
                         -- This relies heavily of having the expected `let x = f a b c`
                         -- structure
             let udfName = QualifiedBinding GenFuncsNamespace opName
-                opGen =
-                    TemplateSubstitution
-                        "pure/op.rs"
-                        (generatedOpSourcePath udfName) $
-                    baseUdfSubMap udfName "r" accessedFields <>
-                    [ "function" ~>
-                      [ renderDoc $ asRust function <>
-                        PP.tupled
-                            (map (\i ->
-                                      "r[self." <> pretty (idxPropFromName i) <>
-                                      "].clone().into()")
-                                 (if args == [Lit UnitLit]
-                                      then []
-                                      else accessedFields))
-                      ]
-                    , "udf-ret-type" ~> ["SqlType::Double"]
-                    ]
             ( argVars, foldl (.) id -> extraLets ) <- unzip <$> traverse (\case Var v -> pure (v, id); other -> do b <- generateBindingWith "arg"; pure (b, Let b other) ) args
-            (udfState, execSem) <- case st of
-                 Nothing -> pure (Nothing, SimpleSem)
-                 Just (Var v) ->
-                     first (Just . stateToInit ) . fromMaybe (error $ "No initializer found for " <> quickRender v)
-                     <$> gets (HashMap.lookup v)
-                 Just other -> error $ "State should be a var " <> quickRender other
-            liftIO $ registerOp $ Op_UDF $
-                UDFDescription
-                    { udfName = udfName
-                    , inputBindings = argVars
-                    , udfState = udfState
-                    , referencedFields = fieldIndices
-                    , generations = [opGen]
-                    , execSemantic = execSem
-                    }
+            liftIO . registerOp . Op_UDF =<< case st of
+                Nothing ->
+                    pure $ UDFDescription
+                        { udfName = udfName
+                        , inputBindings = argVars
+                        , udfState = Nothing
+                        , referencedFields = fieldIndices
+                        , generations = [opGen]
+                        , execSemantic = SimpleSem
+                        }
+                  where
+                    opGen =
+                        TemplateSubstitution
+                            "pure/op.rs"
+                            (generatedOpSourcePath udfName) $
+                        baseUdfSubMap udfName "r" accessedFields <>
+                        [ "function" ~>
+                        [ renderDoc $ asRust function <>
+                            PP.tupled
+                                (map (\i ->
+                                        "r[self." <> pretty (idxPropFromName i) <>
+                                        "].clone().into()")
+                                    (if args == [Lit UnitLit]
+                                        then []
+                                        else accessedFields))
+                        ]
+                        , "udf-ret-type" ~> ["SqlType::Double"]
+                        ]
+                Just (Var v) -> gets (HashMap.lookup v) >>= \case
+                    Nothing ->
+                        error $ "No initializer found for " <> quickRender v
+                    Just st -> pure $ mkStatefulOpDesc (function ^. name) st udfName argVars
+
+                Just other -> error $ "State should be a var " <> quickRender other
             pure $ extraLets $ Let bnd (fromListToApply (FunRef udfName Nothing) (map Var argVars)) body
       where
         (st, FunRef function _, args) = stateAwareApplyToList val

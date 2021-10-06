@@ -13,6 +13,7 @@ module Ohua.CodeGen.NoriaUDF.LowerToMir
 
 import Control.Lens (Simple, (?~), (%=), (^?!), ix, to, use, at)
 import qualified Control.Lens as Lens
+import qualified Control.Lens.Plated as Plated
 import qualified Data.GraphViz as GraphViz
 import qualified Data.GraphViz.Printing as GraphViz
 import qualified Data.HashMap.Strict as HashMap
@@ -89,7 +90,7 @@ data LoweringError
     | ExpectedEqualType GR.Node Operator NType NType
     | ColumnHasNoTable Mir.Column
     | ColumnNotFoundInList SomeColumn [SomeColumn] GR.Node Operator
-    | InvalidUDFReturnType GR.Node NType
+    | InvalidUDFReturnType GR.Node [ NType ]
     | Expected2TypeRowsInSelect GR.Node SelectPayload
     | CannotReconcileSelectArmTypes (Either SomeColumn Mir.Table) (Either SomeColumn Mir.Table)
     | AncestorNotFound [Int] GR.Node GR.Node
@@ -332,7 +333,9 @@ typeGraph udfs envInputs g = m
                                 (throw $ FieldNotFound f rb fields) $
                             List.lookup f fields
                         other -> throw $ UnexpectedTypeForField other f
-                | Just _ <- udfs o -> likeUdf
+                | Just sem <- udfs o -> case sem of
+                      SimpleSem -> likeUdf
+                      ReductionSem -> fromIndex Nothing 0 : likeUdf
             _ -> throw $ MissingReturnType o
       where
         argTypes = map snd indexedArgTypes
@@ -1117,8 +1120,10 @@ instance PP.Pretty SomeColumn where
 
 type LoweringMapEntry = (Mir.Node, [SomeColumn], [GR.Node])
 
-handleNode :: (Operator -> Maybe ExecSemantic) -> (IM.IntMap ([NType], [NType] )) -> GR.Gr Operator () -> IM.IntMap LoweringMapEntry -> GR.Node -> LoweringMapEntry
-handleNode execSemMap tm mg m n = case op of
+type TableExpansionMap = HashMap Mir.Table [Mir.Column]
+
+handleNode :: (Operator -> Maybe ExecSemantic) -> TypeMap -> TableExpansionMap -> GR.Gr Operator () -> IM.IntMap LoweringMapEntry -> GR.Node -> LoweringMapEntry
+handleNode execSemMap tm tableColumn mg m n = case op of
     CustomOp o ccols ->
         withCols cols $
         defaultRet
@@ -1130,7 +1135,7 @@ handleNode execSemMap tm mg m n = case op of
         where
           Just execSem = execSemMap op
           stdIndices = map (either Mir.ConstantValue (Mir.ColumnValue . colAsIndex) ) ccols
-          udfRetCols = map Left (getUdfReturnCols n)
+          udfRetCols = getUdfReturnCols n
           (ind, cols, execT) =
                   case execSem of
                       SimpleSem ->
@@ -1144,7 +1149,7 @@ handleNode execSemMap tm mg m n = case op of
                           let (Mir.ColumnValue x:xs) = stdIndices
                               Right c:_ = ccols
                           in
-                              (xs, c:udfRetCols , Mir.Reduction [x])
+                              (xs, udfRetCols , Mir.Reduction [x])
                       _ -> unimplemented
     Join {joinType, joinOn}
         | [lp,rp] <- map snd ins ->
@@ -1263,14 +1268,19 @@ handleNode execSemMap tm mg m n = case op of
     withAncestors c = _3 .~ c
     (ins, _, op, _) = GR.context mg n
     getUdfReturnCols n =
-        maybe
-            (throw $ TypeNotKnown n)
-            (map (\case
-                      NTScalar (Left s) -> s
-                      t -> throw (InvalidUDFReturnType n t)) .
-             snd) $
-        IM.lookup n tm
-    tableColumn =
+        case t of
+            NTScalar s:xs -> -- The first scalar does not have to be local in reductions
+                s : map (\case
+                                NTScalar s@(Left _) -> s
+                                t -> err) xs
+            _ -> err
+      where
+        t = snd $ fromMaybe (throw $ TypeNotKnown n) $ IM.lookup n tm
+        err :: a
+        err = throw (InvalidUDFReturnType n t)
+
+makeTableExpansionMap :: GR.Gr Operator b -> TableExpansionMap
+makeTableExpansionMap mg =
         HashSet.toList <$>
         HashMap.fromListWith
             HashSet.union
@@ -1291,6 +1301,15 @@ handleNode execSemMap tm mg m n = case op of
                       Join {joinOn} -> joinOn >>= \(c1, c2) -> [c1, c2]
                       _ -> []
             ]
+
+typeToCols :: TableExpansionMap -> [NType] -> [SomeColumn]
+typeToCols tableExpansion = (>>= Lens.para g)
+  where
+    g a r = case a of
+        NTRecFromTable t -> map Right $ tableExpansion HashMap.! t
+        NTAnonRec _ f -> assert (length f == length r) $ concat r
+        NTScalar s -> [s]
+        _ -> concat r
 
 toSerializableGraph ::
        (MonadLogger m, MonadIO m)
@@ -1320,7 +1339,8 @@ toSerializableGraph entrypoint execSemMap tm mg = do
     sink0 <- do
         let [(s, _, _)] = GR.inn mg $ fst sink
             avail = HashSet.fromList $ completeOutputColsFor s
-            projectedCols = HashSet.toList $ findProjCols s
+            projectedCols = typeToCols tableExpansion (snd $ tm IM.! s)
+            --projectedCols = HashSet.toList $ findProjCols s
             findProjCols s =
                 case GR.lab mg s of
                     Just (Project p) -> HashSet.fromList $ rights p <> mapMaybe (\case Left (l,_) -> Just $ Left l; _ -> Nothing) p
@@ -1355,8 +1375,9 @@ toSerializableGraph entrypoint execSemMap tm mg = do
                 }
     pure sgr
   where
+    tableExpansion = makeTableExpansionMap mg
     loweredOps = IM.fromList
-                 [ (n, handleNode execSemMap tm mg loweredOps n)
+                 [ (n, handleNode execSemMap tm tableExpansion mg loweredOps n)
                  | n <- GR.nodes mg
                  ]
     completeOutputColsFor n = loweredOps ^?! ix n . _2 . to (map someColToMirCol)

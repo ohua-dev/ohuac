@@ -147,7 +147,7 @@ impl
 
                     //eprintln!("{} Handling group {:?}", idx, &group);
 
-                    let mut mrs = db.lookup_leaf_mut(&out_key[..], &KeyType::from(&group[..]));
+                    let mut mrs = db.lookup_leaf_mut(&out_key[..], KeyType::from(&group[..]));
                     let rs = match mrs {
                         Option::Some(ref mut rs) => {
                             if replay_key_cols.is_some() {

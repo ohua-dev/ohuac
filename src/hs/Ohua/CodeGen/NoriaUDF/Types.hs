@@ -9,7 +9,7 @@ import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.HashMap.Strict as HashMap
-import Control.Lens.Plated (Plated, plate, gplate)
+import Control.Lens.Plated (Plated, plate, gplate, para)
 
 data NType
     = NTSeq NType
@@ -20,7 +20,19 @@ data NType
   deriving (Show, Eq, Ord, Generic)
 
 instance Plated NType where
-    plate = gplate
+    plate f = \case
+        NTTup t -> NTTup <$> traverse f t
+        NTAnonRec name flds -> NTAnonRec name . zip (map fst flds) <$> traverse (f . snd) flds
+        a -> gplate f a
+
+typeToCols :: (Mir.Table -> [Mir.Column]) -> [NType] -> [SomeColumn]
+typeToCols tableExpansion = (>>= para g)
+  where
+    g a r = case a of
+        NTRecFromTable t -> map Right $ tableExpansion t
+        NTAnonRec _ f -> assert (length f == length r) $ concat r
+        NTScalar s -> [s]
+        _ -> concat r
 
 isRecNType, isSeqNType, isUnitNType :: NType -> Bool
 

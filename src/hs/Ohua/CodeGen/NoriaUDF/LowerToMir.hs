@@ -1302,14 +1302,6 @@ makeTableExpansionMap mg =
                       _ -> []
             ]
 
-typeToCols :: TableExpansionMap -> [NType] -> [SomeColumn]
-typeToCols tableExpansion = (>>= Lens.para g)
-  where
-    g a r = case a of
-        NTRecFromTable t -> map Right $ tableExpansion HashMap.! t
-        NTAnonRec _ f -> assert (length f == length r) $ concat r
-        NTScalar s -> [s]
-        _ -> concat r
 
 toSerializableGraph ::
        (MonadLogger m, MonadIO m)
@@ -1339,13 +1331,15 @@ toSerializableGraph entrypoint execSemMap tm mg = do
     sink0 <- do
         let [(s, _, _)] = GR.inn mg $ fst sink
             avail = HashSet.fromList $ completeOutputColsFor s
-            projectedCols = typeToCols tableExpansion (snd $ tm IM.! s)
+            sTy = (snd $ tm IM.! s)
+            projectedCols = typeToCols (tableExpansion HashMap.!) sTy
             --projectedCols = HashSet.toList $ findProjCols s
             findProjCols s =
                 case GR.lab mg s of
                     Just (Project p) -> HashSet.fromList $ rights p <> mapMaybe (\case Left (l,_) -> Just $ Left l; _ -> Nothing) p
                     Just _ -> HashSet.unions $ map findProjCols $ GR.pre mg s
                     Nothing -> error "Why no label?"
+        logDebugN $ "Found type " <> quickRender sTy <> " for node " <> show s <> " which yields the columns " <> quickRender projectedCols
         (sinkIn, sinkOut) <-
             unzip . fst <$> foldM (\(cols, m) e ->
                                  let cname = Mir.name e in

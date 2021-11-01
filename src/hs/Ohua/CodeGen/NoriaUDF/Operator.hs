@@ -424,9 +424,11 @@ generatedOpSourcePath udfName =
     ".rs"
 
 makeStateReturn :: Expr -> Expr
-makeStateReturn = transform $ \case
-    Let unit val (Lit UnitLit) | isIgnoredBinding unit -> val
-    e -> e
+makeStateReturn =
+    rewrite (\case
+                    Let unit val (Lit UnitLit) | isIgnoredBinding unit -> Just val
+                    e -> Nothing) .
+    rewrite (\case Let v (Lit UnitLit) bod -> Just $ rewrite (\case Var v' | v' == v -> Just $ Lit UnitLit; _ -> Nothing) bod ; _ -> Nothing)
 
 processStatefulUdf ::
        (MonadOhua m)
@@ -885,7 +887,17 @@ generateOperators fields registerOp program = do
                     liftIO $ registerOp fdata
                     pure $ handleReturn invokeExpr e'
     genStatefulOps e = pure e
-    genPureOps (Let bnd val@Apply {} body)
+    -- This is insanely hacky but I want to avoid having to write a full type inferencer to deal with this otherwise
+    genPureOps (Lambda v b@Apply{}) = genPureOp (Lambda v) b
+    genPureOps (Let bnd val@Apply {} body) = do
+        bod' <-
+            case body of
+                Apply {} -> genPureOp id body
+                _ -> pure body
+        genPureOp (\val -> Let bnd val bod') val
+    genPureOps other = pure other
+
+    genPureOp trans val
         | not $ isKnownFunction function = do
             opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
                         -- This relies heavily of having the expected `let x = f a b c`
@@ -926,12 +938,12 @@ generateOperators fields registerOp program = do
                     Just st -> pure $ mkStatefulOpDesc (function ^. name) st udfName argVars
 
                 Just other -> error $ "State should be a var " <> quickRender other
-            pure $ extraLets $ Let bnd (fromListToApply (FunRef udfName Nothing) (map Var argVars)) body
+            pure $ extraLets $ trans (fromListToApply (FunRef udfName Nothing) (map Var argVars))
+        | otherwise = pure $ trans val
       where
         (st, FunRef function _, args) = stateAwareApplyToList val
         fieldIndices = [0 .. length args - 1]
         accessedFields = map ("none", ) fieldIndices
-    genPureOps other = pure other
     stateVals =
         HashSet.fromList
             [ v

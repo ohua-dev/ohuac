@@ -65,6 +65,8 @@ import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
 import qualified Ohua.ALang.Passes as ALang (normalize)
 import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply, destructure, mkApply)
+import Ohua.DFLang.Lang
+import Ohua.DFLang.PPrint
 import qualified Ohua.CodeGen.NoriaUDF.Paths as Path
 import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL, rewriteFieldAccess)
 import Ohua.CodeGen.NoriaUDF.Types
@@ -78,6 +80,11 @@ import Ohua.CodeGen.NoriaUDF.Util
 data OpExc
     = IllegalExpressionInThisContext Expr
     | NoInitializerFound Binding
+    | FoundDFEnvVar LetExpr Lit
+    | StateProducingFunctionShouldOnlyHaveOneOutput LetExpr
+    | InputToStateCannotBeLocal LetExpr Binding
+    | StatCannotBeModifiedTwice LetExpr Binding
+    | StateReadBeforeWriting LetExpr Binding
     deriving (Show)
 
 instance Exception OpExc
@@ -431,163 +438,6 @@ generatedOpSourcePath udfName =
     toString (unwrap $ udfName ^. name) <>
     ".rs"
 
-makeStateReturn :: Expr -> Expr
-makeStateReturn =
-    rewrite (\case
-                    Let unit val (Lit UnitLit) | isIgnoredBinding unit -> Just val
-                    e -> Nothing) .
-    rewrite (\case Let v (Lit UnitLit) bod -> Just $ rewrite (\case Var v' | v' == v -> Just $ Lit UnitLit; _ -> Nothing) bod ; _ -> Nothing)
-
-makeStateExplicit :: forall m. (HasCallStack, MonadLogger m, MonadGenBnd m ) => (Maybe Binding -> FunRef -> Int -> m Expr) -> Expr -> m Expr
-makeStateExplicit makeOp = fmap fst . flip runReaderT (mempty, True) . go
-  where
-    go :: HasCallStack => Expr -> ReaderT (HashMap Binding Binding, Bool) m (Expr, Set Binding)
-    go = \case
-        Let b val bod -> do
-            (v', sts) <- withoutReturns $ go val
-            if Set.null sts
-                then withAdjustExpr (Let b v') $ go bod
-                else do p <- generateBindingWith "pack"
-                        let sts' = Set.toAscList sts
-                        ts <- traverse generateBindingWith sts'
-                        withToReturn $
-                            withAdjustReturned sts $
-                            withAdjustExpr (Let p v' .
-                                        destructure (Var p) (b: ts)) $
-                            withReplacements (HashMap.fromList $ zip sts' ts) (go bod)
-        Lambda x bod -> do
-            assertNoReturns
-            withoutReturns $ withAdjustExpr (Lambda x) $ go bod
-        this@Apply {} -> do
-            let (st, fun, args) = stateAwareApplyToList this
-                numArgs = fromIntegral $ length args
-            assertNoReturns
-            (args', Set.unions -> rets) <- withoutReturns $ unzip <$> traverse go args
-            case st of
-                Nothing -> lift $ (,rets) . flip mkApply args' <$> makeOp Nothing fun numArgs
-                Just (Var s) -> do
-                    op <- lift $ makeOp (Just s) fun numArgs
-                    pure ( mkApply op (Var s: args')
-                         , (Set.insert s rets))
-                Just other -> throwStack $ IllegalExpressionInThisContext other
-        Var v ->
-            (, []) <$>
-            (makeReturns . maybe (Var v) (Var)
-             =<< getState v)
-        l@Lit {} ->
-            (, []) <$> makeReturns l
-        BindState st to
-            | isFieldAccess to -> withAdjustExpr (flip BindState to) $ go st
-        other -> throwStack $ IllegalExpressionInThisContext other
-    withAdjustExpr = fmap . first
-    assertNoReturns = assertM . not =<< getReturns
-    makeReturns var = do
-        ret <- getReturns
-        if ret
-            then pure var
-            else do
-            toRet <- asks $ HashMap.elems . stateReplacementMap
-            if null toRet
-                then pure var
-                else
-                pure $ mkApply (Lit $ FunRefLit (FunRef "ohua.lang/(,)" Nothing) ) (var : map Var (sort toRet))
-    stateReplacementMap = fst
-    getReturns = asks snd
-    getState v = asks $ (HashMap.lookup v) . stateReplacementMap
-    withoutReturns = local (second $ const False)
-    withReplacements repl = local (first $ HashMap.union repl)
-    withToReturn = local (second $ const True)
-    withAdjustReturned = fmap . second . Set.union
-
-processStatefulUdf ::
-       (MonadOhua m)
-    => Fields
-    -> QualifiedBinding
-    -> Expression
-    -> Binding
-    -> Expression
-    -> m (Expression, Either Expression OperatorDescription)
-processStatefulUdf fields udfName program state initState = do
-    logDebugN $ "Processing stateful UDF " <> quickRender program
-    case program of
-        Let unit stuff bod -> do
-            case length [v | Var v <- universe stuff, v == state] of
-                0 -> error "State not used. This should probably not be an error?"
-                n | n > 1 -> logWarnN $ "State " <> quickRender state <> " is used too often (" <> show n <> ")"
-                1 -> pure ()
-            let newExpr = makeStateReturn stuff
-            pure (if bod == Lit UnitLit || isIgnoredBinding unit
-                  then newExpr
-                  else Let unit newExpr bod
-                 , Left initState)
-        Let unit (Smap _ mapF (Var coll)) reduceF
-            | isIgnoredBinding unit -> do
-                (mapFn, rowName, fieldIndices) <- mkMapFn fields mapF state coll
-                reduceFn <- mkReduceFn fields state reduceF
-                let nodeSub =
-                        TemplateSubstitution
-                            "map-reduce/op.rs"
-                            (generatedOpSourcePath udfName) $
-                        baseUdfSubMap udfName rowName accessedFields <>
-                        [ "map" ~> ["use " <> stateNSStr <> "::Action;", mapFn]
-                        , "reduce" ~> [reduceFn]
-                        , "special-state-coerce-call" ~>
-                          ["." <> mkSpecialStateCoerceName udfName <> "()"]
-                        , "udf-state-type" ~> [stateTypeStr]
-                        ]
-                    accessedFields = map (state, ) fieldIndices
-                    stateType = getStateType initState
-                    stateTypeStr = asRustT $ stateType ^. namespace
-                    stateNSStr =
-                        asRustT $ unwrapped @NSRef . asNonEmpty %~ init $
-                        stateType ^.
-                        namespace
-                    stateSub =
-                        TemplateSubstitution
-                            "map-reduce/state.rs"
-                            (Path.dataflowSourceDir <> "/state/ohua/generated/" <>
-                             toString (unwrap $ udfName ^. name) <>
-                             ".rs")
-                            [ "state-trait-coerce-impls" ~>
-                              mkStateTraitCoercionFunc
-                                  udfName
-                                  stateType
-                                  "Option::Some(self)"
-                            , "udf-state-type" ~> [stateTypeStr]
-                            ]
-                logDebugN $ unlines $ "Acessed fields:" : map show fieldIndices
-                logInfoN $ "UDF " <> show udfName <> " callable with " <>
-                    renderDoc
-                        (pretty (udfName ^. name) <>
-                         PP.tupled (map pretty fieldIndices))
-                mkInvokeExpr <-
-                    if null fieldIndices
-                        then pure (`Apply` Var coll)
-                        else do
-                            let flen = succ $ maximum fieldIndices
-                            (Endo mkFieldDestrExpr, newBnds) <-
-                                fmap mconcat . for fieldIndices $ \idx -> do
-                                    b <-
-                                        generateBindingWith =<<
-                                        make ("findex_" <> show idx)
-                                    pure
-                                        ( Endo $
-                                          Let b (mkNthExpr idx flen (Var coll))
-                                        , pure @[] b)
-                            pure $ \udf ->
-                                mkFieldDestrExpr
-                                    (foldl' Apply udf $ map Var newBnds)
-                ie <- ALang.normalize $ mkInvokeExpr $ embedE udfName
-                pure $ (ie, ) $ Right $ Op_UDF $
-                    UDFDescription
-                        { generations = [nodeSub, stateSub]
-                        , udfName = udfName
-                        , inputBindings = []
-                        , udfState = Just ( stateType, [] )
-                        , referencedFields = fieldIndices
-                        , execSemantic = ReductionSem
-                        }
-        _ -> error $ "Expected map-reduce pattern, got " <> quickRender program
 
 -- HACK A dirty, dirty hack
 getStateType initState =
@@ -595,14 +445,6 @@ getStateType initState =
         [f] -> f
         o -> error $ "Too many qualified applications in state init " <> show o
 
-extractAcessedFields :: Expr -> [UDFAccessedField]
-extractAcessedFields program =
-    hashNub
-        [ (expectVarE st, fromIntegral n)
-        | PureFunction fun _ `Apply` Lit (NumericLit n) `Apply` _ `Apply` st <-
-              universe program
-        , fun == "ohua.lang/nth"
-        ]
 
 pattern OhuaFieldNS :: NSRef
 
@@ -897,175 +739,22 @@ mkStatefulOpDesc function initState udfName args =
             , "udf-state-type" ~> [stateTypeStr]
             ]
 
-generateOperators ::
-       Fields -> RegisterOperator -> Expression -> OhuaM env Expression
-generateOperators fields registerOp program = do
-    logInfoN $ "Complete expression for compilation\n" <> quickRender program
-    logDebugN $ "Found state values" <> quickRender (HashSet.toList stateVals)
-    program' <- evalStateT (transformM genStatefulOps program >>= genPureOps registerOp) HashMap.empty
-    logDebugN $ "Remaining program\n" <> quickRender program'
-    pure program'
-  where
-    mempty' = mempty @(Dual (Endo Expr), HashSet.HashSet Binding)
-    tellRet var = tell $ mempty' & _2 .~ HashSet.singleton var
-    tellUdfE f = tell $ mempty' & _1 .~ Dual (Endo f)
-    getDeps = map expectVarE . findFreeVariables
-    go st (LetF v (oldExpr, expr) (extract -> body))
-        | v == st =
-            error $ "Invariant broken, state init happened in scope for " <>
-            show st
-        | otherwise = do
-            body' <- body
-                    -- Its a bit of a hack to record the return binding. It's
-                    -- necessary because this pass is still a bit unstable in general.
-            case body' of
-                Var v -> _2 <>= [v]
-                _ -> pure ()
-            let contNormal e = _2 <>= eDeps >> pure (Let v e body')
-            (udfDeps, exprDeps) <- get
-            if exprUsesState || v `HashSet.member` udfDeps
-                then do
-                    tellUdfE (Let v oldExpr)
-                    _1 <>= eDeps
-                    if v `HashSet.member` exprDeps
-                        then if exprUsesState
-                                 then tellRet v >> pure body'
-                                 else contNormal oldExpr
-                        else pure body'
-                else contNormal =<< expr
-      where
-        exprUsesState = or [s == Var st | BindState s _ <- universe oldExpr]
-        eDeps = HashSet.fromList $ getDeps oldExpr
-    go _ e = RS.embed <$> traverse extract e
-    genStatefulOps (Let st initExpr body)
-        | st `HashSet.member` stateVals = do
-            logDebugN $ "Considering the function:\n" <> quickRender body
-            (e', _, (Dual (Endo mut), rets)) <-
-                runRWST (RS.para (go st) body) () mempty
-            bnd <- generateBindingWith ("op_s_" <> st)
-            let udfName = QualifiedBinding GenFuncsNamespace bnd
-                                 -- TODO This also necessitates changing the invoke expression to destructure this output!!
-            logDebugN $ "Returns found " <> show rets
-            (v', handleReturn) <- setupReturnRecieve $ HashSet.toList rets
-            let udf = mut v'
-                freeVars = filter (/= Var st) $ findFreeVariables udf
-            logDebugN $ "Found operator function " <> quickRender udfName <>
-                "\n" <>
-                quickRender (Let st initExpr udf)
-            (invokeExpr, fdata) <-
-                processStatefulUdf fields udfName udf st initExpr
-            case fdata of
-                Left init -> modify (HashMap.insert st init) >> pure invokeExpr
-                Right fdata -> do
-                    liftIO $ registerOp fdata
-                    pure $ handleReturn invokeExpr e'
-    genStatefulOps e = pure e
-    -- This is insanely hacky but I want to avoid having to write a full type inferencer to deal with this otherwise
-    stateVals =
-        HashSet.fromList
-            [ v
-            | BindState st _ <- universe program
-            , v <-
-                  case st of
-                      Var v -> [v]
-                      e -> throwStack $ IllegalExpressionInThisContext e
-            ]
 
-genPureOps registerOp = makeStateExplicit $ \st funRef@(FunRef function _) argNum ->
-    Lit . FunRefLit <$>
-    if isKnownFunction function
-    then pure funRef
-    else do
-        opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
-                    -- This relies heavily of having the expected `let x = f a b c`
-                    -- structure
-        let udfName = QualifiedBinding GenFuncsNamespace opName
-            fieldIndices = [0..pred argNum]
-            argVars = map ("arg" <>) $ map show fieldIndices
-            accessedFields = ("none", ) <$> fieldIndices
-        -- ( argVars, foldl (.) id -> extraLets ) <- unzip <$> traverse (\case
-        --                                                                    Var v -> pure (v, id)
-        --                                                                    other -> do
-        --                                                                        b <- generateBindingWith "arg"
-        --                                                                        pure (b, Let b other) ) args
-        liftIO . registerOp . Op_UDF =<< case st of
-            Nothing ->
-                pure $ UDFDescription
-                    { udfName = udfName
-                    , inputBindings = argVars
-                    , udfState = Nothing
-                    , referencedFields = fieldIndices
-                    , generations = [opGen]
-                    , execSemantic = SimpleSem
-                    }
-              where
-                opGen =
-                    TemplateSubstitution
-                        "pure/op.rs"
-                        (generatedOpSourcePath udfName) $
-                    baseUdfSubMap udfName "r" accessedFields <>
-                    [ "function" ~>
-                    [ renderDoc $ asRust function <>
-                        PP.tupled
-                            (map (\i ->
-                                    "r[self." <> pretty (idxPropFromName i) <>
-                                    "].clone().into()")
-                                accessedFields)
-                    ]
-                    , "udf-ret-type" ~> ["SqlType::Double"]
-                    ]
-            Just v -> gets (HashMap.lookup v) >>= \case
-                Nothing -> throwStack $ NoInitializerFound v
-                Just st -> pure $ mkStatefulOpDesc (function ^. name) st udfName argVars
-
-        pure $ {- extraLets $ trans -} (FunRef udfName Nothing)
 
 stateToInit :: Expr -> (QualifiedBinding, [Lit])
 stateToInit e = (fun, [case l of Lit l -> l; _ -> error $ quickRender l <> " is not a literal" | l <- args])
   where (FunRef fun _, args) = fromApplyToList e
-
-stateAwareApplyToList :: Expr -> (Maybe Expr, FunRef, [Expr])
-stateAwareApplyToList = \case
-    Apply f val -> let (s, f', e) = stateAwareApplyToList f in (s, f', e ++ [val])
-    BindState v (Lit (FunRefLit f)) -> (Just v, f, [])
-    Lit (FunRefLit f) -> (Nothing, f, [])
-    e -> error $ quickRender e <> " is not a function application"
 
 isKnownFunction :: QualifiedBinding -> Bool
 isKnownFunction f =
     f ^. namespace == GenFuncsNamespace || f ^? namespace . unwrapped . ix 0 ==
     Just "ohua"
 
-isFieldAccess :: Expr -> Bool
-isFieldAccess = \case
-    Lit (FunRefLit (FunRef f _)) -> isJust $ isFieldAccessor f
-    _ -> False
 
 isFieldAccessor :: QualifiedBinding -> Maybe Binding
 isFieldAccessor op
     | OhuaFieldNS <- op ^. namespace = Just $ op ^.name
     | otherwise = Nothing
-
-setupReturnRecieve ::
-       (Monad m, MonadGenBnd m) => [Binding] -> m (Expr, Expr -> Expr -> Expr)
-setupReturnRecieve returns =
-    case returns of
-        [] -> (Lit UnitLit, ) . Let <$> generateBindingWith "_"
-        [i] -> pure (Var i, Let i)
-        other -> do
-            retBnd <- generateBindingWith "find_good_name"
-            pure (mkTup, \call -> Let retBnd call . destrTup retBnd)
-  where
-    mkTup =
-        foldl'
-            Apply
-            (embedE ("ohua.lang/(,)" :: QualifiedBinding))
-            (map embedE returns)
-    destrTup bnd =
-        appEndo $
-        foldMap
-            (\(i, x) -> Endo $ Let x (mkNthExpr i (length returns) (Var bnd)))
-            (zip [0 ..] returns)
 
 
 mainArgsToTableRefs :: Expr -> (Word, [(Binding, Word)], Expr)
@@ -1079,3 +768,96 @@ mainArgsToTableRefs =
                    embedE UnitLit)
                   e)
         other -> (0, [], RS.embed $ fmap fst other)
+
+
+generateOperators :: Fields -> RegisterOperator -> DFExpr -> OhuaM env DFExpr
+generateOperators _ registerOp DFExpr{ .. } = do
+    newExprs <- evalStateT ( traverse doRewrite letExprs ) mempty
+    let exp =  DFExpr { letExprs = newExprs >>= id
+                      , returnVar
+                      }
+    logDebugN $ "DFLang after operator generation\n" <> quickRender exp
+    pure exp
+  where
+    stateVars = HashSet.fromList [v | LetExpr{stateArgument=Just (DFVar v)} <- toList letExprs ]
+    isState = flip HashSet.member stateVars
+    doRewrite e@LetExpr{..}
+        | any isState output =
+          case output of
+              [v] -> modify (first $ HashMap.insert v e) >> pure mempty
+              _ -> throwStack $ StateProducingFunctionShouldOnlyHaveOneOutput e
+        | not (isKnownFunction function) = do
+              opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
+                    -- This relies heavily of having the expected `let x = f a b c`
+                    -- structure
+              let udfName = QualifiedBinding GenFuncsNamespace opName
+                  argNum = length callArguments
+                  fieldIndices = [0..pred argNum]
+                  argVars = map (\(i, v) -> case v of DFVar v -> v; _ -> "arg" <> show i) $ zip [0..] callArguments
+                  accessedFields = ("none", ) <$> fieldIndices
+                  likePure =
+                      UDFDescription
+                      { udfName = udfName
+                      , inputBindings = argVars
+                      , udfState = Nothing
+                      , referencedFields = fieldIndices
+                      , generations = [opGen]
+                      , execSemantic = SimpleSem
+                      }
+                    where
+                      opGen =
+                          TemplateSubstitution
+                          "pure/op.rs"
+                          (generatedOpSourcePath udfName) $
+                          baseUdfSubMap udfName "r" accessedFields <>
+                          [ "function" ~>
+                            [ renderDoc $ asRust function <>
+                              PP.tupled
+                                (map (\i ->
+                                          "r[self." <> pretty (idxPropFromName i) <>
+                                        "].clone().into()")
+                                    accessedFields)
+                            ]
+                          , "udf-ret-type" ~> ["SqlType::Double"]
+                          ]
+              (mnewInp, mnewOutput, newOp) <- case stateArgument of
+                  Just (DFEnvVar v) -> throwStack $ FoundDFEnvVar e v
+                  Just (DFVar v) ->
+                      gets (HashMap.lookup v . snd) >>= \case
+                      Nothing -> do
+                          bnd <- generateBindingWith v
+                          modify $ second $ HashMap.insert v bnd
+                          gets (HashMap.lookup v . fst) >>= \case
+                              Nothing -> throwStack $ NoInitializerFound v
+                              Just st -> do
+                                  pure $ (Nothing, Just bnd, mkStatefulOpDesc (function ^. name) (exprFromDFExpr st) udfName argVars)
+                      Just _ -> throwStack $ StatCannotBeModifiedTwice e v
+                  Nothing ->
+                      (, Nothing, likePure)
+                      <$> case [ b |  DFVar b <- callArguments, isState b ] of
+                              [] ->
+                                  pure Nothing
+                              _ ->
+                                  Just <$>
+                                  traverse
+                                  (\case
+                                          DFVar v | isState v ->
+                                                    gets $ DFVar
+                                                    . fromMaybe (throwStack $ StateReadBeforeWriting e v)
+                                                    . HashMap.lookup v
+                                                    . snd
+                                          other -> pure other)
+                                  callArguments
+              liftIO $ registerOp $ Op_UDF newOp
+              pure $ pure $ e { stateArgument = Nothing
+                              , functionRef = functionRef { nodeRef = udfName }
+                              , callArguments = fromMaybe callArguments mnewInp
+                              , output = maybe output pure mnewOutput
+                              }
+        -- A bit hacky, but this is how I can drop the state from ctrl
+        | otherwise = return $ pure e { callArguments = filter (\case DFVar v -> not $ isState v; _ -> True) callArguments }
+      where
+        function = nodeRef functionRef
+        exprFromDFExpr e@LetExpr{..} =
+            foldl Apply (Lit $ FunRefLit $ FunRef (nodeRef functionRef) Nothing) $
+            map (\case DFVar v -> throwStack $ InputToStateCannotBeLocal e v; DFEnvVar l -> Lit l) callArguments

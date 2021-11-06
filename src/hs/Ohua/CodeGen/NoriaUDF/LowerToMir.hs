@@ -904,7 +904,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
                         Select $ map flattenTy ts
                 "unitFn"
                     | Just (FunRefLit (FunRef r _)) <- Prelude.lookup 0 lits ->
-                          retype3 m g n (error "impossible") ty r
+                          retype3 m g n [] ty r
                     | otherwise -> throw $ InvalidLiteralInputs (CustomOp other []) (map snd lits)
                 _ -> CustomOp other []
         ["ohua", "lang", "field"] -> CustomOp other []

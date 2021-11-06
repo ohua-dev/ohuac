@@ -13,24 +13,19 @@ module Ohua.CodeGen.NoriaUDF.LowerToMir
 
 import Control.Lens (Simple, (?~), (%=), (^?!), ix, to, use, at)
 import qualified Control.Lens as Lens
-import qualified Control.Lens.Plated as Plated
 import qualified Data.GraphViz as GraphViz
 import qualified Data.GraphViz.Printing as GraphViz
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
 import qualified Data.IntMap as IM
 import qualified Data.List as List
-import Data.Maybe (fromJust)
 import qualified Data.Text as Text
-import qualified Data.Text.Lazy as LT
-import qualified Data.Text.Lazy.Encoding as LT
 import qualified Data.Text.Lazy.IO as LT
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.Text.Prettyprint.Doc as PP
 import qualified Ohua.ALang.Refs as Refs
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
-import qualified Ohua.CodeGen.NoriaUDF.Paths as Path
 import Ohua.CodeGen.NoriaUDF.Operator
     ( ExecSemantic
     , OperatorDescription(..)
@@ -40,21 +35,18 @@ import Ohua.CodeGen.NoriaUDF.Operator
     , UDFDescription(UDFDescription, execSemantic, udfName)
     , (~>)
     , renderDoc
+    , isFieldAccessor
     )
 import Ohua.CodeGen.NoriaUDF.Types
 import qualified Ohua.DFGraph as DFGraph
 import qualified Ohua.Helpers.Graph as GR
-import qualified Ohua.Helpers.Template as TemplateHelper
 import Ohua.Prelude hiding (First, Identity, (&))
 import Prelude ((!!))
 import qualified Prelude
 import qualified System.Directory as FS
 import qualified System.FilePath as FS
 import System.IO.Unsafe (unsafePerformIO)
-import Text.Printf (printf)
-import qualified Control.Exception (throw, displayException)
-import qualified GHC.Exception
-
+import Ohua.CodeGen.NoriaUDF.Util
 
 data LoweringError
     = UnexpectedTypeForField NType Binding
@@ -99,16 +91,8 @@ data LoweringError
     | WeirdProjectSetupInLeftOuterJoinIf GR.Node [(GR.Node, [ProjectColSpec])] [GR.Node]
     deriving Show
 
-data ErrorWithTrace = forall e . Exception e => ErrorWithTrace CallStack e
-
-instance Exception ErrorWithTrace
-
-instance Prelude.Show ErrorWithTrace where
-    show (ErrorWithTrace trace e) =
-        Prelude.unlines [Control.Exception.displayException e, "Stack Trace:", GHC.Exception.prettyCallStack trace]
-
-throw :: ( HasCallStack, Exception e) => e -> a
-throw e = Control.Exception.throw $ ErrorWithTrace callStack e
+throw :: (HasCallStack, Exception e) => e -> a
+throw = throwStack
 
 traceWarning :: Text -> a -> a
 traceWarning t = trace ("WARNING: " <> t)
@@ -323,7 +307,7 @@ typeGraph udfs envInputs g = m
                                   (["lt", "gt", "eq", "and", "or", "leq", "geq", "<", ">", "<=", ">=", "==", "!=", "&&", "||"] :: Vector Binding) ->
                                 likeUdf
                             | otherwise -> throw $ UnknownBuiltin bnd
-                | QualifiedBinding ["ohua", "lang", "field"] f <- bnd ->
+                | Just f <- isFieldAccessor bnd ->
                     pure $
                     case fromIndex (Just 1) 0 of
                         NTRecFromTable t ->
@@ -511,7 +495,7 @@ execSemOf nodes =
             | op == Refs.collect -> Just (One, Many)
             | op == Refs.smapFun -> Just (Many, One)
             | op == Refs.ctrl -> Just (One, Many)
-            | op ^. namespace == ["ohua", "lang", "field"] -> Just (One, One)
+            | isJust $ isFieldAccessor op -> Just (One, One)
             | QualifiedBinding ["ohua", "lang"] b <- op
             , b `elem` builtinSimpleFuns -> Just (One, One)
             | otherwise -> execSemantic <$> nodes op
@@ -523,6 +507,7 @@ execSemOf nodes =
         Select {} -> Just (Many, Many)
         IsEmptyCheck -> Just (Many, One)
         Ctrl {} -> Just (Many, One)
+
 
 (&) :: GR.DynGraph gr => GR.Context a b -> gr a b -> gr a b
 (&) = (GR.&)

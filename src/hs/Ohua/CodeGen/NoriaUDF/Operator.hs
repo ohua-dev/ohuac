@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeApplications, MultiWayIf, ConstraintKinds #-}
+{-# LANGUAGE TypeApplications, MultiWayIf, ConstraintKinds, ViewPatterns #-}
 
 module Ohua.CodeGen.NoriaUDF.Operator
     ( generateOperators
@@ -20,6 +20,8 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , rewriteFieldAccess
     , preResolveHook
     , mkPatchesFor
+    , pattern OhuaFieldNS
+    , isFieldAccessor
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -57,11 +59,12 @@ import qualified Data.Text.Prettyprint.Doc.Render.Text as PP
 import Data.Traversable (for)
 import System.Directory (createDirectoryIfMissing)
 import qualified System.FilePath as FP
+import qualified Data.Set as Set
 
 import Ohua.ALang.Lang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
 import qualified Ohua.ALang.Passes as ALang (normalize)
-import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply)
+import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply, destructure, mkApply)
 import qualified Ohua.CodeGen.NoriaUDF.Paths as Path
 import Ohua.CodeGen.NoriaUDF.QueryEDSL (queryEDSL, rewriteFieldAccess)
 import Ohua.CodeGen.NoriaUDF.Types
@@ -70,6 +73,14 @@ import qualified Ohua.Frontend.Lang as Fr
 import qualified Ohua.Frontend.NS as NS
 import Ohua.Helpers.Template (Substitutions)
 import Ohua.Standalone (CombinedAnn(..), PreResolveHook, RawNamespace)
+import Ohua.CodeGen.NoriaUDF.Util
+
+data OpExc
+    = IllegalExpressionInThisContext Expr
+    | NoInitializerFound Binding
+    deriving (Show)
+
+instance Exception OpExc
 
 type Fields = IM.IntMap Text
 
@@ -390,9 +401,6 @@ mkReduceFn _ state = pure . renderDoc . (preamble <>) . go True
                  then []
                  else args)
 
-newFunctionCall :: (MonadGenId m, Functor m) => QualifiedBinding -> m Expression
-newFunctionCall n = PureFunction n . Just <$> generateId
-
 asNonEmpty :: Traversal [a] [b] (NonEmpty a) [b]
 asNonEmpty _ [] = pure []
 asNonEmpty f (x:xs) = f (x :| xs)
@@ -430,6 +438,67 @@ makeStateReturn =
                     e -> Nothing) .
     rewrite (\case Let v (Lit UnitLit) bod -> Just $ rewrite (\case Var v' | v' == v -> Just $ Lit UnitLit; _ -> Nothing) bod ; _ -> Nothing)
 
+makeStateExplicit :: forall m. (HasCallStack, MonadLogger m, MonadGenBnd m ) => (Maybe Binding -> FunRef -> Int -> m Expr) -> Expr -> m Expr
+makeStateExplicit makeOp = fmap fst . flip runReaderT (mempty, True) . go
+  where
+    go :: HasCallStack => Expr -> ReaderT (HashMap Binding Binding, Bool) m (Expr, Set Binding)
+    go = \case
+        Let b val bod -> do
+            (v', sts) <- withoutReturns $ go val
+            if Set.null sts
+                then withAdjustExpr (Let b v') $ go bod
+                else do p <- generateBindingWith "pack"
+                        let sts' = Set.toAscList sts
+                        ts <- traverse generateBindingWith sts'
+                        withToReturn $
+                            withAdjustReturned sts $
+                            withAdjustExpr (Let p v' .
+                                        destructure (Var p) (b: ts)) $
+                            withReplacements (HashMap.fromList $ zip sts' ts) (go bod)
+        Lambda x bod -> do
+            assertNoReturns
+            withoutReturns $ withAdjustExpr (Lambda x) $ go bod
+        this@Apply {} -> do
+            let (st, fun, args) = stateAwareApplyToList this
+                numArgs = fromIntegral $ length args
+            assertNoReturns
+            (args', Set.unions -> rets) <- withoutReturns $ unzip <$> traverse go args
+            case st of
+                Nothing -> lift $ (,rets) . flip mkApply args' <$> makeOp Nothing fun numArgs
+                Just (Var s) -> do
+                    op <- lift $ makeOp (Just s) fun numArgs
+                    pure ( mkApply op (Var s: args')
+                         , (Set.insert s rets))
+                Just other -> throwStack $ IllegalExpressionInThisContext other
+        Var v ->
+            (, []) <$>
+            (makeReturns . maybe (Var v) (Var)
+             =<< getState v)
+        l@Lit {} ->
+            (, []) <$> makeReturns l
+        BindState st to
+            | isFieldAccess to -> withAdjustExpr (flip BindState to) $ go st
+        other -> throwStack $ IllegalExpressionInThisContext other
+    withAdjustExpr = fmap . first
+    assertNoReturns = assertM . not =<< getReturns
+    makeReturns var = do
+        ret <- getReturns
+        if ret
+            then pure var
+            else do
+            toRet <- asks $ HashMap.elems . stateReplacementMap
+            if null toRet
+                then pure var
+                else
+                pure $ mkApply (Lit $ FunRefLit (FunRef "ohua.lang/(,)" Nothing) ) (var : map Var (sort toRet))
+    stateReplacementMap = fst
+    getReturns = asks snd
+    getState v = asks $ (HashMap.lookup v) . stateReplacementMap
+    withoutReturns = local (second $ const False)
+    withReplacements repl = local (first $ HashMap.union repl)
+    withToReturn = local (second $ const True)
+    withAdjustReturned = fmap . second . Set.union
+
 processStatefulUdf ::
        (MonadOhua m)
     => Fields
@@ -441,12 +510,16 @@ processStatefulUdf ::
 processStatefulUdf fields udfName program state initState = do
     logDebugN $ "Processing stateful UDF " <> quickRender program
     case program of
-        Let unit stuff (Lit UnitLit)
-            | isIgnoredBinding unit ->
-              case length [v | Var v <- universe stuff, v == state] of
-                  0 -> error "State not used. This should probably not be an error?"
-                  n | n > 1 -> error $ "State " <> quickRender state <> " is used too often (" <> show n <> ")"
-                  1 -> pure (makeStateReturn stuff, Left initState)
+        Let unit stuff bod -> do
+            case length [v | Var v <- universe stuff, v == state] of
+                0 -> error "State not used. This should probably not be an error?"
+                n | n > 1 -> logWarnN $ "State " <> quickRender state <> " is used too often (" <> show n <> ")"
+                1 -> pure ()
+            let newExpr = makeStateReturn stuff
+            pure (if bod == Lit UnitLit || isIgnoredBinding unit
+                  then newExpr
+                  else Let unit newExpr bod
+                 , Left initState)
         Let unit (Smap _ mapF (Var coll)) reduceF
             | isIgnoredBinding unit -> do
                 (mapFn, rowName, fieldIndices) <- mkMapFn fields mapF state coll
@@ -829,7 +902,7 @@ generateOperators ::
 generateOperators fields registerOp program = do
     logInfoN $ "Complete expression for compilation\n" <> quickRender program
     logDebugN $ "Found state values" <> quickRender (HashSet.toList stateVals)
-    program' <- evalStateT (transformM genStatefulOps program >>= transformM genPureOps) HashMap.empty
+    program' <- evalStateT (transformM genStatefulOps program >>= genPureOps registerOp) HashMap.empty
     logDebugN $ "Remaining program\n" <> quickRender program'
     pure program'
   where
@@ -863,7 +936,7 @@ generateOperators fields registerOp program = do
       where
         exprUsesState = or [s == Var st | BindState s _ <- universe oldExpr]
         eDeps = HashSet.fromList $ getDeps oldExpr
-    go _ e'' = RS.embed <$> traverse extract e''
+    go _ e = RS.embed <$> traverse extract e
     genStatefulOps (Let st initExpr body)
         | st `HashSet.member` stateVals = do
             logDebugN $ "Considering the function:\n" <> quickRender body
@@ -888,62 +961,6 @@ generateOperators fields registerOp program = do
                     pure $ handleReturn invokeExpr e'
     genStatefulOps e = pure e
     -- This is insanely hacky but I want to avoid having to write a full type inferencer to deal with this otherwise
-    genPureOps (Lambda v b@Apply{}) = genPureOp (Lambda v) b
-    genPureOps (Let bnd val@Apply {} body) = do
-        bod' <-
-            case body of
-                Apply {} -> genPureOp id body
-                _ -> pure body
-        genPureOp (\val -> Let bnd val bod') val
-    genPureOps other = pure other
-
-    genPureOp trans val
-        | not $ isKnownFunction function = do
-            opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
-                        -- This relies heavily of having the expected `let x = f a b c`
-                        -- structure
-            let udfName = QualifiedBinding GenFuncsNamespace opName
-            ( argVars, foldl (.) id -> extraLets ) <- unzip <$> traverse (\case Var v -> pure (v, id); other -> do b <- generateBindingWith "arg"; pure (b, Let b other) ) args
-            liftIO . registerOp . Op_UDF =<< case st of
-                Nothing ->
-                    pure $ UDFDescription
-                        { udfName = udfName
-                        , inputBindings = argVars
-                        , udfState = Nothing
-                        , referencedFields = fieldIndices
-                        , generations = [opGen]
-                        , execSemantic = SimpleSem
-                        }
-                  where
-                    opGen =
-                        TemplateSubstitution
-                            "pure/op.rs"
-                            (generatedOpSourcePath udfName) $
-                        baseUdfSubMap udfName "r" accessedFields <>
-                        [ "function" ~>
-                        [ renderDoc $ asRust function <>
-                            PP.tupled
-                                (map (\i ->
-                                        "r[self." <> pretty (idxPropFromName i) <>
-                                        "].clone().into()")
-                                    (if args == [Lit UnitLit]
-                                        then []
-                                        else accessedFields))
-                        ]
-                        , "udf-ret-type" ~> ["SqlType::Double"]
-                        ]
-                Just (Var v) -> gets (HashMap.lookup v) >>= \case
-                    Nothing ->
-                        error $ "No initializer found for " <> quickRender v
-                    Just st -> pure $ mkStatefulOpDesc (function ^. name) st udfName argVars
-
-                Just other -> error $ "State should be a var " <> quickRender other
-            pure $ extraLets $ trans (fromListToApply (FunRef udfName Nothing) (map Var argVars))
-        | otherwise = pure $ trans val
-      where
-        (st, FunRef function _, args) = stateAwareApplyToList val
-        fieldIndices = [0 .. length args - 1]
-        accessedFields = map ("none", ) fieldIndices
     stateVals =
         HashSet.fromList
             [ v
@@ -951,8 +968,57 @@ generateOperators fields registerOp program = do
             , v <-
                   case st of
                       Var v -> [v]
-                      e -> error (show e)
+                      e -> throwStack $ IllegalExpressionInThisContext e
             ]
+
+genPureOps registerOp = makeStateExplicit $ \st funRef@(FunRef function _) argNum ->
+    Lit . FunRefLit <$>
+    if isKnownFunction function
+    then pure funRef
+    else do
+        opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
+                    -- This relies heavily of having the expected `let x = f a b c`
+                    -- structure
+        let udfName = QualifiedBinding GenFuncsNamespace opName
+            fieldIndices = [0..pred argNum]
+            argVars = map ("arg" <>) $ map show fieldIndices
+            accessedFields = ("none", ) <$> fieldIndices
+        -- ( argVars, foldl (.) id -> extraLets ) <- unzip <$> traverse (\case
+        --                                                                    Var v -> pure (v, id)
+        --                                                                    other -> do
+        --                                                                        b <- generateBindingWith "arg"
+        --                                                                        pure (b, Let b other) ) args
+        liftIO . registerOp . Op_UDF =<< case st of
+            Nothing ->
+                pure $ UDFDescription
+                    { udfName = udfName
+                    , inputBindings = argVars
+                    , udfState = Nothing
+                    , referencedFields = fieldIndices
+                    , generations = [opGen]
+                    , execSemantic = SimpleSem
+                    }
+              where
+                opGen =
+                    TemplateSubstitution
+                        "pure/op.rs"
+                        (generatedOpSourcePath udfName) $
+                    baseUdfSubMap udfName "r" accessedFields <>
+                    [ "function" ~>
+                    [ renderDoc $ asRust function <>
+                        PP.tupled
+                            (map (\i ->
+                                    "r[self." <> pretty (idxPropFromName i) <>
+                                    "].clone().into()")
+                                accessedFields)
+                    ]
+                    , "udf-ret-type" ~> ["SqlType::Double"]
+                    ]
+            Just v -> gets (HashMap.lookup v) >>= \case
+                Nothing -> throwStack $ NoInitializerFound v
+                Just st -> pure $ mkStatefulOpDesc (function ^. name) st udfName argVars
+
+        pure $ {- extraLets $ trans -} (FunRef udfName Nothing)
 
 stateToInit :: Expr -> (QualifiedBinding, [Lit])
 stateToInit e = (fun, [case l of Lit l -> l; _ -> error $ quickRender l <> " is not a literal" | l <- args])
@@ -969,6 +1035,16 @@ isKnownFunction :: QualifiedBinding -> Bool
 isKnownFunction f =
     f ^. namespace == GenFuncsNamespace || f ^? namespace . unwrapped . ix 0 ==
     Just "ohua"
+
+isFieldAccess :: Expr -> Bool
+isFieldAccess = \case
+    Lit (FunRefLit (FunRef f _)) -> isJust $ isFieldAccessor f
+    _ -> False
+
+isFieldAccessor :: QualifiedBinding -> Maybe Binding
+isFieldAccessor op
+    | OhuaFieldNS <- op ^. namespace = Just $ op ^.name
+    | otherwise = Nothing
 
 setupReturnRecieve ::
        (Monad m, MonadGenBnd m) => [Binding] -> m (Expr, Expr -> Expr -> Expr)

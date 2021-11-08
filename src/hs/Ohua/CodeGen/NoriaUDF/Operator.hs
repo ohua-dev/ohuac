@@ -46,8 +46,8 @@ import Control.Lens
     , to
     , use
     )
-import Control.Monad.RWS (runRWST)
-import Control.Monad.Writer (runWriterT, tell)
+import Control.Monad.RWS (runRWST, RWST, evalRWST)
+import Control.Monad.Writer (runWriterT, tell, listen, censor)
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
@@ -439,65 +439,29 @@ makeStateReturn =
     rewrite (\case Let v (Lit UnitLit) bod -> Just $ rewrite (\case Var v' | v' == v -> Just $ Lit UnitLit; _ -> Nothing) bod ; _ -> Nothing)
 
 makeStateExplicit :: forall m. (HasCallStack, MonadLogger m, MonadGenBnd m ) => (Maybe Binding -> FunRef -> Int -> m Expr) -> Expr -> m Expr
-makeStateExplicit makeOp = fmap fst . flip runReaderT (mempty, True) . go
+makeStateExplicit makeOp = \e -> fmap fst $ evalRWST (RS.cata go e) mempty []
   where
-    go :: HasCallStack => Expr -> ReaderT (HashMap Binding Binding, Bool) m (Expr, Set Binding)
+    go :: (t ~ RWST (HashMap Binding Binding) [Binding] (HashMap Binding Binding) m, HasCallStack) => RS.Base Expr (t Expr) -> t Expr
     go = \case
-        Let b val bod -> do
-            (v', sts) <- withoutReturns $ go val
-            if Set.null sts
-                then withAdjustExpr (Let b v') $ go bod
-                else do p <- generateBindingWith "pack"
-                        let sts' = Set.toAscList sts
-                        ts <- traverse generateBindingWith sts'
-                        withToReturn $
-                            withAdjustReturned sts $
-                            withAdjustExpr (Let p v' .
-                                        destructure (Var p) (b: ts)) $
-                            withReplacements (HashMap.fromList $ zip sts' ts) (go bod)
-        Lambda x bod -> do
-            assertNoReturns
-            withoutReturns $ withAdjustExpr (Lambda x) $ go bod
-        this@Apply {} -> do
-            let (st, fun, args) = stateAwareApplyToList this
-                numArgs = fromIntegral $ length args
-            assertNoReturns
-            (args', Set.unions -> rets) <- withoutReturns $ unzip <$> traverse go args
-            case st of
-                Nothing -> lift $ (,rets) . flip mkApply args' <$> makeOp Nothing fun numArgs
-                Just (Var s) -> do
-                    op <- lift $ makeOp (Just s) fun numArgs
-                    pure ( mkApply op (Var s: args')
-                         , (Set.insert s rets))
-                Just other -> throwStack $ IllegalExpressionInThisContext other
-        Var v ->
-            (, []) <$>
-            (makeReturns . maybe (Var v) (Var)
-             =<< getState v)
-        l@Lit {} ->
-            (, []) <$> makeReturns l
-        BindState st to
-            | isFieldAccess to -> withAdjustExpr (flip BindState to) $ go st
-        other -> throwStack $ IllegalExpressionInThisContext other
-    withAdjustExpr = fmap . first
-    assertNoReturns = assertM . not =<< getReturns
-    makeReturns var = do
-        ret <- getReturns
-        if ret
-            then pure var
-            else do
-            toRet <- asks $ HashMap.elems . stateReplacementMap
-            if null toRet
-                then pure var
-                else
-                pure $ mkApply (Lit $ FunRefLit (FunRef "ohua.lang/(,)" Nothing) ) (var : map Var (sort toRet))
-    stateReplacementMap = fst
-    getReturns = asks snd
-    getState v = asks $ (HashMap.lookup v) . stateReplacementMap
-    withoutReturns = local (second $ const False)
-    withReplacements repl = local (first $ HashMap.union repl)
-    withToReturn = local (second $ const True)
-    withAdjustReturned = fmap . second . Set.union
+        LetF b val bod -> do
+            (val', valChanges) <- censor (const mempty) $ listen val
+            (augmented, transLet ) <- if null valChanges
+                    then pure (id, Let b val')
+                    else do
+                    newVals <- traverse generateBindingWith valChanges
+                    let changes = HashMap.fromList $ zip valChanges newVals
+                    modify $ HashMap.union changes
+                    pure $ ( local (HashMap.union changes)
+                           , destructure val' ( b : newVals ))
+            bod' <- augmented bod
+            s <- get
+            if HashMap.null s
+                then pure $ transLet bod'
+                else do
+                let (toRet, toPack) = unzip $ HashMap.toList s
+                tell toRet
+                pure $ transLet $ fromListToApply (FunRef "ohua.lang/(,)" Nothing) ( bod': map Var toPack)
+        other -> RS.embed <$> sequence other
 
 processStatefulUdf ::
        (MonadOhua m)

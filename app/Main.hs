@@ -185,7 +185,8 @@ configureForBackend BuildOpts {..} mainAnns = \case
         pure ( PackageHook $ NoriaUDFGen.preResolveHook addUdf
               , defWithCleanUnit
                 { passAfterNormalize =
-                  NoriaUDFGen.generateOperators fields addUdf <=< NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
+                   NoriaUDFGen.makeStateExplicit <=< NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
+                , passAfterDFLowering = NoriaUDFGen.generateOperators fields addUdf
                 }
               , pure . mainToEnv
               , PackageCodeGen $ \dat -> do

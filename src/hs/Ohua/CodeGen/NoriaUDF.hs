@@ -6,6 +6,7 @@ module Ohua.CodeGen.NoriaUDF
     , mainArgsToTableRefs
     , rewriteFieldAccess
     , preResolveHook
+    , makeStateExplicit
     ) where
 
 import Ohua.Prelude

@@ -18,7 +18,6 @@ import qualified Control.Lens.Plated as Plated
 import Control.Lens (at, ix)
 
 pattern BuiltinFunE b <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang"] b) _))
-pattern FieldE f <- Lit (FunRefLit (FunRef (QualifiedBinding ["ohua", "lang", "field"] f) _))
 
 data Conjunction = And | Or deriving (Show, Eq, Ord)
 

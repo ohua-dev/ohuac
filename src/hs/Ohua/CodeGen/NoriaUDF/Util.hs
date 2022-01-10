@@ -6,6 +6,9 @@ import Prelude (($))
 import GHC.Exception (CallStack, prettyCallStack )
 import GHC.Stack (HasCallStack, callStack)
 
+import Ohua.Prelude (NSRef, Lit(..), FunRef(..), QualifiedBinding(..))
+import Ohua.ALang.Lang (Expr(..))
+
 -- | Just a simple helper to make writing the HashMap literals nicer
 (~>) :: a -> b -> (a, b)
 a ~> b = (a, b)
@@ -22,3 +25,10 @@ instance Prelude.Show ErrorWithTrace where
 
 throwStack :: ( HasCallStack, Exception e) => e -> a
 throwStack e = Control.Exception.throw $ ErrorWithTrace callStack e
+
+pattern OhuaFieldNS :: NSRef
+
+pattern OhuaFieldNS <- ["ohua", "lang", "field"]
+  where OhuaFieldNS = ["ohua", "lang", "field"]
+
+pattern FieldE f <- Lit (FunRefLit (FunRef (QualifiedBinding OhuaFieldNS f) _))

@@ -28,6 +28,7 @@ import qualified Paths_ohuac as Paths
 import qualified Data.Version as Version
 
 import Ohua.ALang.PPrint ()
+import qualified Ohua.ALang.Passes as ALang
 import Ohua.CodeGen.Iface
 import qualified Ohua.CodeGen.JSONObject as JSONGen
 import qualified Ohua.CodeGen.NoriaUDF as NoriaUDFGen
@@ -170,7 +171,9 @@ configureForBackend ::
 configureForBackend BuildOpts {..} mainAnns = \case
     NoriaUDF -> do
         udfs <- newIORef []
+        states <- newIORef mempty
         let addUdf u = atomicModifyIORef' udfs (\l -> (u : l, ()))
+        let addState b s = atomicModifyIORef' states (\m -> (HashMap.insert b s m, ()) )
         let (streamAnn:_) =
                 argTypes $ mainAnns ^?! _Just . ix entrypoint
             (ftys, constr) =
@@ -185,8 +188,16 @@ configureForBackend BuildOpts {..} mainAnns = \case
         pure ( PackageHook $ NoriaUDFGen.preResolveHook addUdf
               , defWithCleanUnit
                 { passAfterNormalize =
-                   NoriaUDFGen.makeStateExplicit <=< NoriaUDFGen.rewriteFieldAccess <=< NoriaUDFGen.rewriteQueryExpressions addUdf
-                , passAfterDFLowering = NoriaUDFGen.generateOperators fields addUdf
+                  NoriaUDFGen.rewriteQueryExpressions addUdf
+                  >=> NoriaUDFGen.rewriteFieldAccess
+                  >=> NoriaUDFGen.extractStateInitializers addState
+                  >=> ALang.normalize
+                  >=> \e -> do
+                        sts <- readIORef states
+                        NoriaUDFGen.makeStateExplicit addUdf (flip HashMap.lookup sts) e
+                , passAfterDFLowering = \e -> do
+                        sts <- readIORef states
+                        NoriaUDFGen.generateOperators fields addUdf (flip HashMap.lookup sts) e
                 }
               , pure . mainToEnv
               , PackageCodeGen $ \dat -> do

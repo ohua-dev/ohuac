@@ -7,6 +7,7 @@ module Ohua.CodeGen.NoriaUDF
     , rewriteFieldAccess
     , preResolveHook
     , makeStateExplicit
+    , extractStateInitializers
     ) where
 
 import Ohua.Prelude

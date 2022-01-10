@@ -20,9 +20,9 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , rewriteFieldAccess
     , preResolveHook
     , mkPatchesFor
-    , pattern OhuaFieldNS
     , isFieldAccessor
     , makeStateExplicit
+    , extractStateInitializers
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -49,6 +49,7 @@ import Control.Lens
     )
 import Control.Monad.RWS (runRWST, RWST, evalRWST)
 import Control.Monad.Writer (runWriterT, tell, listen, censor)
+import qualified Control.Exception
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
@@ -63,6 +64,7 @@ import qualified System.FilePath as FP
 import qualified Data.Set as Set
 
 import Ohua.ALang.Lang
+import qualified Ohua.ALang.Passes as ALang
 import Ohua.ALang.PPrint (ohuaDefaultLayoutOpts, quickRender)
 import qualified Ohua.ALang.Passes as ALang (normalize)
 import Ohua.ALang.Util (findFreeVariables, fromApplyToList, fromListToApply, destructure, mkApply)
@@ -85,7 +87,9 @@ data OpExc
     | StateProducingFunctionShouldOnlyHaveOneOutput LetExpr
     | InputToStateCannotBeLocal LetExpr Binding
     | StatCannotBeModifiedTwice LetExpr Binding
+    | NonVarState Expr
     | StateReadBeforeWriting LetExpr Binding
+    | NotAFunctionApplication Expr
     deriving (Show)
 
 instance Exception OpExc
@@ -439,42 +443,85 @@ generatedOpSourcePath udfName =
     toString (unwrap $ udfName ^. name) <>
     ".rs"
 
-makeStateExplicit :: forall m. (HasCallStack, MonadLogger m, MonadGenBnd m ) => Expr -> m Expr
-makeStateExplicit = \e -> fmap fst $ evalRWST (RS.cata go e) mempty []
+extractStateInitializers :: (HasCallStack, MonadLogger m, MonadGenBnd m ) => (Binding -> Expr -> m ()) -> Expr -> m Expr
+extractStateInitializers register e = flip runReaderT mempty $ flip RS.cata e $ \case
+    LetF v bod rest | isState v -> do
+                         bod' <- bod
+                         lift $ register v bod'
+                         local (HashMap.insert v bod')
+                             rest
+    -- BindStateF s r -> do
+    --     s >>= \case
+    --         Var v -> BindState <$> asks (HashMap.! v) <*>
+    --             r
+    --         other -> throwStack $ NonVarState other
+    other -> RS.embed <$> sequence other
+  where
+    isState = flip HashSet.member $ HashSet.fromList [case s of Var v -> v; _ -> throwStack (NonVarState s) | BindState s _ <- universe e ]
+
+
+makeStateExplicit :: forall m. (MonadOhua m, HasCallStack) => RegisterOperator -> (Binding -> Maybe Expr) -> Expr -> m Expr
+makeStateExplicit registerOp getState = makeStateExplicitWith $ \func state args -> do
+    case getState state of
+        Just st -> do
+            opName <- generateBindingWith ("op_p_" <> func ^. name <> "_")
+            let udfName = QualifiedBinding GenFuncsNamespace opName
+            argVars <- traverse expectVar args
+            liftIO $ registerOp $ Op_UDF $ mkStatefulOpDesc (func ^.name) st udfName argVars
+            pure $ Lit $ FunRefLit $ FunRef udfName Nothing
+        Nothing -> pure $ Var state `BindState` Lit (FunRefLit (FunRef func Nothing))
+
+makeStateExplicitWith :: forall m. (MonadOhua m, HasCallStack) => (QualifiedBinding -> Binding -> [Expr] -> m Expr) -> Expr -> m Expr
+makeStateExplicitWith registerOp = \e0 -> do
+    let e = transform ALang.reduceLetA e0 -- yikes
+    logDebugN $ "Program before explicit state rewrite\n" <> quickRender e
+    res <- fmap fst $ evalRWST (RS.cata go e) mempty []
+    n <- (ALang.normalize res)
+    logDebugN $ "Program after explicit state\n"  <> quickRender n
+    pure res
   where
     go :: (t ~ RWST (HashMap Binding Binding) [Binding] (HashMap Binding Binding) m, HasCallStack) => RS.Base Expr (t Expr) -> t Expr
-    go = \case
-        LetF b val bod -> do
-            (val', valChanges) <- censor (const mempty) $ listen val
-            (augmented, transLet ) <- if null valChanges
-                    then pure (id, Let b val')
-                    else do
-                    newVals <- traverse generateBindingWith valChanges
-                    let changes = HashMap.fromList $ zip valChanges newVals
-                    modify $ HashMap.union changes
-                    pure $ ( local (HashMap.union changes)
-                           , destructure val' ( b : newVals ))
-            bod' <- augmented bod
-            s <- get
-            if HashMap.null s
-                then pure $ transLet bod'
-                else do
-                let (toRet, toPack) = unzip $ HashMap.toList s
-                tell toRet
-                pure $ transLet $ fromListToApply (FunRef "ohua.lang/(,)" Nothing) ( bod': map Var toPack)
-        other -> RS.embed <$> sequence other
+    go eIn = case eIn of
+        LetF b (newVal) (bod) -> do
+            (new', newValChanges) <- censor (const mempty) $ listen newVal
+            case tryStateAwareApplyToList new' of
+                Right (st, FunRef  function _, args) -> do
+                    (val', valChanges) <- case st of
+                        Nothing -> pure (new', newValChanges)
+                        Just s
+                            | Var v <- s -> do
+                                func <- lift $ registerOp function v args
+                                pure (mkApply func args, v : newValChanges)
+                            | otherwise -> throwStack $ NonVarState s
+                    (augmented, transLet ) <- if null valChanges
+                            then pure (id, Let b val')
+                            else do
+                            newVals <- traverse generateBindingWith valChanges
+                            newOut <- generateBindingWith "st_ret"
+                            let changes = HashMap.fromList $ zip valChanges newVals
+                            modify $ HashMap.union changes
+                            pure $ ( local (HashMap.union changes)
+                                  , Let newOut val' . destructure (Var newOut) ( b : newVals ))
+                    augmented $ do
+                        bod' <- bod
+                        s <- state (,mempty)
+                        transLet <$>
+                            if HashMap.null s
+                            then pure bod'
+                            else do
+                                let (toRet, toPack) = unzip $ HashMap.toList s
+                                tell toRet
+                                pure $ fromListToApply (FunRef "ohua.lang/(,)" Nothing) ( bod': map Var toPack)
+                _ -> tell newValChanges >> Let b new' <$> bod
+        --BindStateF {} -> throwStack . IllegalExpressionInThisContext . RS.embed <$> sequence eIn
+        VarF v -> Var <$> asks (fromMaybe v . HashMap.lookup v)
+        _ -> RS.embed <$> sequence eIn
 
 -- HACK A dirty, dirty hack
 getStateType initState =
     case [f | PureFunction f _ <- universe initState] of
         [f] -> f
         o -> error $ "Too many qualified applications in state init " <> show o
-
-
-pattern OhuaFieldNS :: NSRef
-
-pattern OhuaFieldNS <- ["ohua", "sql", "field"]
-  where OhuaFieldNS = ["ohua", "sql", "field"]
 
 data PathType
     = FilePath
@@ -794,9 +841,19 @@ mainArgsToTableRefs =
                   e)
         other -> (0, [], RS.embed $ fmap fst other)
 
+stateAwareApplyToList :: HasCallStack => Expr -> (Maybe Expr, FunRef, [Expr])
+stateAwareApplyToList = either Control.Exception.throw id . tryStateAwareApplyToList
 
-generateOperators :: Fields -> RegisterOperator -> DFExpr -> OhuaM env DFExpr
-generateOperators _ registerOp DFExpr{ .. } = do
+tryStateAwareApplyToList :: HasCallStack => Expr -> Either ErrorWithTrace (Maybe Expr, FunRef, [Expr])
+tryStateAwareApplyToList = \case
+    Apply f val -> tryStateAwareApplyToList f >>= \(s, f', e) -> pure (s, f', e ++ [val])
+    BindState v (Lit (FunRefLit f)) -> pure (Just v, f, [])
+    Lit (FunRefLit f) -> pure (Nothing, f, [])
+    e -> Left $ ErrorWithTrace callStack $ NotAFunctionApplication e
+
+
+generateOperators :: Fields -> RegisterOperator -> (Binding -> Maybe Expr) -> DFExpr -> OhuaM env DFExpr
+generateOperators _ registerOp getStateInit DFExpr{ .. } = do
     newExprs <- evalStateT ( traverse doRewrite letExprs ) mempty
     let exp =  DFExpr { letExprs = newExprs >>= id
                       , returnVar
@@ -804,13 +861,8 @@ generateOperators _ registerOp DFExpr{ .. } = do
     logDebugN $ "DFLang after operator generation\n" <> quickRender exp
     pure exp
   where
-    stateVars = HashSet.fromList [v | LetExpr{stateArgument=Just (DFVar v)} <- toList letExprs ]
-    isState = flip HashSet.member stateVars
+    isState = isJust . getStateInit
     doRewrite e@LetExpr{..}
-        | any isState output =
-          case output of
-              [v] -> modify (first $ HashMap.insert v e) >> pure mempty
-              _ -> throwStack $ StateProducingFunctionShouldOnlyHaveOneOutput e
         | not (isKnownFunction function) = do
               opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
                     -- This relies heavily of having the expected `let x = f a b c`
@@ -880,7 +932,7 @@ generateOperators _ registerOp DFExpr{ .. } = do
                               , output = maybe output pure mnewOutput
                               }
         -- A bit hacky, but this is how I can drop the state from ctrl
-        | otherwise = return $ pure e { callArguments = filter (\case DFVar v -> not $ isState v; _ -> True) callArguments }
+        | otherwise = return $ pure e
       where
         function = nodeRef functionRef
         exprFromDFExpr e@LetExpr{..} =

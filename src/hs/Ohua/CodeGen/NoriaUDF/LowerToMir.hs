@@ -517,9 +517,9 @@ infixr 4 &
 joinWhereMerge ::
        (GR.DynGraph gr, gr Operator () ~ g) => (GR.Node -> [NType]) -> g -> g
 joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
+  where
     -- | If there are multiple join columns choose one, because Noria does not yet support multi condition join.
     -- This choice is ... well it looks if one of the columns mentions an `id`. Yeah, its stupid and fragile but hey...
-  where
     chooseAJoinCol =
         pure . maximumBy (compare `on` \(_, (c1, c2)) -> hasId c1 $ hasId c2 0)
       where

@@ -48,7 +48,7 @@ import Control.Lens
     , use
     )
 import Control.Monad.RWS (runRWST, RWST, evalRWST)
-import Control.Monad.Writer (runWriterT, tell, listen, censor)
+import Control.Monad.Writer (runWriterT, tell, listen, censor, MonadWriter)
 import qualified Control.Exception
 import qualified Data.Functor.Foldable as RS
 import qualified Data.HashMap.Strict as HashMap
@@ -472,37 +472,40 @@ makeStateExplicit registerOp getState = makeStateExplicitWith $ \func state args
         Nothing -> pure $ Var state `BindState` Lit (FunRefLit (FunRef func Nothing))
 
 makeStateExplicitWith :: forall m. (MonadOhua m, HasCallStack) => (QualifiedBinding -> Binding -> [Expr] -> m Expr) -> Expr -> m Expr
-makeStateExplicitWith registerOp = \e0 -> do
+makeStateExplicitWith = \registerOp e0 -> do
     let e = transform ALang.reduceLetA e0 -- yikes
     logDebugN $ "Program before explicit state rewrite\n" <> quickRender e
-    res <- fmap fst $ evalRWST (RS.cata go e) mempty []
+    let assertIsUnused b = assertM $ or [b == v | Var v <- universe e]
+    res <- fmap fst $ evalRWST (RS.cata (go assertIsUnused (\qb b a -> lift $ registerOp qb b a)) e) mempty []
     n <- (ALang.normalize res)
     logDebugN $ "Program after explicit state\n"  <> quickRender n
     pure res
   where
-    go :: (t ~ RWST (HashMap Binding Binding) [Binding] (HashMap Binding Binding) m, HasCallStack) => RS.Base Expr (t Expr) -> t Expr
-    go eIn = case eIn of
+    go :: (MonadReader (HashMap Binding Binding) t, MonadWriter [Binding] t, MonadState (HashMap Binding Binding) t, HasCallStack, MonadOhua t) => (Binding -> t ()) -> (QualifiedBinding -> Binding -> [Expr] -> t Expr) -> RS.Base Expr (t Expr) -> t Expr
+    go assertIsUnused registerOp eIn = case eIn of
         LetF b (newVal) (bod) -> do
             (new', newValChanges) <- censor (const mempty) $ listen newVal
             case tryStateAwareApplyToList new' of
                 Right (st, FunRef  function _, args) -> do
-                    (val', valChanges) <- case st of
-                        Nothing -> pure (new', newValChanges)
-                        Just s
-                            | Var v <- s -> do
-                                func <- lift $ registerOp function v args
-                                pure (mkApply func args, v : newValChanges)
-                            | otherwise -> throwStack $ NonVarState s
-                    (augmented, transLet ) <- if null valChanges
-                            then pure (id, Let b val')
-                            else do
-                            newVals <- traverse generateBindingWith valChanges
+                    (augment, transLet) <- if
+                        | Just s <- st -> do
+                              assertM $ null newValChanges
+                              case s of
+                                  Var v -> do
+                                      func <- registerOp function v args
+                                      newS <- generateBindingWith v
+                                      assertIsUnused b
+                                      pure (HashMap.insert v newS, Let newS $ mkApply func args)
+                                  _ -> throwStack $ NonVarState s
+                        | null newValChanges -> pure (id, Let b new')
+                        | otherwise -> do
+                            newVals <- traverse generateBindingWith newValChanges
                             newOut <- generateBindingWith "st_ret"
-                            let changes = HashMap.fromList $ zip valChanges newVals
-                            modify $ HashMap.union changes
-                            pure $ ( local (HashMap.union changes)
-                                  , Let newOut val' . destructure (Var newOut) ( b : newVals ))
-                    augmented $ do
+                            let changes = HashMap.fromList $ zip newValChanges newVals
+                            pure $ ( HashMap.union changes
+                                  , Let newOut (ReduceState `Apply` new') . destructure (Var newOut) (b : newVals))
+                    modify augment
+                    local augment $ do
                         bod' <- bod
                         s <- state (,mempty)
                         transLet <$>

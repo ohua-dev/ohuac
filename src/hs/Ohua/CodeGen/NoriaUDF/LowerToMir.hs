@@ -48,6 +48,7 @@ import qualified System.FilePath as FS
 import System.IO.Unsafe (unsafePerformIO)
 import Ohua.CodeGen.NoriaUDF.Util
 
+
 data LoweringError
     = UnexpectedTypeForField NType Binding
     | UnknownBuiltin QualifiedBinding
@@ -93,6 +94,12 @@ data LoweringError
 
 throw :: (HasCallStack, Exception e) => e -> a
 throw = throwStack
+
+data ExcOnOperator = forall e. (Show e, Exception e ) => ExcOnOperator (Maybe GR.Node) (Maybe Operator) e
+
+deriving instance Show ExcOnOperator
+
+instance Exception ExcOnOperator
 
 traceWarning :: Text -> a -> a
 traceWarning t = trace ("WARNING: " <> t)
@@ -277,6 +284,11 @@ typeGraph udfs envInputs g = m
                           | otherwise -> throw $ ExpectedEqualType n o a b
                       _ -> throw $ InvalidArgumentType n o (Just (2, length argTypes)) argTypes
             Ctrl {} -> Prelude.tail argTypes
+            CustomOp ReduceStateB _ ->
+                case argTypes of
+                    [NTSeq (NTTup (t0: tn))] -> [NTTup (NTSeq t0 : tn)]
+                    [other] -> [other]
+                    _ -> throw $ InvalidArgumentType n o Nothing argTypes
             CustomOp bnd _
                 | bnd == Refs.nth ->
                     let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ LiteralNotFound n) $
@@ -284,7 +296,7 @@ typeGraph udfs envInputs g = m
                      in case fromIndex (Just 1) 0 of
                             NTTup tys
                                 | Just t <- tys ^? ix idx -> [t]
-                            t -> throw (InvalidIndexIntoType idx t)
+                            t -> throw $ ExcOnOperator (Just n) (Just o) (InvalidIndexIntoType idx t)
                 | bnd == Refs.smapFun ->
                     case fromIndex (Just 1) 0 of
                         NTSeq t ->
@@ -491,6 +503,7 @@ execSemOf ::
 execSemOf nodes =
     \case
         Join {} -> Just (Many, Many)
+        CustomOp ReduceStateB _ -> Just (One, One)
         CustomOp op _
             | op == Refs.collect -> Just (One, Many)
             | op == Refs.smapFun -> Just (Many, One)
@@ -649,6 +662,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                      case GR.lab' ctx of
                          Ctrl _ SmapCtrl -> assert (length (GR.pre' ctx) == 1) True
                          CustomOp c _ ->
+                             c == ReduceStateB ||
                              c ^. namespace == ["ohua", "lang", "field"] ||
                              c == "ohua.sql.query/group_by" ||
                              c `elem`
@@ -960,6 +974,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
                 NTRecFromTable t -> t
                 _ -> throw $ UnexpectedType "NTRecFromTable" a ty
     rewriteFilter a = a
+    toCol :: HasCallStack => NType -> SomeColumn
     toCol =
         \case
             NTScalar s -> s
@@ -967,7 +982,8 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
     litToDBLit = \case
         NULL -> Mir.None
         NumericLit n -> Mir.Int n
-        other -> throw $ InvalidLiteralInputs (Project []) [other]
+        UnitLit -> Mir.None
+        other -> throw $ ExcOnOperator (Just n) Nothing $ InvalidLiteralInputs (Project []) [other]
 
 pattern NULL <- FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _)
    where NULL = FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") Nothing)

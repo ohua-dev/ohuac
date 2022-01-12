@@ -6,7 +6,7 @@ import Prelude (($))
 import GHC.Exception (CallStack, prettyCallStack )
 import GHC.Stack (HasCallStack, callStack)
 
-import Ohua.Prelude (NSRef, Lit(..), FunRef(..), QualifiedBinding(..))
+import Ohua.Prelude
 import Ohua.ALang.Lang (Expr(..))
 
 -- | Just a simple helper to make writing the HashMap literals nicer
@@ -32,3 +32,10 @@ pattern OhuaFieldNS <- ["ohua", "lang", "field"]
   where OhuaFieldNS = ["ohua", "lang", "field"]
 
 pattern FieldE f <- Lit (FunRefLit (FunRef (QualifiedBinding OhuaFieldNS f) _))
+
+pattern ReduceStateB :: QualifiedBinding
+pattern ReduceStateB = "ohua.lang/reduceState"
+
+pattern ReduceState :: Expr
+pattern ReduceState <- Lit (FunRefLit (FunRef ReduceStateB _))
+  where ReduceState = Lit (FunRefLit (FunRef ReduceStateB Nothing))

@@ -55,7 +55,16 @@ data LoweringExn = LoweringExn
     , lExnOnNode :: Maybe GR.Node
     , lExnCallStack :: CallStack
     }
-    deriving Show
+
+instance Show LoweringExn where
+    show LoweringExn{..} =
+        Prelude.unlines $ catMaybes
+        [ Just $ show lExnT
+        , (\o -> "On op " <> show o) <$> lExnOnOp
+        , (\n -> "On Node " <> show n) <$> lExnOnNode
+        , Just $ "Stack Trace:"
+        , Just $ prettyCallStack lExnCallStack
+        ]
 
 instance Exception LoweringExn
 
@@ -104,6 +113,8 @@ data LExnT
     | NoMirEquivalent Operator GR.Node
     | UnableToFindSingleMatchingCtrlChild GR.Node [(GR.Node, Maybe Operator)]
     | WeirdProjectSetupInLeftOuterJoinIf GR.Node [(GR.Node, [ProjectColSpec])] [GR.Node]
+    | TableNotAllowedInThisContext Mir.Table
+    | ExecSemForOperatorNotFound Operator
     deriving Show
 
 data MiscError
@@ -252,6 +263,9 @@ mkLitMap arcs =
                   l'' -> [l'']
         ]
 
+pattern GroupReadFnB :: QualifiedBinding
+pattern GroupReadFnB = "ohua.sql.query/group_read"
+
 typeGraph ::
        (GR.Graph gr)
     => (Operator -> Maybe ExecSemantic)
@@ -289,6 +303,7 @@ typeGraph udfs envInputs g = m
                     [other] -> [other]
                     _ -> throw $ lExn' $ InvalidArgumentType Nothing argTypes
             CustomOp bnd _
+                | bnd == GroupReadFnB -> [fromIndex (Just 2) 1]
                 | bnd == Refs.nth ->
                     let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ lExn' $ LiteralNotFound n) $
                             find ((== 0) . view _1) $ envInputs `getLit` n
@@ -330,7 +345,7 @@ typeGraph udfs envInputs g = m
                         other -> throw $ lExn' $ UnexpectedTypeForField other f
                 | Just sem <- udfs o -> case sem of
                       SimpleSem -> likeUdf
-                      ReductionSem -> fromIndex Nothing 0 : likeUdf
+                      ReductionSem ->  likeUdf ++ [fromIndex Nothing 0]
             _ -> throw $ lExn' $ MissingReturnType o
       where
         lExn' :: HasCallStack => LExnT -> LoweringExn
@@ -510,6 +525,7 @@ execSemOf nodes =
             | op == Refs.smapFun -> Just (Many, One)
             | op == Refs.ctrl -> Just (One, Many)
             | isJust $ isFieldAccessor op -> Just (One, One)
+            | op == GroupReadFnB -> Just (One, One)
             | QualifiedBinding ["ohua", "lang"] b <- op
             , b `elem` builtinSimpleFuns -> Just (One, One)
             | otherwise -> execSemantic <$> nodes op
@@ -905,7 +921,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
             case name of
                 "(,)" ->
                     Project
-                    { projectEmit = map (mapLeft (first $ \idx -> InternalColumn { producingOperator = n, outputIndex = idx}) ) consolidated
+                    { projectEmit = map (mapLeft (first $ \idx -> InternalColumn { producingOperator = n, outputIndex = idx}) ) $ consolidated True
                     --, projectLits = map (\( idx, l ) -> (, litToDBLit l)) lits
                     }
                 "nth" -> CustomOp other []
@@ -935,16 +951,22 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
   where
     lExn' :: HasCallStack => LExnT -> LoweringExn
     lExn' = lExnWith Nothing (Just n)
-    mkUDFInputs = map (mapLeft snd) consolidated
-    consolidated = unfoldr consolidate (sortOn fst lits, ty, 0)
-    consolidate (lits, tys, succ -> n) = case lits of
+    mkUDFInputs = map (mapLeft snd) $ consolidated False
+    consolidated relax = concat $ unfoldr (consolidate relax) (sortOn fst lits, ty, 0)
+    consolidate relax (lits, tys, succ -> n) = case lits of
         []
-            | t:ts <- tys -> Just (Right $ toCol t, ([], ts, n) )
+            | t:ts <- tys -> Just (toCols t, ([], ts, n) )
             | otherwise -> Nothing
         (li,l):ls
-            | succ li == n -> Just (Left (li, litToDBLit l), (ls, tys, n))
-            | t:ts <- tys -> Just (Right $ toCol t, (lits, ts, n))
+            | succ li == n -> Just ([Left (li, litToDBLit l)], (ls, tys, n))
+            | t:ts <- tys -> Just (toCols t, (lits, ts, n))
             | otherwise -> throw $ lExn' $ InputsDoNotLineUp lits tys
+      where
+        toCols =
+            map Right .
+            if relax
+            then typeToCols (throw . lExn' . TableNotAllowedInThisContext) . pure
+            else \i -> [toCol i]
     rewriteFilter a@(Filter conds vars@(st, free)) = Filter newConds vars
       where
         varnames = map unwrap $ st : free
@@ -1141,7 +1163,7 @@ handleNode execSemMap tm tableColumn mg m n = case op of
             , executionType = execT
             }
         where
-          Just execSem = execSemMap op
+          execSem = fromMaybe (throw $ lExn' $ ExecSemForOperatorNotFound op) $ execSemMap op
           stdIndices = map (either Mir.ConstantValue (Mir.ColumnValue . colAsIndex) ) ccols
           udfRetCols = getUdfReturnCols n
           (ind, cols, execT) =

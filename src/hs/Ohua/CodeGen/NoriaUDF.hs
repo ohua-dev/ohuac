@@ -163,10 +163,18 @@ extraOperatorProcessing qs ops = do
             allUdfs
     patchFiles Nothing allUdfs
 
-loadInstalledQueries :: MonadIO m => m InstalledQueries
-loadInstalledQueries = liftIO $ do
-    ext <- FS.doesFileExist qObjFile
-    if ext then B.decodeFile qObjFile else return def
+loadInstalledQueries :: (MonadIO m, MonadLogger m ) => m InstalledQueries
+loadInstalledQueries = do
+    ext <- liftIO $ FS.doesFileExist qObjFile
+    if ext
+        then
+        liftIO (B.decodeFileOrFail qObjFile) >>= \case
+        Right o -> pure o
+        Left _ -> do
+            logWarnN "Decoding query file failed. The file will be overwritten."
+            liftIO $ FS.removeFile qObjFile
+            return def
+        else return def
 
 qObjFile = "installed.ohua-query-object"
 

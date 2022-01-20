@@ -10,6 +10,7 @@ import qualified Ohua.CodeGen.NoriaUDF.Mir as Mir
 import Data.Text.Prettyprint.Doc ((<+>), pretty)
 import qualified Data.HashMap.Strict as HashMap
 import Control.Lens.Plated (Plated, plate, gplate, para)
+import Prelude (show)
 
 data NType
     = NTSeq NType
@@ -17,7 +18,7 @@ data NType
     | NTRecFromTable Mir.Table
     | NTAnonRec Binding NTFields
     | NTScalar SomeColumn
-  deriving (Show, Eq, Ord, Generic)
+  deriving (Eq, Ord, Generic)
 
 instance Plated NType where
     plate f = \case
@@ -71,6 +72,9 @@ instance PP.Pretty NType where
         NTScalar (Left InternalColumn {..}) -> "FromOp<" <> pretty producingOperator <> PP.comma <+> pretty outputIndex <> ">"
         NTScalar (Right c) -> pretty c
 
+instance Show NType where
+    show = toString . quickRender
+
 data GenerationType
     = TemplateSubstitution Template
                            FilePath
@@ -94,13 +98,16 @@ type ExecSemantic = (ExecSem, ExecSem)
 data InternalColumn = InternalColumn
     { producingOperator :: Int
     , outputIndex :: Int
-    } deriving (Show, Eq, Ord, Generic)
+    } deriving (Eq, Ord, Generic)
 
 
 type Column = InternalColumn
 
 instance PP.Pretty InternalColumn where
-    pretty InternalColumn{..} = pretty producingOperator <> ":" <> pretty outputIndex
+    pretty InternalColumn{..} = "op:" <> pretty producingOperator <+> "idx:" <> pretty outputIndex
+
+instance Show InternalColumn where
+    show = toString . quickRender
 
 type SomeColumn = Either Column Mir.Column
 -- instance Hashable Column
@@ -134,7 +141,10 @@ data Operator
     | IsEmptyCheck
     | Select SelectPayload
     | Ctrl Int CtrlType
-    deriving (Show, Eq, Generic)
+    deriving (Eq, Generic)
+
+instance Show Operator where
+    show = toString . quickRender
 
 type SelectPayload = [[Either SomeColumn Mir.Table]]
 

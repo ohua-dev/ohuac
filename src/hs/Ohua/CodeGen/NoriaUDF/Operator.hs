@@ -514,7 +514,7 @@ makeStateExplicitWith = \registerOp e0 -> do
                             else do
                                 let (toRet, toPack) = unzip $ HashMap.toList s
                                 tell toRet
-                                pure $ fromListToApply (FunRef "ohua.lang/(,)" Nothing) ( bod': map Var toPack)
+                                pure $ mkApply PackState ( bod': map Var toPack)
                 _ -> tell newValChanges >> Let b new' <$> bod
         --BindStateF {} -> throwStack . IllegalExpressionInThisContext . RS.embed <$> sequence eIn
         VarF v -> Var <$> asks (fromMaybe v . HashMap.lookup v)

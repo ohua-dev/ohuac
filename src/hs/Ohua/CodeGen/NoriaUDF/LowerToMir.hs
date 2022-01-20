@@ -115,6 +115,7 @@ data LExnT
     | WeirdProjectSetupInLeftOuterJoinIf GR.Node [(GR.Node, [ProjectColSpec])] [GR.Node]
     | TableNotAllowedInThisContext Mir.Table
     | ExecSemForOperatorNotFound Operator
+    | ColumnsNotPresent [SomeColumn] [SomeColumn]
     deriving Show
 
 data MiscError
@@ -325,9 +326,10 @@ typeGraph udfs envInputs g = m
                   case argTypes of
                       [x] -> [x,x]
                       _ -> throw $ lExn' $ IncorrectType "expected one onput type" Refs.ifFun n argTypes
+                | PackStateB <- bnd -> likeTuple
                 | QualifiedBinding ["ohua", "lang"] b <- bnd ->
                     case b of
-                        "(,)" -> [NTTup argTypes ]
+                        "(,)" -> likeTuple
                         _
                             | b `elem`
                                   (["lt", "gt", "eq", "and", "or", "leq", "geq", "<", ">", "<=", ">=", "==", "!=", "&&", "||"] :: Vector Binding) ->
@@ -347,7 +349,8 @@ typeGraph udfs envInputs g = m
                       SimpleSem -> likeUdf
                       ReductionSem ->  likeUdf ++ [fromIndex Nothing 0]
             _ -> throw $ lExn' $ MissingReturnType o
-      where
+      where 
+        likeTuple = [NTTup argTypes ]
         lExn' :: HasCallStack => LExnT -> LoweringExn
         lExn' = lExnWith (Just o) (Just n)
         argTypes = map snd indexedArgTypes
@@ -519,7 +522,6 @@ execSemOf ::
 execSemOf nodes =
     \case
         Join {} -> Just (Many, Many)
-        CustomOp ReduceStateB _ -> Just (One, One)
         CustomOp op _
             | op == Refs.collect -> Just (One, Many)
             | op == Refs.smapFun -> Just (Many, One)
@@ -528,6 +530,7 @@ execSemOf nodes =
             | op == GroupReadFnB -> Just (One, One)
             | QualifiedBinding ["ohua", "lang"] b <- op
             , b `elem` builtinSimpleFuns -> Just (One, One)
+            | op == ReduceStateB || op == PackStateB -> Just (One, One)
             | otherwise -> execSemantic <$> nodes op
         Filter {} -> Just (Many, Many)
         Identity -> Nothing
@@ -682,8 +685,10 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                          Ctrl _ SmapCtrl -> assert (length (GR.pre' ctx) == 1) True
                          CustomOp c _ ->
                              c == ReduceStateB ||
+                             c == PackStateB ||
                              c ^. namespace == ["ohua", "lang", "field"] ||
                              c == "ohua.sql.query/group_by" ||
+                             c == GroupReadFnB ||
                              c `elem`
                              ([Refs.smapFun, Refs.collect, Refs.nth, Refs.ifFun] :: Vector QualifiedBinding)
                          s@Select {} ->
@@ -1177,9 +1182,10 @@ handleNode execSemMap tm tableColumn mg m n = case op of
                                  length $ ancestorColumns (snd p))
                       ReductionSem ->
                           let (Mir.ColumnValue x:xs) = stdIndices
-                              Right c:_ = ccols
+                              Right (Left c):_ = ccols
                           in
-                              (xs, udfRetCols , Mir.Reduction [x])
+                              (xs, ancestorColumns (producingOperator c) <> udfRetCols , Mir.Reduction [x])
+
                       _ -> unimplemented
     Join {joinType, joinOn}
         | [lp,rp] <- map snd ins ->
@@ -1248,13 +1254,15 @@ handleNode execSemMap tm tableColumn mg m n = case op of
         retB = ancestorColumns b
         retBSet = HashSet.fromList retB
 
-    Project {..} ->
-        withCols (fromAncestor <> map (Left . fst) projectLits) $
-        defaultRet Mir.Project
-        { projectEmit = map someColToMirCol fromAncestor
-        , projectLiterals = zip (repeat "unused") $ map snd projectLits
-        }
-      where projectLits = mapMaybe (\case Left l -> Just l; _ -> Nothing) projectEmit
+    Project {..}
+        | l@(_:_) <- filter (not . (`elem` fromAncestor)) projectCols -> throw $ lExn' $ ColumnsNotPresent l fromAncestor
+        | otherwise ->
+          withCols (fromAncestor <> map (Left . fst) projectLits) $
+          defaultRet Mir.Project
+          { projectEmit = map someColToMirCol fromAncestor
+          , projectLiterals = zip (repeat "unused") $ map snd projectLits
+          }
+      where ( projectLits, projectCols ) = partitionEithers projectEmit
     Identity -> defaultRet $ Mir.Identity $ map someColToMirCol fromAncestor
     Filter f _ ->
         defaultRet

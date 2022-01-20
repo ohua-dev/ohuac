@@ -39,3 +39,11 @@ pattern ReduceStateB = "ohua.lang/reduceState"
 pattern ReduceState :: Expr
 pattern ReduceState <- Lit (FunRefLit (FunRef ReduceStateB _))
   where ReduceState = Lit (FunRefLit (FunRef ReduceStateB Nothing))
+
+
+pattern PackStateB :: QualifiedBinding
+pattern PackStateB = "ohua.lang/packState"
+
+pattern PackState :: Expr
+pattern PackState <- Lit (FunRefLit (FunRef PackStateB _))
+  where PackState = Lit (FunRefLit (FunRef PackStateB Nothing))

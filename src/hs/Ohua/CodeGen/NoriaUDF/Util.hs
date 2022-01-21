@@ -47,3 +47,7 @@ pattern PackStateB = "ohua.lang/packState"
 pattern PackState :: Expr
 pattern PackState <- Lit (FunRefLit (FunRef PackStateB _))
   where PackState = Lit (FunRefLit (FunRef PackStateB Nothing))
+
+
+pattern NULL <- FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _)
+   where NULL = FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") Nothing)

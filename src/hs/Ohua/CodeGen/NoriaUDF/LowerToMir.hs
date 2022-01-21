@@ -116,6 +116,7 @@ data LExnT
     | TableNotAllowedInThisContext Mir.Table
     | ExecSemForOperatorNotFound Operator
     | ColumnsNotPresent [SomeColumn] [SomeColumn]
+    | IncorrectlySizedTupleForNth Int [NType]
     deriving Show
 
 data MiscError
@@ -279,13 +280,13 @@ typeGraph udfs envInputs g = m
     mkRetType :: GR.Node -> [(Int , NType )] -> Operator -> [NType]
     mkRetType n indexedArgTypes o =
         case o of
-            IsEmptyCheck -> [NTScalar (Left InternalColumn {producingOperator=n,outputIndex=0})]
+            IsEmptyCheck -> [NTScalarCol (Left InternalColumn {producingOperator=n,outputIndex=0})]
             Filter {} -> [fromIndex Nothing 0]
             Join {} -> throw $ lExn' $ UnexpectedOperator o
             Identity -> [fromIndex (Just 1) 0]
             Sink -> [fromIndex (Just 1) 0]
             Source t -> [NTSeq (NTRecFromTable t)]
-            Project {..} -> [NTTup $ map (NTScalar . either (Left . fst ) id ) projectEmit]
+            Project {..} -> [NTTup $ map (NTScalarCol . either (Left . fst ) id ) projectEmit]
             Select _ ->
                   case argTypes of
                       [_, x] -> [x]
@@ -306,18 +307,18 @@ typeGraph udfs envInputs g = m
             CustomOp bnd _
                 | bnd == GroupReadFnB -> [fromIndex (Just 2) 1]
                 | bnd == Refs.nth ->
-                    let (0, NumericLit (fromIntegral -> idx)) = fromMaybe (throw $ lExn' $ LiteralNotFound n) $
-                            find ((== 0) . view _1) $ envInputs `getLit` n
-                     in case fromIndex (Just 1) 0 of
-                            NTTup tys
-                                | Just t <- tys ^? ix idx -> [t]
-                            t -> throw (lExn' $ InvalidIndexIntoType idx t)
+                    case argTypes of
+                        [NTConstInt (fromIntegral -> i), NTConstInt (fromIntegral -> l), NTTup tys]
+                            | l /= length tys -> throw $ lExn' $ IncorrectlySizedTupleForNth l tys
+                            | Just t <- tys ^? ix i -> [t]
+                            | otherwise -> throw (lExn' $ InvalidIndexIntoType i $ NTTup tys)
+                        ts -> throw $ lExn' $ InvalidArgumentType Nothing ts
                 | bnd == Refs.smapFun ->
                     case fromIndex (Just 1) 0 of
                         NTSeq t ->
                             [ t
-                            , NTScalar $ Left $ InternalColumn n 1
-                            , NTScalar $ Left $ InternalColumn n 2
+                            , NTScalarCol $ Left $ InternalColumn n 1
+                            , NTScalarCol $ Left $ InternalColumn n 2
                             ] {- is this really necessary? -}
                         _ -> invalidArgs
                 | bnd == Refs.collect -> [NTSeq $ fromIndex (Just 2) 1]
@@ -339,7 +340,7 @@ typeGraph udfs envInputs g = m
                     pure $
                     case fromIndex (Just 1) 0 of
                         NTRecFromTable t ->
-                            NTScalar $ Right $ Mir.Column (Just t) $ unwrap f
+                            NTScalarCol $ Right $ Mir.Column (Just t) $ unwrap f
                         r@(NTAnonRec rb fields) ->
                             fromMaybe
                                 (throw $ lExn' $ FieldNotFound f rb fields) $
@@ -354,7 +355,7 @@ typeGraph udfs envInputs g = m
         lExn' :: HasCallStack => LExnT -> LoweringExn
         lExn' = lExnWith (Just o) (Just n)
         argTypes = map snd indexedArgTypes
-        likeUdf = [NTScalar $ Left $ InternalColumn n 0]
+        likeUdf = [NTScalarCol $ Left $ InternalColumn n 0]
         invalidArgs :: a
         invalidArgs = throw $ lExn' $ InvalidArgumentType Nothing argTypes
         fromIndex (Just el) _
@@ -363,23 +364,30 @@ typeGraph udfs envInputs g = m
         fromIndex _ i
             | Just t' <- argTypes ^? ix i = t'
             | otherwise = throw $ lExn' $ InvalidArgumentType (Just (i, length argTypes)) argTypes
+    sortedArgsForNode n l = 
+        sortOn fst $
+        [ (i, NTScalar $ Mir.ConstantValue $ Mir.litToDataType d) 
+        | (i, d) <- fromMaybe [] $ IM.lookup n envInputs
+        , not (isTableLit d)
+        ] <>
+        [ ( inIdx
+        , let retTypes = snd (getType p)
+            in if outIdx == (-1)
+                    then NTTup retTypes
+                    else fromMaybe
+                            (throw $ lExn $ InvalidIndexIntoTypes outIdx retTypes (getLabel g p) inIdx l) $
+                        retTypes ^? ix outIdx)
+        | (p, (outIdx, inIdx)) <- GR.lpre g n
+        ]
     m =
         IM.fromList
             [ (n, (map snd argTypes, mkRetType n argTypes l))
             | (n, l) <- GR.labNodes g
-            , let argTypes =
-                      sortOn
-                          fst
-                          [ ( inIdx
-                            , let retTypes = snd (getType p)
-                               in if outIdx == (-1)
-                                      then NTTup retTypes
-                                      else fromMaybe
-                                               (throw $ lExn $ InvalidIndexIntoTypes outIdx retTypes (getLabel g p) inIdx l) $
-                                           retTypes ^? ix outIdx)
-                          | (p, (outIdx, inIdx)) <- GR.lpre g n
-                          ]
+            , let argTypes = sortedArgsForNode n l
             ]
+
+pattern NTScalarCol c = NTScalar (Mir.ColumnValue c)
+pattern NTConstInt i = NTScalar (Mir.ConstantValue (Mir.Int i))
 
 -- | Note that this calculates the node order once and does not update it during the fold
 gFoldTopSort ::
@@ -438,7 +446,7 @@ inlineCtrl getType =
                                     | ctxL == Refs.ifFun ->
                                         let theCol =
                                                 case getType ctxSource Prelude.!! ctxSourceOutIdx of
-                                                    NTScalar s -> s
+                                                    NTScalarCol s -> s
                                                     other -> throw (lExnWith (Just ctxSourceLab) (Just ctxSource) $ InvalidReturnType [other])
                                             theVal =
                                                 case ctxSourceOutIdx of
@@ -717,7 +725,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
         zip
             [succ $ fromMaybe sinkId $ fst <$> IM.lookupMax sourceNodes ..]
             [ (target, Source (Mir.TableByName $ unwrap t))
-            | DFGraph.Arc target (DFGraph.EnvSource (FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "table"] t) _))) <-
+            | DFGraph.Arc target (DFGraph.EnvSource (TableLit t)) <-
                   arcs
             ]
     quickDumpGr = quickDumpGrAsDot entrypoint
@@ -825,6 +833,13 @@ removeSuperfluousOperators p g0 =
         g0
         (GR.nodes g0)
 
+pattern TableLit t <- FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "table"] t) _)
+  where TableLit t = FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "table"] t) Nothing)
+
+isTableLit :: Lit -> Bool 
+isTableLit = \case TableLit _ -> True; _ -> False
+
+
 type TypeMap = IM.IntMap ([NType], [NType])
 
 optimizeLeftOuterJoin :: ( GR.DynGraph gr, gr Operator () ~ g, MonadLogger m ) => g -> m g
@@ -898,7 +913,7 @@ determineCtrlType g n ts = (ctxSource, ) $
     lab = CustomOp Refs.ctrl []
     theCol =
         case ts of
-            NTScalar s:_ -> s
+            NTScalarCol s:_ -> s
             other -> throw $ lExn' $ InvalidReturnType other
     idxmap =
         IM.fromList
@@ -936,8 +951,9 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
                 "id" -> Identity
                 "select" ->
                     let flattenTy = Lens.para $ \a r -> case a of
-                            NTScalar s -> [Left s]
+                            NTScalarCol s -> [Left s]
                             NTRecFromTable t -> [Right t]
+                            NTScalar _ -> throw $ lExn' $ InvalidArgumentType Nothing [a]
                             _ -> concat r
                         (_:ts) = ty
                     in
@@ -963,7 +979,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
             | t:ts <- tys -> Just (toCols t, ([], ts, n) )
             | otherwise -> Nothing
         (li,l):ls
-            | succ li == n -> Just ([Left (li, litToDBLit l)], (ls, tys, n))
+            | succ li == n -> Just ([Left (li, Mir.litToDataType l)], (ls, tys, n))
             | t:ts <- tys -> Just (toCols t, (lits, ts, n))
             | otherwise -> throw $ lExn' $ InputsDoNotLineUp lits tys
       where
@@ -1011,16 +1027,9 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
     toCol :: HasCallStack => NType -> SomeColumn
     toCol =
         \case
-            NTScalar s -> s
-            t -> throw $ lExn' $ UnexpectedType "NTScalar" (CustomOp other []) [t]
-    litToDBLit = \case
-        NULL -> Mir.None
-        NumericLit n -> Mir.Int n
-        UnitLit -> Mir.None
-        other -> throw (lExn' $ InvalidLiteralInputs [other])
+            NTScalarCol s -> s
+            t -> throw $ lExn' $ UnexpectedType "NTScalarCol" (CustomOp other []) [t]
 
-pattern NULL <- FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") _)
-   where NULL = FunRefLit (FunRef (QualifiedBinding ["ohua", "sql", "query"] "NULL") Nothing)
 
 multiArcToJoin2 :: (GR.DynGraph gr, gr Operator () ~ g) => g -> g
 multiArcToJoin2 g = foldl' f g (GR.labNodes g)
@@ -1309,9 +1318,9 @@ handleNode execSemMap tm tableColumn mg m n = case op of
     (ins, _, op, _) = GR.context mg n
     getUdfReturnCols n =
         case t of
-            NTScalar s:xs -> -- The first scalar does not have to be local in reductions
+            NTScalarCol s:xs -> -- The first scalar does not have to be local in reductions
                 s : map (\case
-                                NTScalar s@(Left _) -> s
+                                NTScalarCol s@(Left _) -> s
                                 t -> err) xs
             _ -> err
       where

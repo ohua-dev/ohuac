@@ -8,6 +8,7 @@ import Ohua.Prelude hiding (list, Identity)
 import Data.Text.Prettyprint.Doc as P hiding (list)
 import Ohua.ALang.PPrint ()
 import Control.Exception (throw)
+import Ohua.CodeGen.NoriaUDF.Util (pattern NULL, throwStack)
 
 list = brackets . concatWith (surround ", ")
 
@@ -77,7 +78,7 @@ deMorganOp = \case
 data Value col
     = ColumnValue col
     | ConstantValue DataType
-    deriving (Show, Eq, Generic)
+    deriving (Show, Eq, Generic, Ord)
 
 instance Pretty col => Pretty ( Value col) where
     pretty = \case
@@ -103,7 +104,7 @@ instance NFData col => NFData ( FilterCondition col )
 data DataType
     = None
     | Int Integer
-    deriving (Show, Eq, Generic)
+    deriving (Show, Eq, Generic, Ord)
 
 instance Num DataType where
     fromInteger = Int
@@ -112,9 +113,12 @@ data LiteralNotSupported = LiteralNotSupported Lit deriving (Show)
 
 instance Exception LiteralNotSupported
 
-litToDataType :: Lit -> DataType
-litToDataType (NumericLit n) = Int n
-litToDataType other = throw $ LiteralNotSupported other
+litToDataType :: HasCallStack => Lit -> DataType
+litToDataType = \case 
+    NumericLit n -> Int n
+    NULL -> None
+    UnitLit -> None
+    other -> throwStack $ LiteralNotSupported other
 
 data Node
     = Regular

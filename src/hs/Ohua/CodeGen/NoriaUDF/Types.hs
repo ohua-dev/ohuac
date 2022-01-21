@@ -17,7 +17,7 @@ data NType
     | NTTup [NType]
     | NTRecFromTable Mir.Table
     | NTAnonRec Binding NTFields
-    | NTScalar SomeColumn
+    | NTScalar (Mir.Value SomeColumn)
   deriving (Eq, Ord, Generic)
 
 instance Plated NType where
@@ -32,7 +32,7 @@ typeToCols tableExpansion = (>>= para g)
     g a r = case a of
         NTRecFromTable t -> map Right $ tableExpansion t
         NTAnonRec _ f -> assert (length f == length r) $ concat r
-        NTScalar s -> [s]
+        NTScalar (Mir.ColumnValue s) -> [s]
         _ -> concat r
 
 isRecNType, isSeqNType, isUnitNType :: NType -> Bool
@@ -69,8 +69,13 @@ instance PP.Pretty NType where
         NTAnonRec b rs -> pretty b <>
             PP.encloseSep PP.lbracket PP.rbracket PP.comma
             (map (\(f, t) -> pretty f <+> PP.colon <+> pretty t) rs)
-        NTScalar (Left InternalColumn {..}) -> "FromOp<" <> pretty producingOperator <> PP.comma <+> pretty outputIndex <> ">"
-        NTScalar (Right c) -> pretty c
+        NTScalar s ->
+            case s of
+                Mir.ColumnValue c ->
+                    case c of 
+                        Left InternalColumn {..} -> "FromOp<" <> pretty producingOperator <> PP.comma <+> pretty outputIndex <> ">"
+                        Right c -> pretty c
+                Mir.ConstantValue c -> pretty c
 
 instance Show NType where
     show = toString . quickRender

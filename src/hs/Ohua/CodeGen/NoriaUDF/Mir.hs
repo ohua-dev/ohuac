@@ -41,6 +41,7 @@ instance NFData Column
 data ExecutionType
     = Reduction
           { groupBy :: [Word]
+          , keep :: [Word]
           }
     | Simple Word
   deriving (Show, Eq, Generic)

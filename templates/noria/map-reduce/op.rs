@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use super::super::att3::Typed;
+use super::super::att3::{Typed, Keep};
 use nom_sql::SqlType;
 use super::super::Value;
 
@@ -43,6 +43,7 @@ pub struct
     group_by: Vec<usize>,
     out_key: Vec<usize>,
     colfix: Vec<usize>,
+    keep: Keep,
 }
 
 impl Typed for
@@ -66,8 +67,10 @@ impl
         src: NodeIndex,
         // <insert(udf-args-sigs)>
         // <insert(node-properties)>
-        mut group_by: Vec<usize>,
+        group_by: &[usize],
+        keep: &[usize],
     ) -> Self {
+        let mut group_by = group_by.to_vec();
         group_by.sort();
         let out_key = (0..group_by.len()).collect();
         // <begin(udf-name)>
@@ -85,7 +88,8 @@ impl
 
             group_by: group_by,
             out_key: out_key,
-            colfix: Vec::new(),
+            keep: keep.to_vec(),
+            colfix: vec![],
         }
     }
 
@@ -205,8 +209,20 @@ impl
                                 out.push(Record::Negative((**old).clone()));
                             }
 
-                            // emit positive, which is group + new.
-                            let mut rec = group;
+                            // emit positive, which is keep + new.
+                            let mut rec = group_rs.next().unwrap().to_vec();
+                            rec.retain({
+                                let mut idx = 0;
+                                let mut it = self.keep.iter().peekable();
+                                move |_| {
+                                    let keep_this = idx == **it.peek().unwrap();
+                                    if keep_this {
+                                        it.next();
+                                    }
+                                    idx += 1;
+                                    keep_this
+                                }
+                            });
                             rec.push(new);
                             out.push(Record::Positive(rec));
                         }
@@ -217,10 +233,11 @@ impl
             let mut group_rs = Vec::new();
             for r in rs {
                 if !group_rs.is_empty() && cmp(&group_rs[0], &r) != Ordering::Equal {
+                    debug_assert_eq!(group_rs.len(), diffs.len());
                     handle_group(group_rs.drain(..), diffs.drain(..));
                 }
 
-                let moved_row = {
+                let mut moved_row = {
                     let r_is_positive = r.is_positive();
                     let
                         // <begin(row-name)>
@@ -267,21 +284,12 @@ impl Ingredient for
 
     /// TODO check this is can be copied like this
     fn on_connected(&mut self, g: &Graph) {
+
         let srcn = &g[self.src.as_global()];
 
-        // group by all columns
-        self.cols = srcn.fields().len();
+        let cols = srcn.fields().len();
 
-        // build a translation mechanism for going from output columns to input columns
-        let colfix: Vec<_> = (0..self.cols)
-            .filter(|col| {
-                // since the generated value goes at the end,
-                // this is the n'th output value
-                // otherwise this column does not appear in output
-                self.group_by.iter().any(|c| c == col)
-            })
-            .collect();
-        self.colfix.extend(colfix.into_iter());
+        self.colfix = (0..).filter(|i| self.keep.contains(i)).take(cols - 1).collect();
     }
 
     fn on_commit(&mut self, us: NodeIndex, remap: &HashMap<NodeIndex, IndexPair>) {
@@ -325,16 +333,34 @@ impl Ingredient for
         Some((this, self.out_key.clone())).into_iter().collect()
     }
 
+    fn description(&self, detailed: bool) -> String {
+        if detailed {
+            let 
+                // <insert(udf-name)>
+                {
+                    // <insert(node-property-args)>
+                    ..
+                } = &self;
+            format!("{}[{:?}]({:?})", 
+                // <insert(udf-name-str)>
+                ,
+                self.group_by,
+                vec![
+                    // <insert(node-property-args)>
+                ],
+
+            )
+        } else {
+            // <insert(udf-name-str)>
+            .to_string()
+        }
+    }
+
     fn resolve(&self, col: usize) -> Option<Vec<(NodeIndex, usize)>> {
         if col == self.colfix.len() {
             return None;
         }
         Some(vec![(self.src.as_global(), self.colfix[col])])
-    }
-
-    fn description(&self, detailed: bool) -> String {
-        // <insert(udf-name-str)>
-          .to_string()
     }
 
     fn parent_columns(&self, column: usize) -> Vec<(NodeIndex, Option<usize>)> {

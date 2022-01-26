@@ -590,7 +590,7 @@ mkPatchesFor UDFDescription {..} =
              -- NodeOperator::ClickAnaUDF(ref i) => i.$fn($($arg),*),
       ]
     , Path.opsInterfaceFile ~>
-    let mkInit extraNodeArg =
+    let mkInit extraNodeArgs =
             [ renderDoc $ PP.dquotes (pretty udfName) <+> "=>" <+>
               ppBlock
                   (PP.vsep
@@ -607,14 +607,14 @@ mkPatchesFor UDFDescription {..} =
                               map
                                   (\n -> "over_cols" <> PP.brackets (pretty n) <> ".clone()")
                                   [0 .. pred $ length referencedFields] <>
-                              [extraNodeArg])
+                              extraNodeArgs)
                        ] <>
                    ".into()") <>
               ","
             ]
         (red, simpl) = case execSemantic of
-                           ReductionSem -> (mkInit "group", [])
-                           SimpleSem -> ([], mkInit "carry")
+                           ReductionSem -> (mkInit ["group", "keep"], [])
+                           SimpleSem -> ([], mkInit ["carry"])
     in
     [ "generated-reducing-operator-inits" ~> red
     , "generated-simple-operator-inits" ~> simpl

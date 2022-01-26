@@ -305,7 +305,7 @@ typeGraph udfs envInputs g = m
                     [other] -> [other]
                     _ -> throw $ lExn' $ InvalidArgumentType Nothing argTypes
             CustomOp bnd _
-                | bnd == GroupReadFnB -> [fromIndex (Just 2) 1]
+                | bnd == GroupReadFnB -> [fromIndex (Just 2) 0]
                 | bnd == Refs.nth ->
                     case argTypes of
                         [NTConstInt (fromIntegral -> i), NTConstInt (fromIntegral -> l), NTTup tys]
@@ -348,7 +348,7 @@ typeGraph udfs envInputs g = m
                         other -> throw $ lExn' $ UnexpectedTypeForField other f
                 | Just sem <- udfs o -> case sem of
                       SimpleSem -> likeUdf
-                      ReductionSem ->  likeUdf ++ [fromIndex Nothing 0]
+                      ReductionSem -> likeUdf -- ++ [fromIndex Nothing 0]
             _ -> throw $ lExn' $ MissingReturnType o
       where 
         likeTuple = [NTTup argTypes ]
@@ -1108,7 +1108,7 @@ instance ToRust SerializableGraph where
                             case executionType of
                                 Mir.Reduction {..} ->
                                     "Reduction" <>
-                                    recordSyn [("group_by", ppVec $ map pretty groupBy)]
+                                    recordSyn ["group_by" ~> ppVec (map pretty groupBy), "keep" ~> ppVec (map pretty keep)]
                                 Mir.Simple i ->
                                     "Simple" <> recordSyn [("carry", pretty i)])
                         ]
@@ -1192,8 +1192,11 @@ handleNode execSemMap tm tableColumn mg m n = case op of
                       ReductionSem ->
                           let (Mir.ColumnValue x:xs) = stdIndices
                               Right (Left c):_ = ccols
+                              stateProducerCols = ancestorColumns (producingOperator c)
+                              (keep, outputCols) = unzip $ filter ((`elem` stateProducerCols) . snd) $ zip [0..] fromAncestor
                           in
-                              (xs, ancestorColumns (producingOperator c) <> udfRetCols , Mir.Reduction [x])
+                              assert (all (`elem` fromAncestor) stateProducerCols ) $
+                              (xs, outputCols <> udfRetCols , Mir.Reduction { keep = keep, groupBy = [x] })
 
                       _ -> unimplemented
     Join {joinType, joinOn}
@@ -1301,9 +1304,11 @@ handleNode execSemMap tm tableColumn mg m n = case op of
     lExn' :: HasCallStack => LExnT -> LoweringExn
     lExn' = lExnWith (Just op) (Just n)
     colAsIndex :: HasCallStack => SomeColumn -> Word
-    colAsIndex c = fromIntegral $
+    colAsIndex = colAsIndexFrom fromAncestor
+    colAsIndexFrom :: HasCallStack => [SomeColumn] -> SomeColumn -> Word
+    colAsIndexFrom cols c = fromIntegral $
         fromMaybe (throw $ lExn' $ ColumnNotFoundInList c fromAncestor n op) $
-        List.elemIndex c fromAncestor
+        List.elemIndex c cols
     pre = GR.pre mg n
     fromAncestor =
         let a = case pre of

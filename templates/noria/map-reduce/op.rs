@@ -73,6 +73,9 @@ impl
         let mut group_by = group_by.to_vec();
         group_by.sort();
         let out_key = (0..group_by.len()).collect();
+        let mut keep = keep.to_vec();
+        keep.sort();
+        let colfix = keep.clone();
         // <begin(udf-name)>
         Self
         // <end(udf-name)>
@@ -88,8 +91,8 @@ impl
 
             group_by: group_by,
             out_key: out_key,
-            keep: keep.to_vec(),
-            colfix: vec![],
+            keep,
+            colfix,
         }
     }
 
@@ -284,12 +287,6 @@ impl Ingredient for
 
     /// TODO check this is can be copied like this
     fn on_connected(&mut self, g: &Graph) {
-
-        let srcn = &g[self.src.as_global()];
-
-        let cols = srcn.fields().len();
-
-        self.colfix = (0..).filter(|i| self.keep.contains(i)).take(cols - 1).collect();
     }
 
     fn on_commit(&mut self, us: NodeIndex, remap: &HashMap<NodeIndex, IndexPair>) {

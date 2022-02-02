@@ -613,7 +613,7 @@ mkPatchesFor UDFDescription {..} =
               ","
             ]
         (red, simpl) = case execSemantic of
-                           ReductionSem -> (mkInit ["group", "keep"], [])
+                           ReductionSem -> (mkInit ["group", "keep", "num_cols"], [])
                            SimpleSem -> ([], mkInit ["carry"])
     in
     [ "generated-reducing-operator-inits" ~> red

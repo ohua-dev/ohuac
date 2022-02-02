@@ -69,6 +69,7 @@ impl
         // <insert(node-properties)>
         group_by: &[usize],
         keep: &[usize],
+        cols: usize,
     ) -> Self {
         let mut group_by = group_by.to_vec();
         group_by.sort();
@@ -87,7 +88,7 @@ impl
             // <insert(node-property-args)>
 
             local_index: None,
-            cols: 0, // Actually initialized in `on_connected`
+            cols,
 
             group_by: group_by,
             out_key: out_key,
@@ -214,6 +215,7 @@ impl
 
                             // emit positive, which is keep + new.
                             let mut rec = group_rs.next().unwrap().to_vec();
+                            debug_assert!(rec.len() >= self.keep.len());
                             rec.retain({
                                 let mut idx = 0;
                                 let mut it = self.keep.iter().peekable();
@@ -226,7 +228,9 @@ impl
                                     keep_this
                                 }
                             });
+                            debug_assert_eq!(rec.len(), self.keep.len());
                             rec.push(new);
+                            debug_assert_eq!(rec.len(), self.cols);
                             out.push(Record::Positive(rec));
                         }
                     }

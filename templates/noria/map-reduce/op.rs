@@ -73,10 +73,10 @@ impl
     ) -> Self {
         let mut group_by = group_by.to_vec();
         group_by.sort();
-        let out_key = (0..group_by.len()).collect();
         let mut keep = keep.to_vec();
         keep.sort();
         let colfix = keep.clone();
+        let out_key = group_by.iter().map(|i| keep.binary_search(i).unwrap()).collect();
         // <begin(udf-name)>
         Self
         // <end(udf-name)>

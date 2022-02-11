@@ -131,7 +131,7 @@ data Node
           { mirJoinProject :: [Column]
           , left :: [Column]
           , right :: [Column]
-          , isLeftJoin :: Bool
+          , joinType :: JoinType
           }
     | Identity [Column]
     | Filter
@@ -146,12 +146,27 @@ data Node
 instance Pretty Node where
     pretty = \case
         Regular {..} -> pretty nodeFunction <+> list (map pretty indices)
-        Join {..} ->  list (map pretty left) <+> "⋈"  <+> list (map pretty right) <+> "→" <+> list (map pretty mirJoinProject)
+        Join {..} ->  list (map pretty left) <+> pretty joinType  <+> list (map pretty right) <+> "→" <+> list (map pretty mirJoinProject)
         Identity cols -> "≡" <+> list (map pretty cols)
         Filter conds -> "σ" <+> list [pretty (idx :: Word) <+> pretty cond | (idx, Just cond) <- zip [0..] conds]
         Union emit ->  "∪" <+> list [pretty c | lc <- emit, c <- lc]
         Project {} -> "π"
 
+
+data JoinType
+    = FullInnerJoin
+    | LeftOuterJoin
+    | InnerJoin
+    deriving (Show, Eq, Generic)
+
+isLeftJoin :: JoinType -> Bool
+isLeftJoin = \case LeftOuterJoin -> True; _ -> False
+
+instance Pretty JoinType where
+    pretty = \case
+        FullInnerJoin -> "×"
+        LeftOuterJoin -> "⟕"
+        InnerJoin -> "⋈"
 
 instance B.Binary DataType
 instance B.Binary a => B.Binary (Value a)
@@ -170,8 +185,11 @@ instance B.Binary NSRef where
     get = makeThrow <$> B.get
 instance B.Binary Binding
 instance B.Binary QualifiedBinding
+instance B.Binary JoinType
+instance Hashable JoinType
 
 instance NFData DataType
+instance NFData JoinType
 
 instance Hashable DataType
 instance Pretty DataType where

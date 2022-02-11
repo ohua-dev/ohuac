@@ -117,6 +117,8 @@ data LExnT
     | ExecSemForOperatorNotFound Operator
     | ColumnsNotPresent [SomeColumn] [SomeColumn]
     | IncorrectlySizedTupleForNth Int [NType]
+    | FilterForJoinNotFound GR.Node
+    | UnexpectedJoinTypeWhenSearchingForFilter GR.Node Mir.JoinType
     deriving Show
 
 data MiscError
@@ -332,8 +334,7 @@ typeGraph udfs envInputs g = m
                     case b of
                         "(,)" -> likeTuple
                         _
-                            | b `elem`
-                                  (["lt", "gt", "eq", "and", "or", "leq", "geq", "<", ">", "<=", ">=", "==", "!=", "&&", "||"] :: Vector Binding) ->
+                            | b `elem`builtinSimpleFuns ->
                                 likeUdf
                             | otherwise -> throw $ lExn' $ UnknownBuiltin bnd
                 | Just f <- isFieldAccessor bnd ->
@@ -555,12 +556,94 @@ execSemOf nodes =
 
 infixr 4 &
 
-joinWhereMerge ::
-       (GR.DynGraph gr, gr Operator () ~ g) => (GR.Node -> [NType]) -> g -> g
-joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
+allowFullJoin = True
+
+joinWhereMerge :: 
+       ( GR.DynGraph gr, gr Operator () ~ g
+       , MonadLogger m ) 
+    => (GR.Node -> [NType]) 
+    -> g 
+    -> m g
+joinWhereMerge getType = \g -> foldl f (pure g) (GR.labNodes g)
   where
     -- | If there are multiple join columns choose one, because Noria does not yet support multi condition join.
     -- This choice is ... well it looks if one of the columns mentions an `id`. Yeah, its stupid and fragile but hey...
+    f mg ln = mg >>= \g ->
+        case ln of
+            (n, Join jt []) -> assertM (jt == Mir.FullInnerJoin) >> joinWhereMergeHandleAJoin getType g n jt
+            _ -> pure g
+
+joinWhereMergeHandleAJoin :: 
+       ( GR.DynGraph gr, gr Operator () ~ g
+       , MonadLogger m ) 
+    => (GR.Node -> [NType]) 
+    -> g 
+    -> GR.Node
+    -> Mir.JoinType
+    -> m g
+joinWhereMergeHandleAJoin getType g n jt
+    | (Just (ins, _, o, [((), suc)]), g1) <- GR.match n g
+    , (Just (fins, _, filterlab@(Filter conds filterfields), fsuc), g2) <- GR.match suc g1
+    , filtert@(NTSeq (NTRecFromTable t):_) <- getType suc 
+    =
+        let lExn' :: HasCallStack => LExnT -> LoweringExn
+            lExn' = lExnWith (Just o) (Just n)
+            colIsFromTable =
+                \case
+                    Right c -> Mir.table c == Just t
+                    _ -> False
+            (rem, cols) =
+                unzip $
+                chooseAJoinCol
+                    [ (sc1, (c1, c2))
+                    | (sc1, Mir.Comparison Mir.Equal (Mir.ColumnValue (Right -> v))) <-
+                            HashMap.toList conds
+                    , (c1, c2) <-
+                            case (colIsFromTable sc1, colIsFromTable v) of
+                                (True, False) -> [(sc1, v)]
+                                (False, True) -> [(v, sc1)]
+                                _ -> []
+                    ]
+            (ng, nsuc) =
+                if length cols == HashMap.size conds
+                    then (g2, fsuc)
+                    else ( ( fins
+                            , suc
+                            , Filter
+                                    (foldr' HashMap.delete conds rem)
+                                    filterfields
+                            , fsuc) GR.&
+                            g2
+                            , [((), suc)])
+        in
+        if  | length cols < 1 ->
+                if allowFullJoin && jt == Mir.FullInnerJoin
+                    then logWarnN ("Emitting full join " <> quickRender n <> ". This might be an error in the algorithm and will lead to very inefficient queries.") $> g
+                    else throw $ lExn' $ UnexpectedType "no matching filter found" filterlab filtert
+
+            | [( (), fsuc' )] <- fsuc
+            , (Just (_, _, IsEmptyCheck, emouts), g3) <- GR.match fsuc' g2 ->
+                    let [f1, f2] = map snd emouts
+                        matchFilter v (Just ([], _, Ctrl op ( IfCtrl {..}), outs))
+                            | iAmTrueBranch == v -- && op == fsuc'    The previous op has already been dropped. but this would be a good safety condition
+                            = outs
+                        matchFilter _ ctx = throw $ lExn' $ InvalidFilterAfterIsEmpty fsuc' ctx in
+                    let (matchFilter True -> f1outs, g4) = GR.match f1 g3
+                        (matchFilter False -> f2outs, g5) = GR.match f2 g4
+                        (( theCol, _ ):_) = cols
+                        mkFilter op = Filter { conditions = HashMap.fromList [(theCol, Mir.Comparison op (Mir.ConstantValue Mir.None) )]
+                                                , arguments = ("no", []) -- throw FilterIsMissingAField
+                                                }
+                    in pure $ 
+                        (ins, n, Join Mir.LeftOuterJoin $ map swap cols, [((), f1 ), ((), f2)]) &
+                        ([], f1, mkFilter Mir.Equal, f1outs ) &
+                        ([], f2, mkFilter Mir.NotEqual, f2outs ) &
+                        g5
+            | otherwise -> pure $ (ins, n, Join Mir.InnerJoin cols, nsuc) GR.& ng
+    | not allowFullJoin = throw $ lExnWith Nothing (Just n) $ FilterForJoinNotFound n
+    | jt == Mir.FullInnerJoin = logWarnN ("Emitting full join " <> quickRender n <> ". This might be an error in the algorithm and will lead to very inefficient queries.") $> g
+    | otherwise = throw $ lExnWith Nothing (Just n) $ UnexpectedJoinTypeWhenSearchingForFilter n jt
+  where
     chooseAJoinCol =
         pure . maximumBy (compare `on` \(_, (c1, c2)) -> hasId c1 $ hasId c2 0)
       where
@@ -569,64 +652,6 @@ joinWhereMerge getType = \g -> foldl' f g (GR.labNodes g)
                 Right r
                     | "id" `Text.isSuffixOf` Mir.name r -> succ
                 _ -> id
-    handleJoin g n jt
-        | length cols < 1 = throw $ lExn' $ UnexpectedType "no matching filter found" filterlab filtert
-        | [( (), fsuc' )] <- fsuc
-        , (Just (_, _, IsEmptyCheck, emouts), g3) <- GR.match fsuc' g2 =
-                let [f1, f2] = map snd emouts
-                    matchFilter v (Just ([], _, Ctrl op ( IfCtrl {..}), outs))
-                        | iAmTrueBranch == v -- && op == fsuc'    The previous op has already been dropped. but this would be a good safety condition
-                        = outs
-                    matchFilter _ ctx = throw $ lExn' $ InvalidFilterAfterIsEmpty fsuc' ctx in
-                let (matchFilter True -> f1outs, g4) = GR.match f1 g3
-                    (matchFilter False -> f2outs, g5) = GR.match f2 g4
-                    (( theCol, _ ):_) = cols
-                    mkFilter op = Filter { conditions = HashMap.fromList [(theCol, Mir.Comparison op (Mir.ConstantValue Mir.None) )]
-                                         , arguments = ("no", []) -- throw FilterIsMissingAField
-                                         }
-                in (ins, n, Join LeftOuterJoin $ map swap cols, [((), f1 ), ((), f2)]) &
-                   ([], f1, mkFilter Mir.Equal, f1outs ) &
-                   ([], f2, mkFilter Mir.NotEqual, f2outs ) &
-                   g5
-        | otherwise = (ins, n, Join jt cols, nsuc) GR.& ng
-      where
-        lExn' :: HasCallStack => LExnT -> LoweringExn
-        lExn' = lExnWith (Just o) (Just n)
-        (Just (ins, _, o, [((), suc)]), g1) = GR.match n g
-        (Just (fins, _, filterlab@(Filter conds filterfields), fsuc), g2) =
-            GR.match suc g1
-        filtert@(NTSeq (NTRecFromTable t):_) = getType suc
-        colIsFromTable =
-            \case
-                Right c -> Mir.table c == Just t
-                _ -> False
-        (rem, cols) =
-            unzip $
-            chooseAJoinCol
-                [ (sc1, (c1, c2))
-                | (sc1, Mir.Comparison Mir.Equal (Mir.ColumnValue (Right -> v))) <-
-                      HashMap.toList conds
-                , (c1, c2) <-
-                      case (colIsFromTable sc1, colIsFromTable v) of
-                          (True, False) -> [(sc1, v)]
-                          (False, True) -> [(v, sc1)]
-                          _ -> []
-                ]
-        (ng, nsuc) =
-            if length cols == HashMap.size conds
-                then (g2, fsuc)
-                else ( ( fins
-                        , suc
-                        , Filter
-                              (foldr' HashMap.delete conds rem)
-                              filterfields
-                        , fsuc) GR.&
-                        g2
-                      , [((), suc)])
-    f g =
-        \case
-            (n, Join jt []) -> handleJoin g n jt
-            _ -> g
 
 mergeSmapToCtrl :: (GR.DynGraph gr) => gr Operator () -> gr Operator ()
 mergeSmapToCtrl = \g -> foldl' f g (GR.labNodes g)
@@ -708,7 +733,7 @@ annotateAndRewriteQuery entrypoint gMirNodes getExecSemantic graph = do
                          _ -> False)
                 gr3
     quickDumpGr "superf-removed.dot" $ printableLabelWithIndices gr2
-    let whereMerged = joinWhereMerge (fst . getType) gr2
+    whereMerged <- joinWhereMerge (fst . getType) gr2
     quickDumpGr "join-where-merged-with-types.dot" $
         printableLabelWithTypes whereMerged
     quickDumpGr "join-where-merged.dot" $ mkLabelsPrintable whereMerged
@@ -845,7 +870,7 @@ type TypeMap = IM.IntMap ([NType], [NType])
 optimizeLeftOuterJoin :: ( GR.DynGraph gr, gr Operator () ~ g, MonadLogger m ) => g -> m g
 optimizeLeftOuterJoin = \g -> foldM f g (GR.labNodes g)
   where
-    f g (joinN, Join { joinType = LeftOuterJoin, ..} )
+    f g (joinN, Join { joinType = Mir.LeftOuterJoin, ..} )
         | all isSimple thenLabels
         , all (== Mir.None) litMatches
         , all fromParentTable litMatchCols =
@@ -923,7 +948,7 @@ determineCtrlType g n ts = (ctxSource, ) $
     (ctxSource, ctxSourceOutIdx, _) = idxmap IM.! (-1)
     ctxSourceLab = getLabel g ctxSource
 
-retype3 :: (GR.Graph gr, g ~ gr Operator (Int, Int))
+retype3 :: (GR.Graph gr, g ~ gr Operator (Int, Int), HasCallStack)
     => GeneratedMirNodes
     -> g
     -> GR.Node
@@ -953,6 +978,7 @@ retype3 m g n lits ty other@(QualifiedBinding namespace name) =
                     let flattenTy = Lens.para $ \a r -> case a of
                             NTScalarCol s -> [Left s]
                             NTRecFromTable t -> [Right t]
+                            NTScalar (Mir.ConstantValue Mir.None) -> []
                             NTScalar _ -> throw $ lExn' $ InvalidArgumentType Nothing [a]
                             _ -> concat r
                         (_:ts) = ty
@@ -1047,7 +1073,7 @@ multiArcToJoin2 g = foldl' f g (GR.labNodes g)
             doJoin y g =
                 ( [((), x), ((), y)]
                 , Prelude.head $ GR.newNodes 1 g
-                , Join InnerJoin []
+                , Join Mir.FullInnerJoin []
                 , [((), n)]) GR.&
                 GR.delEdges [(x, n), (y, n)] g
 
@@ -1108,17 +1134,25 @@ instance ToRust SerializableGraph where
                             case executionType of
                                 Mir.Reduction {..} ->
                                     "Reduction" <>
-                                    recordSyn ["group_by" ~> ppVec (map pretty groupBy), "keep" ~> ppVec (map pretty keep)]
+                                    recordSyn 
+                                        [ "group_by" ~> ppVec (map pretty groupBy)
+                                        , "keep" ~> ppVec (map pretty keep)
+                                        ]
                                 Mir.Simple i ->
                                     "Simple" <> recordSyn [("carry", pretty i)])
                         ]
                 Mir.Join {..} ->
-                    (if isLeftJoin then "LeftJoin" else "Join" ) <+>
-                    recordSyn
-                        [ ("on_left", ppColVec left)
-                        , ("on_right", ppColVec right)
-                        , ("project", ppColVec mirJoinProject)
-                        ]
+                    case joinType of 
+                        Mir.LeftOuterJoin -> "LeftJoin" <+> stdRecord
+                        Mir.InnerJoin -> "Join" <+> recordSyn [ "project" ~> ppColVec mirJoinProject ]
+                        Mir.FullInnerJoin -> "FullJoin" <+> stdRecord
+                  where
+                    stdRecord = 
+                        recordSyn
+                            [ ("on_left", ppColVec left)
+                            , ("on_right", ppColVec right)
+                            , ("project", ppColVec mirJoinProject)
+                            ]
                 Mir.Union {..} ->
                     "Union" <+>
                     recordSyn [("emit", ppVec $ map ppColVec mirUnionEmit)]
@@ -1210,7 +1244,8 @@ handleNode execSemMap tm tableColumn mg m n = case op of
                   leftStuff = (lp, lc)
                   rightStuff = (rp, rc)
                   (( left, leftCol ), ( right, rightCol )) =
-                      if | lpHasL && lpHasR && rpHasR && rpHasL ->
+                      if  | joinType == Mir.FullInnerJoin -> (leftStuff, rightStuff)
+                          | lpHasL && lpHasR && rpHasR && rpHasL ->
                               throw $ lExn' $ AmbiguousColumnsInJoin op
                           | lpHasL && rpHasR -> (leftStuff, rightStuff)
                           | lpHasR && rpHasL -> (rightStuff, leftStuff)
@@ -1227,7 +1262,7 @@ handleNode execSemMap tm tableColumn mg m n = case op of
               { mirJoinProject = map someColToMirCol proj
               , left = map someColToMirCol l
               , right = map someColToMirCol r
-              , isLeftJoin = joinType == LeftOuterJoin
+              , joinType = joinType
               }
         | otherwise ->
               throw $ lExn' $ WrongNumberOfAncestors n op 2 (length ins)

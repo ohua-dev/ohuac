@@ -48,6 +48,7 @@ isSeqNType = \case
 
 isUnitNType = \case
     NTTup [] -> True
+    NTScalar (Mir.ConstantValue Mir.None) -> True
     _ -> False
 
 shallowEqNType :: NType -> NType -> Bool
@@ -122,12 +123,6 @@ data GScope col =
     GroupBy [col]
     deriving (Show, Eq, Generic)
 
-data JoinType
-    = FullOuterJoin
-    | LeftOuterJoin
-    | InnerJoin
-    deriving (Show, Eq, Generic)
-
 data CtrlType
     = SmapCtrl
     | IfCtrl { iAmTrueBranch :: Bool, conditionColumn :: SomeColumn }
@@ -137,7 +132,7 @@ type ProjectColSpec = Either (InternalColumn, Mir.DataType ) SomeColumn
 
 data Operator
     = CustomOp { opName :: QualifiedBinding, opInputs :: [Either Mir.DataType SomeColumn] }
-    | Join { joinType :: JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
+    | Join { joinType :: Mir.JoinType, joinOn :: [(SomeColumn, SomeColumn)] }
     | Project { projectEmit :: [ProjectColSpec]}
     | Identity
     | Sink
@@ -177,11 +172,6 @@ instance PP.Pretty Operator where
               Left InternalColumn{..} -> PP.pretty producingOperator <> ":" <> PP.pretty outputIndex
               Right c -> PP.pretty c
 
-instance PP.Pretty JoinType where
-    pretty = \case
-        FullOuterJoin -> "><"
-        LeftOuterJoin -> "⋊"
-        InnerJoin -> "⋈"
 
 data OperatorDescription
     = Op_MIR (QualifiedBinding, Operator)
@@ -207,13 +197,10 @@ instance B.Binary CtrlType
 instance B.Binary OperatorDescription
 instance NFData CtrlType
 instance NFData Operator
-instance NFData JoinType
-instance Hashable JoinType
 instance Hashable a => Hashable (GScope a)
 instance NFData a => NFData (GScope a)
 instance Hashable InternalColumn
 instance NFData InternalColumn
-instance B.Binary JoinType
 instance B.Binary InternalColumn
 instance B.Binary ExecSem
 

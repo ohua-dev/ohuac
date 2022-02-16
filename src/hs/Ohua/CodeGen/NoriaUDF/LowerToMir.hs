@@ -1144,8 +1144,8 @@ instance ToRust SerializableGraph where
                 Mir.Join {..} ->
                     case joinType of 
                         Mir.LeftOuterJoin -> "LeftJoin" <+> stdRecord
-                        Mir.InnerJoin -> "Join" <+> recordSyn [ "project" ~> ppColVec mirJoinProject ]
-                        Mir.FullInnerJoin -> "FullJoin" <+> stdRecord
+                        Mir.InnerJoin -> "Join" <+> stdRecord
+                        Mir.FullInnerJoin -> "FullJoin" <+> recordSyn [ "project" ~> ppColVec mirJoinProject ]
                   where
                     stdRecord = 
                         recordSyn

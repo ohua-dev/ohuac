@@ -220,7 +220,7 @@ impl
                                 let mut idx = 0;
                                 let mut it = self.keep.iter().peekable();
                                 move |_| {
-                                    let keep_this = idx == **it.peek().unwrap();
+                                    let keep_this = Some(&&idx) == it.peek();
                                     if keep_this {
                                         it.next();
                                     }

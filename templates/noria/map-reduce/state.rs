@@ -61,5 +61,9 @@ impl State for
         self.0.clear()
     }
 
+    fn scan<'a>(&'a self) -> Option<Box<crate::state::ScanResult<'a>>> {
+        self.0.scan()
+    }
+
     // <insert(state-trait-coerce-impls)>
 }

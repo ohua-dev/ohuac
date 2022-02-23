@@ -164,11 +164,12 @@ data PackageCodeGen = PackageCodeGen CodeGen
 
 configureForBackend ::
     (?copts :: CommonCmdOpts, MonadIO m, MonadLogger m, Ixed map, Index map ~ Binding, IxValue map ~ FunAnn (TyExpr SomeBinding), Monad f)
-    => BuildOpts
+    => NSRef
+    -> BuildOpts
     -> Maybe map
     -> CodeGenSelection
     -> m (PackageHook, CustomPasses env, Expr -> f (Int, Expr), PackageCodeGen)
-configureForBackend BuildOpts {..} mainAnns = \case
+configureForBackend algoNamespace BuildOpts {..} mainAnns = \case
     NoriaUDF -> do
         udfs <- newIORef []
         states <- newIORef mempty
@@ -185,7 +186,7 @@ configureForBackend BuildOpts {..} mainAnns = \case
             Just formatter = Prelude.lookup "rust" langs
             fields =
                 IM.fromList $ zip [0 ..] (map formatter $ reverse ftys)
-        pure ( PackageHook $ NoriaUDFGen.preResolveHook addUdf
+        pure ( PackageHook $ NoriaUDFGen.preResolveHook algoBase addUdf
               , defWithCleanUnit
                 { passAfterNormalize =
                   NoriaUDFGen.rewriteQueryExpressions addUdf
@@ -194,10 +195,10 @@ configureForBackend BuildOpts {..} mainAnns = \case
                   >=> ALang.normalize
                   >=> \e -> do
                         sts <- readIORef states
-                        NoriaUDFGen.makeStateExplicit addUdf (flip HashMap.lookup sts) e
+                        NoriaUDFGen.makeStateExplicit algoBase addUdf (flip HashMap.lookup sts) e
                 , passAfterDFLowering = \e -> do
                         sts <- readIORef states
-                        NoriaUDFGen.generateOperators fields addUdf (flip HashMap.lookup sts) e
+                        NoriaUDFGen.generateOperators algoBase fields addUdf (flip HashMap.lookup sts) e
                 }
               , pure . mainToEnv
               , PackageCodeGen $ \dat -> do
@@ -208,6 +209,7 @@ configureForBackend BuildOpts {..} mainAnns = \case
   where
     defWithCleanUnit = def { passAfterDFLowering = cleanUnits }
     CommonCmdOpts {..} = ?copts
+    algoBase = QualifiedBinding algoNamespace entrypoint
 
 runBuild ::
        (?copts :: CommonCmdOpts)
@@ -225,7 +227,7 @@ runBuild bo@BuildOpts { outputFormat
             map (\(ns, i) -> show $ PP.pretty ns <> PP.tupled (map PP.pretty i))
      in do logDebugN $ unlines $ "Algos:" : present (rawMainMod ^. algoImports)
            logDebugN $ unlines $ "Sfs:" : present (rawMainMod ^. sfImports)
-    (preResHook, passes, handleMainArgs, PackageCodeGen gen) <- configureForBackend bo mainAnns outputFormat
+    (preResHook, passes, handleMainArgs, PackageCodeGen gen) <- configureForBackend (rawMainMod ^. name) bo mainAnns outputFormat
     mainMod <-
         let ?env = case preResHook of
                        PackageHook h -> ResolutionEnv

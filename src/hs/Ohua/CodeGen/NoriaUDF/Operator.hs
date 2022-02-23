@@ -23,6 +23,7 @@ module Ohua.CodeGen.NoriaUDF.Operator
     , isFieldAccessor
     , makeStateExplicit
     , extractStateInitializers
+    , makeHopefullyUniqueUdfName
     ) where
 
 import Ohua.Prelude hiding (First, Identity)
@@ -437,6 +438,12 @@ baseUdfSubMap udfName rowName accessedFields =
     , "udf-args-sigs" ~> ["udf_arg_placeholder: usize,"]
     ]
 
+makeHopefullyUniqueUdfName :: QualifiedBinding -> QualifiedBinding -> Text
+makeHopefullyUniqueUdfName algoBase udfName =
+    T.intercalate "_" $ map unwrap $ 
+        unwrap (algoBase ^. namespace) <> [algoBase ^. name, udfName ^.name]
+
+
 generatedOpSourcePath :: QualifiedBinding -> FilePath
 generatedOpSourcePath udfName =
     Path.dataflowSourceDir <> "/ops/ohua/generated/" <>
@@ -460,11 +467,11 @@ extractStateInitializers register e = flip runReaderT mempty $ flip RS.cata e $ 
     isState = flip HashSet.member $ HashSet.fromList [case s of Var v -> v; _ -> throwStack (NonVarState s) | BindState s _ <- universe e ]
 
 
-makeStateExplicit :: forall m. (MonadOhua m, HasCallStack) => RegisterOperator -> (Binding -> Maybe Expr) -> Expr -> m Expr
-makeStateExplicit registerOp getState = makeStateExplicitWith $ \func state args -> do
+makeStateExplicit :: forall m. (MonadOhua m, HasCallStack) => QualifiedBinding -> RegisterOperator -> (Binding -> Maybe Expr) -> Expr -> m Expr
+makeStateExplicit algoBase registerOp getState = makeStateExplicitWith $ \func state args -> do
     case getState state of
         Just st -> do
-            opName <- generateBindingWith ("op_p_" <> func ^. name <> "_")
+            opName <- generateBindingWith (makeThrow $ makeHopefullyUniqueUdfName algoBase func)
             let udfName = QualifiedBinding GenFuncsNamespace opName
             argVars <- traverse expectVar args
             liftIO $ registerOp $ Op_UDF $ mkStatefulOpDesc (func ^.name) st udfName argVars
@@ -647,10 +654,11 @@ toSQLType t = trace ("WARNING: No SQL equivalent known for type " <> show t :: T
 
 preResolveHook ::
        (MonadIO m, MonadError Error m, MonadLogger m)
-    => RegisterOperator
+    => QualifiedBinding
+    -> RegisterOperator
     -> RawNamespace
     -> m RawNamespace
-preResolveHook registerOp r =
+preResolveHook algoBase registerOp r =
     runGenBndT mempty $ do
         logDebugN $ "Hook is running for " <> quickRender (r ^. name)
         (newDecls, toTransform) <- runWriterT $ itraverse finder (r ^. decls)
@@ -724,14 +732,14 @@ preResolveHook registerOp r =
                        True
                    _ -> False)
              (genericAnn ann) = do
-            let newFnName =
-                    unsafeMake $
-                    T.intercalate "_" (map unwrap $ unwrap $ r ^. name) <>
-                    "_" <>
-                    unwrap nam
-                newName = QualifiedBinding GenFuncsNamespace newFnName
+            -- let newFnName = 
+            --         unsafeMake $
+            --         T.intercalate "_" (map unwrap $ unwrap $ r ^. name) <>
+            --         "_" <>
+            --         unwrap nam
+            let newName = QualifiedBinding GenFuncsNamespace $ makeThrow $ makeHopefullyUniqueUdfName algoBase (QualifiedBinding (r ^. name) nam)
             logDebugN $ "Found candidate " <> unwrap nam
-            tell $ asList [(a, nam, newName)]
+            tell ([(a, nam, newName)] :: [(Annotated (CombinedAnn Fr.Expr) Fr.Expr, Binding, QualifiedBinding)])
             pure $ a & annotation .~ ann {genericAnn = []} & value .~
                 Fr.LitE (FunRefLit (FunRef newName Nothing))
         | otherwise = pure a
@@ -855,8 +863,8 @@ tryStateAwareApplyToList = \case
     e -> Left $ ErrorWithTrace callStack $ NotAFunctionApplication e
 
 
-generateOperators :: Fields -> RegisterOperator -> (Binding -> Maybe Expr) -> DFExpr -> OhuaM env DFExpr
-generateOperators _ registerOp getStateInit DFExpr{ .. } = do
+generateOperators :: QualifiedBinding -> Fields -> RegisterOperator -> (Binding -> Maybe Expr) -> DFExpr -> OhuaM env DFExpr
+generateOperators algoBase _ registerOp getStateInit DFExpr{ .. } = do
     newExprs <- evalStateT ( traverse doRewrite letExprs ) mempty
     let exp =  DFExpr { letExprs = newExprs >>= id
                       , returnVar
@@ -867,7 +875,7 @@ generateOperators _ registerOp getStateInit DFExpr{ .. } = do
     isState = isJust . getStateInit
     doRewrite e@LetExpr{..}
         | not (isKnownFunction function) = do
-              opName <- generateBindingWith ("op_p_" <> function ^. name <> "_")
+              opName <- generateBindingWith (makeThrow $ makeHopefullyUniqueUdfName algoBase function)
                     -- This relies heavily of having the expected `let x = f a b c`
                     -- structure
               let udfName = QualifiedBinding GenFuncsNamespace opName

@@ -53,14 +53,14 @@ import Paths_ohuac
 data Query = Query
     { queryOps :: [OperatorDescription]
     , queryGraph :: SerializableGraph
-    } deriving (Eq, Generic)
+    } deriving (Eq, Generic, Show)
 
 instance B.Binary SerializableGraph
 instance B.Binary Query
 
 data InstalledQueries = InstalledQueries
-    { queries :: HashMap Binding Query }
-    deriving (Eq, Generic)
+    { queries :: HashMap QualifiedBinding Query }
+    deriving (Eq, Generic, Show)
 
 instance B.Binary InstalledQueries
 
@@ -181,7 +181,7 @@ qObjFile = "installed.ohua-query-object"
 saveInstalledQueries :: MonadIO m => InstalledQueries -> m ()
 saveInstalledQueries = liftIO . B.encodeFile qObjFile
 
-addInstalledQuery :: Binding -> Query -> InstalledQueries -> InstalledQueries
+addInstalledQuery :: QualifiedBinding -> Query -> InstalledQueries -> InstalledQueries
 addInstalledQuery b q qs = qs { queries = HashMap.insert b q $ queries qs }
 
 generate :: [OperatorDescription] -> CodeGen
@@ -193,26 +193,25 @@ generate compiledNodes d@CodeGenData {..} = do
     let subs = ["graph" ~> graphToSubs serializableGraph]
     tpl' <-
         TemplateHelper.sub TemplateHelper.Opts {preserveSpace = True} tpl subs
-    let all = addInstalledQuery (entryPoint ^. name) (Query compiledNodes serializableGraph) prev
+    let all = addInstalledQuery entryPoint (Query compiledNodes serializableGraph) prev
     saveInstalledQueries all
+    logDebugN $ "I know about these queries: " <> show (HashMap.keys $ queries all)
     extraOperatorProcessing all compiledNodes
     patchFile
         Nothing
         Path.udfsModFile
-        [ "graph-mods" ~> ["mod " <> unwrap ep <> "_graph;" | ep <- HashMap.keys $ queries all ]
+        [ "graph-mods" ~> ["mod " <> modNameForEntryPoint ep <> ";" | ep <- HashMap.keys $ queries all ]
         , "graph-dispatch" ~>
           [ "\"" <>
-            ep <>
-            "\" => Some(Box::new(" <> ep <> "_graph::mk_graph)),"
-          | (unwrap -> ep) <- HashMap.keys $ queries all
+            unwrap (ep ^. name) <>
+            "\" => Some(Box::new(" <> modNameForEntryPoint ep <> "::mk_graph)),"
+          | ep <- HashMap.keys $ queries all
           ]
         ]
     pure $ LT.encodeUtf8 $ LT.fromStrict tpl'
-  where
-    entryPointName = unwrap $ entryPoint ^. name
 
-
+modNameForEntryPoint ep = Text.intercalate "_" $ map unwrap $ unwrap (ep ^. namespace) <> [ep ^.name, "graph"]
 
 suggestName :: NameSuggester
 suggestName entryPoint =
-    Path.udfsDir <> "/" <> unwrap (entryPoint ^. name) <> "_graph.rs"
+    Path.udfsDir <> "/" <> modNameForEntryPoint entryPoint <> ".rs"

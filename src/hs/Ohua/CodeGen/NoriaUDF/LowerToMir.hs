@@ -119,6 +119,8 @@ data LExnT
     | IncorrectlySizedTupleForNth Int [NType]
     | FilterForJoinNotFound GR.Node
     | UnexpectedJoinTypeWhenSearchingForFilter GR.Node Mir.JoinType
+    | WeirdArgumentsToUDF String [Either Mir.DataType SomeColumn]
+    | NeedToKknowTheSourceTableForColumnInThisContext Mir.Column
     deriving Show
 
 data MiscError
@@ -1225,8 +1227,11 @@ handleNode execSemMap tm tableColumn mg m n = case op of
                                  length $ ancestorColumns (snd p))
                       ReductionSem ->
                           let (Mir.ColumnValue x:xs) = stdIndices
-                              Right (Left c):_ = ccols
-                              stateProducerCols = ancestorColumns (producingOperator c)
+                              stateProducerCols = case ccols of
+                                  Right (Left c):_ -> ancestorColumns $ producingOperator c 
+                                  Right (Right t): _ -> 
+                                      tableColumnsFor $ fromMaybe (throw $ lExn' $ NeedToKknowTheSourceTableForColumnInThisContext t) $ Mir.table t
+                                  _ -> throw $ lExn' $ WeirdArgumentsToUDF "stateful UDF's expect the first argument to be a column" ccols
                               (keep, outputCols) = unzip $ filter ((`elem` stateProducerCols) . snd) $ zip [0..] fromAncestor
                           in
                               assert (all (`elem` fromAncestor) stateProducerCols ) $
@@ -1327,11 +1332,7 @@ handleNode execSemMap tm tableColumn mg m n = case op of
                     Mir.ConstantValue v
     IsEmptyCheck -> withCols [Left $ InternalColumn {producingOperator=n, outputIndex=0}] $ defaultRet $ throw $ lExn' $ NoMirEquivalent IsEmptyCheck n
     Source t ->
-        let cols =
-                map Right $
-                fromMaybe
-                    (throw $ lExn' $ TableColumnsNotFound t tableColumn) $
-                HashMap.lookup t tableColumn
+        let cols = tableColumnsFor t
         in withCols cols $ defaultRet $ throw $ lExn' $ NoMirEquivalent (Source t) n
     Sink -> defaultRet $ throw $ lExn' $ NoMirEquivalent Sink n
     other -> throw $ lExn' $ UnexpectedOperator other
@@ -1350,6 +1351,12 @@ handleNode execSemMap tm tableColumn mg m n = case op of
                     [a] -> a
                     other -> throw $ lExn' $ UnexpectedNumberOfAncestors n op 1 other
         in ancestorColumns a
+    tableColumnsFor :: HasCallStack => Mir.Table -> [SomeColumn]
+    tableColumnsFor t =
+        map Right $
+        fromMaybe
+            (throw $ lExn' $ TableColumnsNotFound t tableColumn) $
+        HashMap.lookup t tableColumn
     ancestorColumns :: HasCallStack => GR.Node -> [SomeColumn]
     ancestorColumns n0 = fromMaybe (throw $ lExn' $  AncestorNotFound (IM.keys m) n n0) $ m ^? ix n0 . _2
     defaultRet = ( , fromAncestor , map snd ins)

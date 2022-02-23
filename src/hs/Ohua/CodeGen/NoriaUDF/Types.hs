@@ -89,11 +89,16 @@ data GenerationType
                    Text
     deriving (Eq, Generic)
 
+instance Show GenerationType where 
+    show = \case 
+        TemplateSubstitution tpl p _ -> "TemplateSubstitution(" <> tpl <> " -> " <> p <> ")"
+        GenerateFile p _ -> "GenerateFile(" <> p <> ")"
+
 
 data ExecSem
     = One
     | Many
-    deriving (Eq, Generic)
+    deriving (Eq, Generic,Show)
 
 type ExecSemantic = (ExecSem, ExecSem)
 
@@ -176,7 +181,7 @@ instance PP.Pretty Operator where
 data OperatorDescription
     = Op_MIR (QualifiedBinding, Operator)
     | Op_UDF UDFDescription
-    deriving (Eq, Generic)
+    deriving (Eq, Generic, Show)
 
 data UDFDescription = UDFDescription
       { generations :: [GenerationType]
@@ -185,7 +190,7 @@ data UDFDescription = UDFDescription
       , udfState :: Maybe (QualifiedBinding, [Lit])
       , referencedFields :: [Int]
       , execSemantic :: (ExecSem, ExecSem)
-      } deriving (Eq, Generic)
+      } deriving (Eq, Generic, Show)
 
 type RegisterOperator = OperatorDescription -> IO ()
 

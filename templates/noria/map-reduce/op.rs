@@ -12,7 +12,7 @@ use crate::state::cstate::{ SpecialStateWrapper, MemoElem };
 //use crate::state::cstate::{MemoElem};
 use prelude::*;
 
-#[derive(Serialize, Deserialize,Clone)]
+#[derive(Serialize, Deserialize,Clone, Debug)]
 pub struct
     // <begin(udf-name)>
     ClickAna

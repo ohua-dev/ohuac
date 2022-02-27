@@ -13,7 +13,7 @@ use crate::state::cstate::{ SpecialStateWrapper, MemoElem };
 //use crate::state::cstate::{MemoElem};
 use crate::prelude::*;
 
-#[derive(Serialize, Deserialize,Clone)]
+#[derive(Serialize, Deserialize,Clone, Debug)]
 pub struct
     // <begin(udf-name)>
     ClickAna
@@ -155,5 +155,11 @@ impl Ingredient for
 
     fn is_selective(&self) -> bool {
         false
+    }
+    fn join_plugin(&self, input: &crate::ops::join::PluginInput) -> Option<DataType> {
+        let r = input;
+        Some({
+            // <insert(function)>
+        }.into())
     }
 }
